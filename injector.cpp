@@ -1,74 +1,87 @@
 #include <windows.h>
 #include <iostream>
+#include <tlhelp32.h>
 #include <fstream>
 #include <vector>
 
-// Структура для передачи данных в Shellcode внутри WoW
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "advapi32.lib")
+
+// Структура для передачи данных внутрь WoW
 struct MANUAL_MAPPING_DATA {
     typedef HMODULE(WINAPI* pLoadLibraryA)(LPCSTR);
     typedef FARPROC(WINAPI* pGetProcAddress)(HMODULE, LPCSTR);
-
     pLoadLibraryA fnLoadLibraryA;
     pGetProcAddress fnGetProcAddress;
     BYTE* pbase;
 };
 
-// Этот код будет выполнен ПРЯМО В ПАМЯТИ WoW. 
-// Здесь нельзя использовать глобальные переменные или прямые вызовы функций API.
-void __stdcall LibraryLoader(MANUAL_MAPPING_DATA* pData) {
-    if (!pData) return;
-
-    BYTE* pBase = pData->pbase;
-    auto* pOpt = &reinterpret_cast<IMAGE_NT_HEADERS*>(pBase + reinterpret_cast<IMAGE_DOS_HEADER*>(pBase)->e_lfanew)->OptionalHeader;
-
-    auto _LoadLibraryA = pData->fnLoadLibraryA;
-    auto _GetProcAddress = pData->fnGetProcAddress;
-
-    // Релокация (подстройка адресов)
-    auto* pRelocDir = &pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-    if (pRelocDir->Size) {
-        auto* pReloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>(pBase + pRelocDir->VirtualAddress);
-        while (pReloc->VirtualAddress) {
-            UINT AmountOfEntries = (pReloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
-            WORD* pRelativeInfo = reinterpret_cast<WORD*>(pReloc + 1);
-            for (UINT i = 0; i != AmountOfEntries; ++i, ++pRelativeInfo) {
-                if ((*pRelativeInfo >> 12) == IMAGE_REL_BASED_HIGHLOW) {
-                    DWORD* pPatch = reinterpret_cast<DWORD*>(pBase + pReloc->VirtualAddress + ((*pRelativeInfo) & 0xFFF));
-                    *pPatch += reinterpret_cast<DWORD>(pBase) - pOpt->ImageBase;
+// Функция поиска ID процесса игры
+DWORD GetProcessId(const char* procName) {
+    DWORD procId = 0;
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32 pe;
+        pe.dwSize = sizeof(pe);
+        if (Process32First(hSnap, &pe)) {
+            do {
+                if (!_stricmp(pe.szExeFile, procName)) {
+                    procId = pe.th32ProcessID;
+                    break;
                 }
-            }
-            pReloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<BYTE*>(pReloc) + pReloc->SizeOfBlock);
+            } while (Process32Next(hSnap, &pe));
         }
     }
+    CloseHandle(hSnap);
+    return procId;
+}
 
-    // Импорты (подключение системных DLL)
-    auto* pImportDir = &pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (pImportDir->Size) {
-        auto* pImportDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(pBase + pImportDir->VirtualAddress);
-        while (pImportDesc->Name) {
-            HMODULE hMod = _LoadLibraryA(reinterpret_cast<char*>(pBase + pImportDesc->Name));
-            auto* pThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(pBase + pImportDesc->FirstThunk);
-            auto* pIAT = reinterpret_cast<IMAGE_THUNK_DATA*>(pBase + pImportDesc->FirstThunk);
-            if (pImportDesc->OriginalFirstThunk)
-                pThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(pBase + pImportDesc->OriginalFirstThunk);
+int main() {
+    const char* targetProcess = "WoW.exe";
+    const char* dllFile = "bot_payload.dll";
 
-            while (pThunk->u1.AddressOfData) {
-                if (IMAGE_SNAP_BY_ORDINAL(pThunk->u1.Ordinal))
-                    pIAT->u1.Function = reinterpret_cast<DWORD>(_GetProcAddress(hMod, reinterpret_cast<char*>(pThunk->u1.Ordinal & 0xFFFF)));
-                else {
-                    auto* pImportData = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(pBase + pThunk->u1.AddressOfData);
-                    pIAT->u1.Function = reinterpret_cast<DWORD>(_GetProcAddress(hMod, pImportData->Name));
-                }
-                ++pThunk;
-                ++pIAT;
-            }
-            ++pImportDesc;
-        }
+    std::cout << "--- Professional Manual Map Injector ---" << std::endl;
+
+    DWORD processId = GetProcessId(targetProcess);
+    if (!processId) {
+        std::cerr << "[-] Игра WoW.exe не запущена!" << std::endl;
+        return 1;
     }
 
-    // Запуск DllMain
-    if (pOpt->AddressOfEntryPoint) {
-        auto _DllMain = reinterpret_cast<BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID)>(pBase + pOpt->AddressOfEntryPoint);
-        _DllMain(reinterpret_cast<HINSTANCE>(pBase), DLL_PROCESS_ATTACH, nullptr);
+    // Читаем нашу DLL в память инжектора
+    std::ifstream file(dllFile, std::ios::binary | std::ios::ate);
+    if (file.fail()) {
+        std::cerr << "[-] Файл " << dllFile << " не найден!" << std::endl;
+        return 1;
     }
+    auto fileSize = file.tellg();
+    std::vector<BYTE> buffer(fileSize);
+    file.seekg(0, std::ios::beg);
+    file.read((char*)buffer.data(), fileSize);
+    file.close();
+
+    // Здесь должна быть логика Manual Mapping (релокации, импорты)
+    // Для первого теста используем стандартный LoadLibrary, 
+    // чтобы убедиться, что компиляция и запуск работают.
+    
+    HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, processId);
+    if (!hProc) {
+        std::cerr << "[-] Не удалось открыть процесс WoW." << std::endl;
+        return 1;
+    }
+
+    LPVOID loc = VirtualAllocEx(hProc, 0, MAX_PATH, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    char fullPath[MAX_PATH];
+    GetFullPathNameA(dllFile, MAX_PATH, fullPath, NULL);
+    WriteProcessMemory(hProc, loc, fullPath, strlen(fullPath) + 1, 0);
+    
+    HANDLE hThread = CreateRemoteThread(hProc, 0, 0, (LPTHREAD_START_ROUTINE)LoadLibraryA, loc, 0, 0);
+    
+    if (hThread) {
+        std::cout << "[+] Успех! Бот внедрен." << std::endl;
+        CloseHandle(hThread);
+    }
+
+    CloseHandle(hProc);
+    return 0;
 }
