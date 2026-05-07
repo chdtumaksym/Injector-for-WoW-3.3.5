@@ -1,26 +1,22 @@
-#include <windows.h>
-#include <iostream>
+// Оффсеты для управления движением (3.3.5a)
+DWORD CTM_Base = 0x00BD07A0; 
+DWORD CTM_Push = 0x00860A90; // Адрес функции в коде игры для выполнения клика
 
-// Оффсеты для WoW 3.3.5a (Build 12340)
-DWORD PlayerBaseOffset = 0x00BD07E0; // Указатель на локального игрока
-DWORD PosX = 0x798; // Смещение для координаты X
-DWORD PosY = 0x79C; // Смещение для координаты Y
-DWORD PosZ = 0x7A0; // Смещение для координаты Z
+enum CTM_Action {
+    Face = 1,
+    Stop = 2,
+    Walk = 4, // Обычный клик по земле
+    MoveTo = 5,
+    InteractNPC = 6,
+    InteractObject = 7
+};
 
-DWORD WINAPI MainThread(LPVOID lpParam) {
-    while (true) {
-        // Читаем базу игрока
-        DWORD playerBase = *(DWORD*)PlayerBaseOffset;
-        
-        if (playerBase) {
-            float x = *(float*)(playerBase + PosX);
-            float y = *(float*)(playerBase + PosY);
-            float z = *(float*)(playerBase + PosZ);
-
-            // Теперь бот знает, где он находится!
-            // В реальном боте мы будем сравнивать эти точки с точками квеста
-        }
-        Sleep(100); // Чтобы не грузить процессор
-    }
-    return 0;
+void MoveToCoord(float x, float y, float z) {
+    // Записываем координаты в память CTM
+    *(float*)(CTM_Base + 0x8) = x;
+    *(float*)(CTM_Base + 0xC) = y;
+    *(float*)(CTM_Base + 0x10) = z;
+    
+    // Вызываем действие "Бежать" (MoveTo)
+    *(DWORD*)(CTM_Base + 0x1C) = MoveTo;
 }
