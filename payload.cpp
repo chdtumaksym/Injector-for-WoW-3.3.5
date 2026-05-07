@@ -1,49 +1,50 @@
 #include <windows.h>
 #include <iostream>
-#include <vector>
 
-#pragma comment(lib, "user32.lib")
-
-// Оффсеты 3.3.5а
 #define PLAYER_BASE_OFFSET 0x00BD07E0
 #define OBJECT_MANAGER_PTR 0x00B41414
-#define FIRST_OBJECT_OFFSET 0xAC
-#define NEXT_OBJECT_OFFSET 0x3C
+
+// Типы объектов в WoW 3.3.5
+enum WowObjType {
+    OT_ITEM = 1,
+    OT_CONTAINER = 2,
+    OT_UNIT = 3,      // Это мобы и NPC
+    OT_PLAYER = 4,    // Другие игроки
+    OT_GAMEOBJECT = 5 // Руда, трава, сундуки
+};
 
 DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Imba Bot: Object Scanner Active ---\n");
+    printf("--- Professional Object Radar ---\n");
 
     while (true) {
-        // 1. Читаем координаты игрока
-        DWORD playerBase = *(DWORD*)PLAYER_BASE_OFFSET;
-        if (playerBase) {
-            float x = *(float*)(playerBase + 0x798);
-            float y = *(float*)(playerBase + 0x79C);
-            printf("Player Pos: X: %.2f Y: %.2f\n", x, y);
+        DWORD objMgr = *(DWORD*)OBJECT_MANAGER_PTR;
+        if (objMgr) {
+            // Начало списка объектов
+            DWORD currentObj = *(DWORD*)(objMgr + 0xAC); 
+            
+            int units = 0, players = 0, items = 0;
 
-            // 2. Сканируем объекты вокруг (Мобы, NPC)
-            DWORD objMgr = *(DWORD*)OBJECT_MANAGER_PTR;
-            if (objMgr) {
-                DWORD currentObj = *(DWORD*)(objMgr + FIRST_OBJECT_OFFSET);
-                int count = 0;
-                
-                while (currentObj != 0 && (currentObj & 1) == 0) {
-                    count++;
-                    // В следующих шагах мы будем вытягивать имена и HP этих объектов
-                    currentObj = *(DWORD*)(currentObj + NEXT_OBJECT_OFFSET);
-                    if(count > 100) break; // Защита от бесконечного цикла
-                }
-                printf("Objects found nearby: %d\n", count);
+            while (currentObj != 0 && (currentObj & 1) == 0) {
+                // Читаем тип объекта (находится по смещению 0x14)
+                int type = *(int*)(currentObj + 0x14);
+
+                if (type == OT_UNIT) units++;
+                if (type == OT_PLAYER) players++;
+                if (type == OT_GAMEOBJECT) items++;
+
+                // Переход к следующему объекту
+                currentObj = *(DWORD*)(currentObj + 0x3C);
             }
+            
+            printf("Found: [Mobs: %d] [Players: %d] [Objects: %d]\n", units, players, items);
         }
-
-        printf("------------------------------\n");
-        Sleep(2000); // Обновляем раз в 2 секунды
-        system("cls"); // Чистим консоль
+        Sleep(1000);
+        system("cls");
+        printf("--- Professional Object Radar ---\n");
     }
     return 0;
 }
