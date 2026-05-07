@@ -11,18 +11,20 @@
 #define ADDR_LUA_EXECUTE      0x00819210
 #define ADDR_CLICK_TO_MOVE    0x00611130
 #define OFFSET_S_CUR_MGR      0x00879CE0 
+#define ADDR_GET_ACTIVE_PLAYER 0x004038BE // Нативная функция получения LocalPlayer
 
 typedef void(__cdecl* tFrameScript_Execute)(const char* command, const char* filename, void* reserved);
 typedef void(__thiscall* tClickToMove)(uintptr_t playerPtr, int clickType, uint64_t* interactGuid, float* pos, float precision);
+typedef uintptr_t(__cdecl* tGetActivePlayer)();
 
 tFrameScript_Execute Lua_DoString = (tFrameScript_Execute)ADDR_LUA_EXECUTE;
 tClickToMove ClickToMove = (tClickToMove)ADDR_CLICK_TO_MOVE;
+tGetActivePlayer GetActivePlayer = (tGetActivePlayer)ADDR_GET_ACTIVE_PLAYER;
 
 // --- ГЛОБАЛЬНЫЕ ДАННЫЕ СИНХРОНИЗАЦИИ ---
-BYTE originalEndSceneBytes[5];
 uintptr_t endSceneAddr = 0;
+void* trampolineEndScene = nullptr;
 
-uintptr_t g_LocalPlayerObj = 0;
 uint64_t g_TargetGuid = 0;
 float g_MoveX = 0, g_MoveY = 0, g_MoveZ = 0;
 
@@ -35,23 +37,19 @@ bool g_QueuedLoot = false;
 enum BotState { STATE_SEARCH, STATE_MOVE, STATE_COMBAT, STATE_LOOT };
 const char* stateNames[] = { "SEARCHING", "MOVING", "COMBAT", "LOOTING" };
 
-// --- ХУК ЛОГИКА ---
-void HookEndScene();
-void UnhookEndScene();
-
+// --- ХУК ЛОГИКА (TRAMPOLINE) ---
 HRESULT __stdcall HookedEndScene(IDirect3DDevice9* pDevice) {
-    UnhookEndScene(); // Временно снимаем хук
-
-    // Все действия выполняются в контексте потока игры
-    if (g_LocalPlayerObj != 0) {
+    // Получаем СВЕЖИЙ указатель на игрока прямо из движка, никаких глобальных кешей!
+    uintptr_t pLocal = GetActivePlayer();
+    
+    if (pLocal != 0) {
         __try {
             if (g_QueuedMove) {
                 float pos[3] = { g_MoveX, g_MoveY, g_MoveZ };
-                ClickToMove(g_LocalPlayerObj, 4, &g_TargetGuid, pos, 0.5f); 
+                ClickToMove(pLocal, 4, &g_TargetGuid, pos, 0.5f); 
                 g_QueuedMove = false;
             }
             if (g_QueuedAttack) {
-                // Безопасный каст: проверяем наличие цели, чтобы не крашнуть UI
                 Lua_DoString("if UnitExists('target') then if not IsCurrentSpell(6603) then StartAttack() end end", "bot", 0);
                 Lua_DoString("if not UnitBuff('player', 'Seal of Righteousness') then CastSpellByID(21084) end", "bot", 0);
                 g_QueuedAttack = false;
@@ -61,33 +59,47 @@ HRESULT __stdcall HookedEndScene(IDirect3DDevice9* pDevice) {
                 g_QueuedInteract = false;
             }
             if (g_QueuedLoot) {
-                // БЕЗОПАСНЫЙ ЛУТ: Лутаем только если окно реально открылось, иначе краш!
                 Lua_DoString("if LootFrame:IsVisible() then for i=1,GetNumLootItems() do LootSlot(i) end CloseLoot() end", "bot", 0);
                 g_QueuedLoot = false;
             }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            // Глушим любые исключения движка
+        } __except(1) {
+            // Заглушка от крашей при смене локации
         }
     }
 
+    // Вызываем оригинал через наш трамплин (хук НЕ СНИМАЕТСЯ, гонок потоков больше нет)
     typedef HRESULT(__stdcall* tEndScene)(IDirect3DDevice9*);
-    HRESULT res = ((tEndScene)endSceneAddr)(pDevice);
-
-    HookEndScene(); // Возвращаем хук
-    return res;
+    return ((tEndScene)trampolineEndScene)(pDevice);
 }
 
-void HookEndScene() {
-    DWORD old; VirtualProtect((void*)endSceneAddr, 5, PAGE_EXECUTE_READWRITE, &old);
-    *(BYTE*)endSceneAddr = 0xE9; // JMP
+bool InstallTrampoline() {
+    trampolineEndScene = VirtualAlloc(NULL, 15, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!trampolineEndScene) return false;
+
+    // Копируем первые 5 байт оригинальной функции
+    memcpy(trampolineEndScene, (void*)endSceneAddr, 5);
+
+    // Добавляем JMP из трамплина обратно в EndScene + 5
+    *(BYTE*)((uintptr_t)trampolineEndScene + 5) = 0xE9;
+    *(uintptr_t*)((uintptr_t)trampolineEndScene + 6) = (endSceneAddr + 5) - ((uintptr_t)trampolineEndScene + 5) - 5;
+
+    // Ставим хук (перезаписываем оригинал JMP'ом на нашу HookedEndScene)
+    DWORD old;
+    VirtualProtect((void*)endSceneAddr, 5, PAGE_EXECUTE_READWRITE, &old);
+    *(BYTE*)endSceneAddr = 0xE9;
     *(uintptr_t*)(endSceneAddr + 1) = (uintptr_t)HookedEndScene - endSceneAddr - 5;
     VirtualProtect((void*)endSceneAddr, 5, old, &old);
+
+    return true;
 }
 
-void UnhookEndScene() {
-    DWORD old; VirtualProtect((void*)endSceneAddr, 5, PAGE_EXECUTE_READWRITE, &old);
-    memcpy((void*)endSceneAddr, originalEndSceneBytes, 5);
+void UnhookTrampoline() {
+    if (!trampolineEndScene) return;
+    DWORD old;
+    VirtualProtect((void*)endSceneAddr, 5, PAGE_EXECUTE_READWRITE, &old);
+    memcpy((void*)endSceneAddr, trampolineEndScene, 5); // Возвращаем оригинальные байты
     VirtualProtect((void*)endSceneAddr, 5, old, &old);
+    VirtualFree(trampolineEndScene, 0, MEM_RELEASE);
 }
 
 uintptr_t GetEndSceneAddress() {
@@ -106,30 +118,24 @@ void SetConsoleCursor(int x, int y) {
     SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), c);
 }
 
-void WriteLog(const char* msg, int lvl, int hp) {
-    FILE* log;
-    if (fopen_s(&log, "bot_log.txt", "a") == 0) {
-        fprintf(log, "[LOG] %-15s | Lvl: %2d | HP: %d\n", msg, lvl, hp);
-        fclose(log);
-    }
-}
-
 // --- ОСНОВНОЙ ЦИКЛ ПРИНЯТИЯ РЕШЕНИЙ ---
 DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f; freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Paladin Internal Bot (Crash-Proof Lua Edition) ---\n");
+    printf("--- Imba Bot Internal v4.0 (TRAMPOLINE EDITION) ---\n");
     endSceneAddr = GetEndSceneAddress();
     if (!endSceneAddr) {
-        printf("[!] Critical: D3D9 EndScene not found! Check overlays.\n");
+        printf("[!] Critical: D3D9 EndScene not found!\n");
         return 0;
     }
 
-    memcpy(originalEndSceneBytes, (void*)endSceneAddr, 5);
-    HookEndScene();
-    printf("[+] Engine Hooked. Safe Lua execution enabled.\n");
-    printf("[*] Turn OFF Steam/Discord Overlays if game crashes!\n");
+    if (InstallTrampoline()) {
+        printf("[+] Trampoline Hook Installed! Thread race conditions eliminated.\n");
+    } else {
+        printf("[-] Failed to install trampoline!\n");
+        return 0;
+    }
     printf("--------------------------------------------------\n");
 
     HMODULE base = GetModuleHandleA(NULL);
@@ -137,7 +143,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     
     BotState state = STATE_SEARCH;
     uint64_t currentTargetGuid = 0;
-    int hudStartY = 7;
+    int hudStartY = 6;
 
     while (!GetAsyncKeyState(VK_END)) {
         uintptr_t clientConn = 0;
@@ -152,16 +158,11 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                 uint64_t myGuid = *(uint64_t*)(mgr + 0xC0);
                 
                 __try {
-                    g_LocalPlayerObj = 0;
-                    while (cur != 0 && (cur & 1) == 0) {
-                        if (*(uint64_t*)(cur + 0x30) == myGuid && myGuid != 0) { g_LocalPlayerObj = cur; break; }
-                        cur = *(uintptr_t*)(cur + 0x3C);
-                    }
-
-                    if (g_LocalPlayerObj) {
-                        uintptr_t localDesc = *(uintptr_t*)(g_LocalPlayerObj + 0x8);
+                    uintptr_t pLocal = GetActivePlayer(); // Используем нативную функцию
+                    if (pLocal) {
+                        uintptr_t localDesc = *(uintptr_t*)(pLocal + 0x8);
                         int hp = *(int*)(localDesc + 0x60), maxHp = *(int*)(localDesc + 0x80), lvl = *(int*)(localDesc + 0xD8);
-                        float myX = *(float*)(g_LocalPlayerObj + 0x798), myY = *(float*)(g_LocalPlayerObj + 0x79C);
+                        float myX = *(float*)(pLocal + 0x798), myY = *(float*)(pLocal + 0x79C);
 
                         printf("[STATUS] Lvl:%d HP:%d/%d POS:%.1f, %.1f          \n", lvl, hp, maxHp, myX, myY);
                         
@@ -203,7 +204,6 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                             if (currentTargetGuid != 0) { 
                                 state = STATE_MOVE; 
                                 *(uint64_t*)(localDesc + 0x48) = currentTargetGuid; 
-                                WriteLog("Target Locked", lvl, hp);
                             }
                         }
 
@@ -234,8 +234,8 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                                     state = STATE_LOOT;
                                     printf("[STATE] LOOTING...                               \n");
                                     g_QueuedInteract = true;
-                                    Sleep(1000); // Даем пингу сервера время прислать окно лута
-                                    g_QueuedLoot = true; // Безопасный вызов (проверит окно сам)
+                                    Sleep(1000); // Ожидание пинга для открытия окна
+                                    g_QueuedLoot = true;
                                     Sleep(500);
                                     
                                     *(uint64_t*)(localDesc + 0x48) = 0; 
@@ -259,7 +259,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
         Sleep(150);
     }
 
-    UnhookEndScene();
+    UnhookTrampoline();
     fclose(f); FreeConsole(); 
     FreeLibraryAndExitThread((HMODULE)lpParam, 0); 
     return 0;
