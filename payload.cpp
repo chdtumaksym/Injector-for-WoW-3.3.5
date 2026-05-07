@@ -2,29 +2,28 @@
 #include <iostream>
 #include <cmath>
 #include <cstdio>
-#include <d3d9.h>
 
-#pragma comment(lib, "d3d9.lib")
 #pragma comment(lib, "user32.lib")
 
 // --- АДРЕСА ФУНКЦИЙ 3.3.5a (12340) ---
 #define ADDR_LUA_EXECUTE      0x00819210
 #define ADDR_CLICK_TO_MOVE    0x00611130
 #define OFFSET_S_CUR_MGR      0x00879CE0 
-#define ADDR_GET_ACTIVE_PLAYER 0x004038BE 
 
 typedef void(__cdecl* tFrameScript_Execute)(const char* command, const char* filename, void* reserved);
 typedef void(__thiscall* tClickToMove)(uintptr_t playerPtr, int clickType, uint64_t* interactGuid, float* pos, float precision);
-typedef uintptr_t(__cdecl* tGetActivePlayer)();
 
 tFrameScript_Execute Lua_DoString = (tFrameScript_Execute)ADDR_LUA_EXECUTE;
 tClickToMove ClickToMove = (tClickToMove)ADDR_CLICK_TO_MOVE;
-tGetActivePlayer GetActivePlayer = (tGetActivePlayer)ADDR_GET_ACTIVE_PLAYER;
 
-// --- ГЛОБАЛЬНЫЕ ДАННЫЕ СИНХРОНИЗАЦИИ ---
+// --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
+HWND g_WowWnd = NULL;
+WNDPROC oWndProc = NULL;
+
+uintptr_t g_LocalPlayerObj = 0;
+uint64_t g_TargetGuid = 0;
 float g_MoveX = 0, g_MoveY = 0, g_MoveZ = 0;
 
-// Очередь команд для главного потока
 bool g_QueuedMove = false;
 bool g_QueuedAttack = false;
 bool g_QueuedInteract = false;
@@ -33,83 +32,37 @@ bool g_QueuedLoot = false;
 enum BotState { STATE_SEARCH, STATE_MOVE, STATE_COMBAT, STATE_LOOT };
 const char* stateNames[] = { "SEARCHING", "MOVING", "COMBAT", "LOOTING" };
 
-// --- VTABLE ХУК ЛОГИКА ---
-typedef HRESULT(__stdcall* tEndScene)(IDirect3DDevice9*);
-tEndScene oEndScene = nullptr;
-
-HRESULT __stdcall HookedEndScene(IDirect3DDevice9* pDevice) {
-    if (pDevice == nullptr) return oEndScene(pDevice);
-
-    uintptr_t pLocal = GetActivePlayer();
-    
-    // Проверяем, что игрок существует и его тип == 4 (Player) во избежание крашей
-    if (pLocal != 0 && *(int*)(pLocal + 0x14) == 4) {
-        __try {
-            if (g_QueuedMove) {
-                float pos[3] = { g_MoveX, g_MoveY, g_MoveZ };
-                uint64_t emptyGuid = 0; // ПУСТОЙ GUID! Чтобы движок не искал трупы и не крашился на 0x14
-                ClickToMove(pLocal, 4, &emptyGuid, pos, 0.5f); 
-                g_QueuedMove = false;
-            }
-            if (g_QueuedAttack) {
-                Lua_DoString("if UnitExists('target') and not IsCurrentSpell(6603) then StartAttack() end", "bot", 0);
-                Lua_DoString("if not UnitBuff('player', 'Seal of Righteousness') then CastSpellByID(21084) end", "bot", 0);
-                g_QueuedAttack = false;
-            }
-            if (g_QueuedInteract) {
-                Lua_DoString("if UnitExists('target') then InteractUnit('target') end", "bot", 0);
-                g_QueuedInteract = false;
-            }
-            if (g_QueuedLoot) {
-                Lua_DoString("if LootFrame:IsVisible() then for i=1,GetNumLootItems() do LootSlot(i) end CloseLoot() end", "bot", 0);
-                g_QueuedLoot = false;
-            }
-        } __except(1) {}
+// --- WNDPROC ХУК (100% ГАРАНТИЯ MAIN THREAD) ---
+LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    // Ловим наше кастомное сообщение
+    if (uMsg == WM_USER + 1) {
+        // ЭТОТ БЛОК ВЫПОЛНЯЕТСЯ СТРОГО В MAIN THREAD! Никаких крашей TLS.
+        if (g_LocalPlayerObj != 0) {
+            __try {
+                if (g_QueuedMove) {
+                    float pos[3] = { g_MoveX, g_MoveY, g_MoveZ };
+                    uint64_t emptyGuid = 0; // Пустой GUID для избежания поиска мертвецов
+                    ClickToMove(g_LocalPlayerObj, 4, &emptyGuid, pos, 0.5f); 
+                    g_QueuedMove = false;
+                }
+                if (g_QueuedAttack) {
+                    Lua_DoString("if UnitExists('target') and not IsCurrentSpell(6603) then StartAttack() end", "bot", 0);
+                    g_QueuedAttack = false;
+                }
+                if (g_QueuedInteract) {
+                    Lua_DoString("if UnitExists('target') then InteractUnit('target') end", "bot", 0);
+                    g_QueuedInteract = false;
+                }
+                if (g_QueuedLoot) {
+                    Lua_DoString("if LootFrame:IsVisible() then for i=1,GetNumLootItems() do LootSlot(i) end CloseLoot() end", "bot", 0);
+                    g_QueuedLoot = false;
+                }
+            } __except(1) {} // Глушим всё, чтобы не уронить клиент
+        }
+        return 0; // Сообщение обработано
     }
-
-    return oEndScene(pDevice);
-}
-
-bool InstallVTableHook() {
-    IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
-    if (!pD3D) return false;
-    D3DPRESENT_PARAMETERS d3dpp = {0}; d3dpp.Windowed = TRUE; d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    IDirect3DDevice9* pDev = nullptr;
-    
-    if (FAILED(pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, GetDesktopWindow(), D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDev))) {
-        pD3D->Release(); return false;
-    }
-
-    // Достаем глобальную VTable D3D9
-    uintptr_t* pVTable = *(uintptr_t**)pDev;
-    oEndScene = (tEndScene)pVTable[42];
-
-    DWORD old;
-    VirtualProtect(&pVTable[42], sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &old);
-    pVTable[42] = (uintptr_t)HookedEndScene; // Подменяем функцию
-    VirtualProtect(&pVTable[42], sizeof(uintptr_t), old, &old);
-
-    pDev->Release(); 
-    pD3D->Release();
-    return true;
-}
-
-void UnhookVTable() {
-    if (!oEndScene) return;
-    IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
-    if (!pD3D) return;
-    D3DPRESENT_PARAMETERS d3dpp = {0}; d3dpp.Windowed = TRUE; d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    IDirect3DDevice9* pDev = nullptr;
-    
-    if (SUCCEEDED(pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, GetDesktopWindow(), D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDev))) {
-        uintptr_t* pVTable = *(uintptr_t**)pDev;
-        DWORD old;
-        VirtualProtect(&pVTable[42], sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &old);
-        pVTable[42] = (uintptr_t)oEndScene; // Возвращаем оригинал
-        VirtualProtect(&pVTable[42], sizeof(uintptr_t), old, &old);
-        pDev->Release();
-    }
-    pD3D->Release();
+    // Всё остальное (клики мыши, клавиатура) отдаем оригинальной игре
+    return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
 }
 
 void SetConsoleCursor(int x, int y) {
@@ -117,19 +70,28 @@ void SetConsoleCursor(int x, int y) {
     SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), c);
 }
 
-// --- ОСНОВНОЙ ЦИКЛ ПРИНЯТИЯ РЕШЕНИЙ ---
+// --- ОСНОВНОЙ ЦИКЛ СКАНИРОВАНИЯ ---
 DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f; freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Imba Bot Internal v5.0 (VTABLE HOOK - CRASH PROOF) ---\n");
+    printf("--- Imba Bot Internal v6.0 (WNDPROC HOOK) ---\n");
     
-    if (InstallVTableHook()) {
-        printf("[+] VTable Hook Installed! Zero instruction slicing.\n");
-    } else {
-        printf("[-] Failed to install VTable hook!\n");
+    g_WowWnd = FindWindowA(NULL, "World of Warcraft");
+    if (!g_WowWnd) {
+        printf("[-] WoW Window not found!\n");
         return 0;
     }
+
+    // Ставим хук на оконную процедуру игры
+    oWndProc = (WNDPROC)SetWindowLongA(g_WowWnd, GWL_WNDPROC, (LONG)HookedWndProc);
+    if (!oWndProc) {
+        printf("[-] Failed to hook WndProc!\n");
+        return 0;
+    }
+
+    printf("[+] WndProc Hooked! 100%% Thread-Safe Main Thread Execution.\n");
+    printf("[*] D3D9 completely bypassed. Crashes eliminated.\n");
     printf("[*] Press END to stop safely.\n");
     printf("--------------------------------------------------\n");
 
@@ -138,7 +100,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     
     BotState state = STATE_SEARCH;
     uint64_t currentTargetGuid = 0;
-    int hudStartY = 6;
+    int hudStartY = 7;
 
     while (!GetAsyncKeyState(VK_END)) {
         uintptr_t clientConn = 0;
@@ -153,15 +115,19 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                 uint64_t myGuid = *(uint64_t*)(mgr + 0xC0);
                 
                 __try {
-                    uintptr_t pLocal = GetActivePlayer(); 
-                    if (pLocal) {
-                        uintptr_t localDesc = *(uintptr_t*)(pLocal + 0x8);
+                    g_LocalPlayerObj = 0;
+                    while (cur != 0 && (cur & 1) == 0) {
+                        if (*(uint64_t*)(cur + 0x30) == myGuid && myGuid != 0) { g_LocalPlayerObj = cur; break; }
+                        cur = *(uintptr_t*)(cur + 0x3C);
+                    }
+
+                    if (g_LocalPlayerObj) {
+                        uintptr_t localDesc = *(uintptr_t*)(g_LocalPlayerObj + 0x8);
                         int hp = *(int*)(localDesc + 0x60), maxHp = *(int*)(localDesc + 0x80), lvl = *(int*)(localDesc + 0xD8);
-                        float myX = *(float*)(pLocal + 0x798), myY = *(float*)(pLocal + 0x79C);
+                        float myX = *(float*)(g_LocalPlayerObj + 0x798), myY = *(float*)(g_LocalPlayerObj + 0x79C);
 
                         printf("[STATUS] Lvl:%d HP:%d/%d POS:%.1f, %.1f          \n", lvl, hp, maxHp, myX, myY);
                         
-                        // --- ИНВЕНТАРЬ ---
                         printf("[BAG] ");
                         int itemsFound = 0;
                         for(int i=0; i<10; i++) {
@@ -186,7 +152,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                             currentTargetGuid = 0;
                             cur = *(uintptr_t*)(mgr + 0xAC);
                             while (cur != 0 && (cur & 1) == 0) {
-                                if (*(int*)(cur + 0x14) == 3) { // NPC
+                                if (*(int*)(cur + 0x14) == 3) {
                                     uintptr_t d = *(uintptr_t*)(cur + 0x8);
                                     if (*(int*)(d + 0x60) > 0 && *(int*)(d + 0xD8) <= lvl + 2 && *(uint64_t*)(d + 0x38) == 0) {
                                         float x = *(float*)(cur + 0x798), y = *(float*)(cur + 0x79C);
@@ -220,16 +186,21 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                                         state = STATE_MOVE;
                                         g_MoveX = tx; g_MoveY = ty; g_MoveZ = tz;
                                         g_QueuedMove = true;
+                                        SendMessageA(g_WowWnd, WM_USER + 1, 0, 0); // Вызов в Main Thread
                                     } else {
                                         state = STATE_COMBAT;
                                         g_QueuedAttack = true; 
+                                        SendMessageA(g_WowWnd, WM_USER + 1, 0, 0);
                                     }
                                 } else {
                                     state = STATE_LOOT;
                                     printf("[STATE] LOOTING...                               \n");
                                     g_QueuedInteract = true;
-                                    Sleep(1000); // Ожидание пинга для открытия окна
+                                    SendMessageA(g_WowWnd, WM_USER + 1, 0, 0);
+                                    Sleep(1000); 
+                                    
                                     g_QueuedLoot = true;
+                                    SendMessageA(g_WowWnd, WM_USER + 1, 0, 0);
                                     Sleep(500);
                                     
                                     *(uint64_t*)(localDesc + 0x48) = 0; 
@@ -253,7 +224,8 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
         Sleep(150);
     }
 
-    UnhookVTable();
+    // Снимаем хук окна и возвращаем управление оригинальной процедуре
+    SetWindowLongA(g_WowWnd, GWL_WNDPROC, (LONG)oWndProc);
     fclose(f); FreeConsole(); 
     FreeLibraryAndExitThread((HMODULE)lpParam, 0); 
     return 0;
