@@ -2,10 +2,11 @@
 #include <iostream>
 #include <cmath>
 #include <cstdio>
+#include <vector>
 
 #pragma comment(lib, "user32.lib")
 
-// --- ЖЕЛЕЗОБЕТОННЫЕ ОФФСЕТЫ 3.3.5a (12340) ---
+// --- ОФФСЕТЫ 3.3.5a (12340) ---
 #define STATIC_CLIENT_CONNECTION 0x00C79CE0
 #define OFFSET_OBJECT_MANAGER    0x2ED0
 
@@ -17,14 +18,27 @@ void SetConsoleCursor(int x, int y) {
     SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), c);
 }
 
-// --- ГЛАВНЫЙ ЦИКЛ БЕЗОПАСНОГО БОТА ---
+// Функция для безопасного нажатия клавиш
+void SendKey(BYTE vKey, bool up = false) {
+    UINT scanCode = MapVirtualKey(vKey, 0);
+    keybd_event(vKey, (BYTE)scanCode, up ? KEYEVENTF_KEYUP : 0, 0);
+}
+
+void WriteLog(const char* msg, int lvl, int hp) {
+    FILE* log;
+    if (fopen_s(&log, "bot_log.txt", "a") == 0) {
+        fprintf(log, "[LOG] %-15s | Lvl: %2d | HP: %d\n", msg, lvl, hp);
+        fclose(log);
+    }
+}
+
 DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f; freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Final Safe Paladin Bot (Zero Hooks Edition) ---\n");
-    printf("[*] No internal calls = No crashes.\n");
-    printf("[*] Bind '1': Attack | 'G': Interact | '9': Flash of Light.\n");
+    printf("--- Paladin Solid Grind v5.0 (Restored & Polished) ---\n");
+    printf("[*] Bindings: '1' Attack, 'G' Interact, '9' Heal.\n");
+    printf("[*] Status: External Logic (Crash-Safe).\n");
     printf("--------------------------------------------------\n");
 
     uintptr_t connectionAddr = STATIC_CLIENT_CONNECTION;
@@ -34,6 +48,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     uint64_t targetGuid = 0;
     bool isMoving = false;
     int hudStartY = 6;
+    int moveRefreshTimer = 0;
 
     while (!GetAsyncKeyState(VK_END)) {
         uintptr_t clientConn = 0;
@@ -59,18 +74,37 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                         int hp = *(int*)(pDesc + 0x60), maxHp = *(int*)(pDesc + 0x80), lvl = *(int*)(pDesc + 0xD8);
                         float myX = *(float*)(pLocal + 0x798), myY = *(float*)(pLocal + 0x79C);
 
-                        printf("[ME] Lvl:%d HP:%d/%d | POS:%.1f, %.1f          \n", lvl, hp, maxHp, myX, myY);
+                        printf("[ME] Lvl:%d HP:%d/%d POS:%.1f, %.1f          \n", lvl, hp, maxHp, myX, myY);
                         
-                        // САМОХИЛ ПАЛАДИНА (Если меньше 40% ХП)
-                        if (hp > 0 && (hp * 100 / maxHp) < 40) {
+                        // --- ИНВЕНТАРЬ ---
+                        printf("[BAG] ");
+                        int items = 0;
+                        for(int i=0; i<12; i++) {
+                            uint64_t iGuid = *(uint64_t*)(pDesc + 0x640 + (i*8));
+                            if (iGuid) {
+                                uintptr_t icur = *(uintptr_t*)(mgr + 0xAC);
+                                while(icur != 0 && (icur & 1) == 0) {
+                                    if(*(uint64_t*)(icur + 0x30) == iGuid) {
+                                        printf("%d ", *(int*)(*(uintptr_t*)(icur + 0x8) + 0xC));
+                                        items++; break;
+                                    }
+                                    icur = *(uintptr_t*)(icur + 0x3C);
+                                }
+                            }
+                        }
+                        printf("(Total: %d)                                \n", items);
+                        printf("--------------------------------------------------\n");
+
+                        // Хил если прижало
+                        if (hp > 0 && (hp * 100 / maxHp) < 45) {
                             if (GetForegroundWindow() == wowWnd) {
-                                keybd_event('9', 0, 0, 0); Sleep(50); keybd_event('9', 0, KEYEVENTF_KEYUP, 0);
+                                SendKey('9'); Sleep(50); SendKey('9', true);
                             }
                         }
 
-                        // --- FSM ---
+                        // --- FSM ЛОГИКА ---
                         if (state == STATE_SEARCH) {
-                            float bestDist = 40.0f; targetGuid = 0;
+                            float bestDist = 50.0f; targetGuid = 0;
                             cur = *(uintptr_t*)(mgr + 0xAC);
                             while (cur != 0 && (cur & 1) == 0) {
                                 if (*(int*)(cur + 0x14) == 3) {
@@ -83,12 +117,16 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                                 }
                                 cur = *(uintptr_t*)(cur + 0x3C);
                             }
-                            if (targetGuid) { state = STATE_MOVE; *(uint64_t*)(pDesc + 0x48) = targetGuid; }
+                            if (targetGuid) { 
+                                state = STATE_MOVE; 
+                                *(uint64_t*)(pDesc + 0x48) = targetGuid; 
+                                WriteLog("Target Locked", lvl, hp);
+                            }
                         }
 
-                        if (targetGuid) {
+                        if (targetGuid != 0) {
                             uintptr_t tObj = 0; cur = *(uintptr_t*)(mgr + 0xAC);
-                            while (cur != 0 && (cur & 1) == 0) { if(*(uint64_t*)(cur+0x30) == targetGuid) { tObj = cur; break; } cur = *(uintptr_t*)(cur+0x3C); }
+                            while (cur != 0 && (cur & 1) == 0) { if(*(uint64_t*)(cur + 0x30) == targetGuid) { tObj = cur; break; } cur = *(uintptr_t*)(cur + 0x3C); }
                             
                             if (tObj) {
                                 uintptr_t td = *(uintptr_t*)(tObj + 0x8);
@@ -98,45 +136,55 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                                 float dist = sqrt(dx*dx + dy*dy);
                                 float cYaw = atan2(dy, dx); if (cYaw < 0) cYaw += 6.283185f;
 
-                                printf("[TARGET] HP:%d Dist:%.2f yds                  \n", thp, dist);
+                                printf("[TARGET] HP:%-5d Dist:%.2f yds                  \n", thp, dist);
                                 
                                 if (thp > 0) {
                                     if (GetForegroundWindow() == wowWnd) {
-                                        *(float*)(pLocal + 0x7A8) = cYaw; // Поворот
+                                        *(float*)(pLocal + 0x7A8) = cYaw; // Пишем поворот
                                         
-                                        if (dist > 4.5f) {
+                                        if (dist > 3.8f) {
                                             state = STATE_MOVE;
-                                            if (!isMoving) { keybd_event('W', 0x11, 0, 0); isMoving = true; }
+                                            // Если долго бежим или только начали - освежаем нажатие W
+                                            if (!isMoving || ++moveRefreshTimer > 20) { 
+                                                SendKey('W'); 
+                                                isMoving = true; 
+                                                moveRefreshTimer = 0;
+                                            }
                                         } else {
                                             state = STATE_COMBAT;
-                                            if (isMoving) { keybd_event('W', 0x11, KEYEVENTF_KEYUP, 0); isMoving = false; }
-                                            keybd_event('1', 0, 0, 0); keybd_event('1', 0, KEYEVENTF_KEYUP, 0);
+                                            if (isMoving) { SendKey('W', true); isMoving = false; }
+                                            SendKey('1'); Sleep(30); SendKey('1', true);
                                         }
+                                    } else {
+                                        if (isMoving) { SendKey('W', true); isMoving = false; }
                                     }
                                 } else {
                                     state = STATE_LOOT;
-                                    if (isMoving) { keybd_event('W', 0x11, KEYEVENTF_KEYUP, 0); isMoving = false; }
+                                    if (isMoving) { SendKey('W', true); isMoving = false; }
                                     if (GetForegroundWindow() == wowWnd) {
-                                        keybd_event('G', 0, 0, 0); Sleep(100); keybd_event('G', 0, KEYEVENTF_KEYUP, 0);
+                                        SendKey('G'); Sleep(50); SendKey('G', true);
                                         Sleep(1500); 
                                     }
                                     *(uint64_t*)(pDesc + 0x48) = 0; targetGuid = 0; state = STATE_SEARCH;
                                 }
-                            } else { targetGuid = 0; state = STATE_SEARCH; *(uint64_t*)(pDesc + 0x48) = 0; }
+                            } else { 
+                                targetGuid = 0; state = STATE_SEARCH; 
+                                if (isMoving) { SendKey('W', true); isMoving = false; }
+                            }
                         } else { 
                             printf("[TARGET] NONE                                    \n");
-                            if (isMoving) { keybd_event('W', 0x11, KEYEVENTF_KEYUP, 0); isMoving = false; }
+                            if (isMoving) { SendKey('W', true); isMoving = false; }
                         }
                         
-                        printf("[FSM] %-10s                                       \n", stateNames[state]);
+                        printf("[FSM] %-10s | MOVING: %-3s                      \n", stateNames[state], isMoving ? "YES" : "NO");
                     }
-                } __except(1) {}
+                } __except(1) { printf("Memory exception.                                \n"); }
             }
         }
         Sleep(100);
     }
 
-    if (isMoving) keybd_event('W', 0x11, KEYEVENTF_KEYUP, 0);
+    if (isMoving) SendKey('W', true);
     fclose(f); FreeConsole(); FreeLibraryAndExitThread((HMODULE)lpParam, 0); return 0;
 }
 
