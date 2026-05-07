@@ -1,15 +1,22 @@
 #include <windows.h>
 #include <iostream>
-#include <vector>
 
 #pragma comment(lib, "user32.lib")
 
-// Функция поиска сигнатуры (байтов) в памяти
-uintptr_t FindPattern(uintptr_t start, uintptr_t size, const char* pattern, const char* mask) {
-    for (uintptr_t i = 0; i < size - strlen(mask); i++) {
+// Функция поиска сигнатуры с безопасным парсингом PE-заголовка
+uintptr_t FindPattern(HMODULE module, const char* pattern, const char* mask) {
+    IMAGE_DOS_HEADER* dosHeader = (IMAGE_DOS_HEADER*)module;
+    IMAGE_NT_HEADERS* ntHeaders = (IMAGE_NT_HEADERS*)((uint8_t*)module + dosHeader->e_lfanew);
+
+    // Сканируем только секцию кода, чтобы не словить Access Violation
+    uintptr_t start = (uintptr_t)module + ntHeaders->OptionalHeader.BaseOfCode;
+    uintptr_t size = ntHeaders->OptionalHeader.SizeOfCode;
+    size_t maskLen = strlen(mask); // Длина вычисляется один раз!
+
+    for (uintptr_t i = 0; i < size - maskLen; i++) {
         bool found = true;
-        for (uintptr_t j = 0; mask[j] != '\0'; j++) {
-            if (mask[j] != '?' && (char)pattern[j] != *(char*)(start + i + j)) {
+        for (size_t j = 0; j < maskLen; j++) {
+            if (mask[j] != '?' && pattern[j] != *(char*)(start + i + j)) {
                 found = false;
                 break;
             }
@@ -24,47 +31,61 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
 
-    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    HMODULE base = GetModuleHandleA(NULL);
     printf("--- Pattern Scanner Active ---\n");
-    printf("[*] Base: 0x%p. Scanning...\n", (void*)base);
+    printf("[*] Base: 0x%p. Safe scanning .text section...\n", (void*)base);
 
-    // Сигнатура функции GetObjectManager для WoW 3.3.5a
-    // 8B 15 ? ? ? ? 8B 42 2C 85 C0
     const char* pattern = "\x8B\x15\x00\x00\x00\x00\x8B\x42\x2C\x85\xC0";
     const char* mask = "xx????xxxxx";
 
-    uintptr_t match = FindPattern(base, 0x1000000, pattern, mask);
+    uintptr_t match = FindPattern(base, pattern, mask);
 
     if (match) {
-        // Вытягиваем адрес из инструкции MOV EDX, [ADDR]
-        uintptr_t objMgrAddr = *(uintptr_t*)(match + 2);
-        printf("[!] FOUND! Real ObjMgr Address: 0x%p\n", (void*)objMgrAddr);
+        uintptr_t connectionAddr = *(uintptr_t*)(match + 2);
+        printf("[!] FOUND! ClientConnection Pointer: 0x%p\n", (void*)connectionAddr);
+        printf("[*] Press END to unload the DLL.\n");
 
-        while (true) {
-            uintptr_t objMgr = *(uintptr_t*)objMgrAddr;
-            if (objMgr) {
-                uintptr_t cur = *(uintptr_t*)(objMgr + 0xAC);
-                int count = 0;
-                while (cur != 0 && (cur & 1) == 0) {
-                    count++;
-                    cur = *(uintptr_t*)(cur + 0x3C);
-                    if (count > 2000) break;
+        while (!GetAsyncKeyState(VK_END)) {
+            uintptr_t clientConnection = *(uintptr_t*)connectionAddr;
+            
+            // Если мы в мире и структура инициализирована
+            if (clientConnection) {
+                // Правильная цепочка: ClientConnection -> +0x2ED0 (ObjectManager) -> +0xAC (First Object)
+                uintptr_t objMgr = *(uintptr_t*)(clientConnection + 0x2ED0);
+                
+                if (objMgr) {
+                    uintptr_t cur = *(uintptr_t*)(objMgr + 0xAC);
+                    int count = 0;
+                    
+                    while (cur != 0 && (cur & 1) == 0 && count < 2000) {
+                        count++;
+                        cur = *(uintptr_t*)(cur + 0x3C); // Смещение на следующий объект
+                    }
+                    printf("Real-time Objects: %d          \r", count);
                 }
-                printf("Real-time Objects: %d\r", count);
             } else {
-                printf("ObjMgr is 0. Waiting for world...\r");
+                printf("Waiting for world...           \r");
             }
-            Sleep(500);
+            Sleep(100);
         }
     } else {
-        printf("[!] ERROR: Pattern not found. Your client is unique.\n");
+        printf("[!] ERROR: Pattern not found.\n");
+        while (!GetAsyncKeyState(VK_END)) Sleep(100);
     }
+
+    // Адекватное завершение работы
+    printf("\n[*] Unloading...\n");
+    fclose(f);
+    FreeConsole();
+    FreeLibraryAndExitThread((HMODULE)lpParam, 0);
     return 0;
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
-        CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)MainThread, NULL, 0, NULL);
+        DisableThreadLibraryCalls(hinstDLL); // Оптимизация, чтобы не вызывать DllMain на каждый новый поток
+        HANDLE hThread = CreateThread(NULL, 0, MainThread, hinstDLL, 0, NULL);
+        if (hThread) CloseHandle(hThread);
     }
     return TRUE;
 }
