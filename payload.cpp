@@ -1,50 +1,54 @@
 #include <windows.h>
 #include <iostream>
 
+#pragma comment(lib, "user32.lib")
+
+// Оффсеты 3.3.5а (12340)
 #define PLAYER_BASE_OFFSET 0x00BD07E0
 #define OBJECT_MANAGER_PTR 0x00B41414
-
-// Типы объектов в WoW 3.3.5
-enum WowObjType {
-    OT_ITEM = 1,
-    OT_CONTAINER = 2,
-    OT_UNIT = 3,      // Это мобы и NPC
-    OT_PLAYER = 4,    // Другие игроки
-    OT_GAMEOBJECT = 5 // Руда, трава, сундуки
-};
+#define CTM_PUSH 0x00860A90 // Функция клика
 
 DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Professional Object Radar ---\n");
+    printf("--- Debug Mode Started ---\n");
 
     while (true) {
-        DWORD objMgr = *(DWORD*)OBJECT_MANAGER_PTR;
-        if (objMgr) {
-            // Начало списка объектов
-            DWORD currentObj = *(DWORD*)(objMgr + 0xAC); 
-            
-            int units = 0, players = 0, items = 0;
-
-            while (currentObj != 0 && (currentObj & 1) == 0) {
-                // Читаем тип объекта (находится по смещению 0x14)
-                int type = *(int*)(currentObj + 0x14);
-
-                if (type == OT_UNIT) units++;
-                if (type == OT_PLAYER) players++;
-                if (type == OT_GAMEOBJECT) items++;
-
-                // Переход к следующему объекту
-                currentObj = *(DWORD*)(currentObj + 0x3C);
+        // Проверка №1: Видим ли мы Object Manager?
+        DWORD* objMgrPtr = (DWORD*)OBJECT_MANAGER_PTR;
+        if (IsBadReadPtr(objMgrPtr, sizeof(DWORD))) {
+            printf("[!] Error: Cannot read ObjectManager at 0x%X\n", OBJECT_MANAGER_PTR);
+        } else {
+            DWORD objMgr = *objMgrPtr;
+            if (!objMgr) {
+                printf("[?] ObjectManager is NULL. Are you in world?\n");
+            } else {
+                printf("[+] ObjectManager Found at: 0x%X\n", objMgr);
+                // Если нашелся, считаем объекты
+                DWORD currentObj = *(DWORD*)(objMgr + 0xAC);
+                int count = 0;
+                while (currentObj != 0 && (currentObj & 1) == 0) {
+                    count++;
+                    currentObj = *(DWORD*)(currentObj + 0x3C);
+                    if(count > 1000) break;
+                }
+                printf("[+] Nearby Objects: %d\n", count);
             }
-            
-            printf("Found: [Mobs: %d] [Players: %d] [Objects: %d]\n", units, players, items);
         }
+
+        // Проверка №2: Кнопка F1
+        if (GetAsyncKeyState(VK_F1) & 0x8000) {
+            printf("[!] F1 Pressed! Testing Click-to-Move...\n");
+            // Пробуем просто заставить персонажа "стопнуть" через CTM
+            DWORD ctm_base = 0x00BD07A0;
+            *(int*)(ctm_base + 0x1C) = 2; // Action: Stop
+        }
+
         Sleep(1000);
         system("cls");
-        printf("--- Professional Object Radar ---\n");
+        printf("--- Debug Mode Active ---\n");
     }
     return 0;
 }
