@@ -1,25 +1,30 @@
 name: Build-Imba-Bot
 on: [push]
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4 # Обновили до v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Initialize MSVC x86
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x86
 
-      - name: Compile
+      - name: Compile Injector and Payload
         run: |
-          cl.exe /O2 /EHsc injector.cpp /link /OUT:injector.exe
-          cl.exe /O2 /LD /EHsc payload.cpp /link /OUT:bot_payload.dll
+          # Компилируем инжектор (EXE)
+          cl.exe /O2 /EHsc injector.cpp /link /OUT:injector.exe user32.lib advapi32.lib shell32.lib
+          
+          # Компилируем бота (DLL)
+          cl.exe /O2 /LD /EHsc payload.cpp /link /OUT:bot_payload.dll user32.lib
 
-      - name: Upload
-        uses: actions/upload-artifact@v4 # ТУТ БЫЛА ОШИБКА, теперь v4
+      - name: Upload Finished Bot
+        uses: actions/upload-artifact@v4
         with:
-          name: Bot-Files
+          name: Imba-Bot-Release
           path: |
             injector.exe
             bot_payload.dll
