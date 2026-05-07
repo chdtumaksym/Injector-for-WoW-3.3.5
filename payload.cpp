@@ -1,45 +1,63 @@
 #include <windows.h>
 #include <iostream>
+#include <vector>
 
 #pragma comment(lib, "user32.lib")
 
-// Оффсеты БЕЗ учета базы (чистые смещения)
-#define OFFSET_OBJMGR 0x00B41414
-#define OFFSET_PLAYER 0x00BD07E0
+// Функция поиска сигнатуры (байтов) в памяти
+uintptr_t FindPattern(uintptr_t start, uintptr_t size, const char* pattern, const char* mask) {
+    for (uintptr_t i = 0; i < size - strlen(mask); i++) {
+        bool found = true;
+        for (uintptr_t j = 0; mask[j] != '\0'; j++) {
+            if (mask[j] != '?' && (char)pattern[j] != *(char*)(start + i + j)) {
+                found = false;
+                break;
+            }
+        }
+        if (found) return start + i;
+    }
+    return 0;
+}
 
 DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
 
-    // 1. Получаем базу модуля (где начинается память WoW в этот раз)
-    uintptr_t baseAddr = (uintptr_t)GetModuleHandleA(NULL);
-    
-    printf("--- PRO SCANNER v2.0 ---\n");
-    printf("[*] Module Base: 0x%p\n", (void*)baseAddr);
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    printf("--- Pattern Scanner Active ---\n");
+    printf("[*] Base: 0x%p. Scanning...\n", (void*)base);
 
-    while (true) {
-        // 2. Считаем реальный адрес: База + Оффсет
-        // ВНИМАНИЕ: Если у тебя чистый 12340, база обычно 0x400000. 
-        // Но современные ОС могут её менять.
-        
-        uintptr_t realObjMgrPtr = baseAddr + (OFFSET_OBJMGR - 0x400000);
-        uintptr_t realPlayerPtr = baseAddr + (OFFSET_PLAYER - 0x400000);
+    // Сигнатура функции GetObjectManager для WoW 3.3.5a
+    // 8B 15 ? ? ? ? 8B 42 2C 85 C0
+    const char* pattern = "\x8B\x15\x00\x00\x00\x00\x8B\x42\x2C\x85\xC0";
+    const char* mask = "xx????xxxxx";
 
-        DWORD* objMgr = (DWORD*)realObjMgrPtr;
-        DWORD* player = (DWORD*)realPlayerPtr;
+    uintptr_t match = FindPattern(base, 0x1000000, pattern, mask);
 
-        if (objMgr && !IsBadReadPtr(objMgr, sizeof(DWORD))) {
-            printf("[+] Real ObjMgr Addr: 0x%p | Value: 0x%X\n", (void*)realObjMgrPtr, *objMgr);
+    if (match) {
+        // Вытягиваем адрес из инструкции MOV EDX, [ADDR]
+        uintptr_t objMgrAddr = *(uintptr_t*)(match + 2);
+        printf("[!] FOUND! Real ObjMgr Address: 0x%p\n", (void*)objMgrAddr);
+
+        while (true) {
+            uintptr_t objMgr = *(uintptr_t*)objMgrAddr;
+            if (objMgr) {
+                uintptr_t cur = *(uintptr_t*)(objMgr + 0xAC);
+                int count = 0;
+                while (cur != 0 && (cur & 1) == 0) {
+                    count++;
+                    cur = *(uintptr_t*)(cur + 0x3C);
+                    if (count > 2000) break;
+                }
+                printf("Real-time Objects: %d\r", count);
+            } else {
+                printf("ObjMgr is 0. Waiting for world...\r");
+            }
+            Sleep(500);
         }
-        
-        if (player && !IsBadReadPtr(player, sizeof(DWORD))) {
-            printf("[+] Real Player Addr: 0x%p | Value: 0x%X\n", (void*)realPlayerPtr, *player);
-        }
-
-        Sleep(1500);
-        system("cls");
-        printf("Base: 0x%p | Scanning for life...\n", (void*)baseAddr);
+    } else {
+        printf("[!] ERROR: Pattern not found. Your client is unique.\n");
     }
     return 0;
 }
