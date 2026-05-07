@@ -86,42 +86,53 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
             if (objMgr) {
                 uintptr_t cur = *(uintptr_t*)(objMgr + 0xAC);
                 uint64_t localGuid = *(uint64_t*)(objMgr + 0xC0); // Получаем GUID нашего персонажа
-                int totalObjects = 0;
                 
-                // Дополнительная проверка указателя cur
                 __try {
-                    bool foundMe = false;
-                    while (cur != 0 && (cur & 1) == 0 && totalObjects < 2000) {
-                        totalObjects++;
-                        
-                        // Читаем GUID текущего перебираемого объекта (смещение 0x30)
-                        uint64_t objGuid = *(uint64_t*)(cur + 0x30);
-                        
-                        // Если GUID совпал с нашим - читаем наши личные данные
-                        if (objGuid == localGuid && localGuid != 0) {
-                            foundMe = true;
-                            
-                            // Читаем указатель на Дескриптор (массив характеристик)
-                            uintptr_t descriptor = *(uintptr_t*)(cur + 0x8);
-                            
-                            // Читаем ХП из дескриптора (UNIT_FIELD_HEALTH = 0x17, UNIT_FIELD_MAXHEALTH = 0x1F)
-                            // Умножаем на 4, так как каждый оффсет это 4 байта (int)
-                            int hp = *(int*)(descriptor + 0x5C); 
-                            int maxHp = *(int*)(descriptor + 0x7C);
-                            
-                            // Читаем координаты X Y Z
-                            float x = *(float*)(cur + 0x798);
-                            float y = *(float*)(cur + 0x79C);
-                            float z = *(float*)(cur + 0x7A0);
-                            
-                            printf("ME: HP %d/%d | POS: X:%.1f Y:%.1f Z:%.1f (Total Obj: %d)          \r", 
-                                   hp, maxHp, x, y, z, totalObjects);
-                        }
+                    uintptr_t localPlayerObj = 0;
+                    uint64_t targetGuid = 0;
+                    uintptr_t targetObj = 0;
 
-                        cur = *(uintptr_t*)(cur + 0x3C); // Смещение на следующий объект
+                    // Первый проход: ищем себя и узнаем GUID нашей цели
+                    while (cur != 0 && (cur & 1) == 0) {
+                        uint64_t objGuid = *(uint64_t*)(cur + 0x30);
+                        if (objGuid == localGuid && localGuid != 0) {
+                            localPlayerObj = cur;
+                            uintptr_t descriptor = *(uintptr_t*)(cur + 0x8);
+                            // 0x48 (index 0x12) - UNIT_FIELD_TARGET (uint64_t)
+                            targetGuid = *(uint64_t*)(descriptor + 0x48);
+                            break; // Нашли себя, дальше этот цикл крутить нет смысла
+                        }
+                        cur = *(uintptr_t*)(cur + 0x3C);
                     }
-                    
-                    if (!foundMe) {
+
+                    // Второй проход: если у нас есть цель, ищем её объект в памяти
+                    if (targetGuid != 0) {
+                        cur = *(uintptr_t*)(objMgr + 0xAC); // Сбрасываем указатель на начало списка
+                        while (cur != 0 && (cur & 1) == 0) {
+                            uint64_t objGuid = *(uint64_t*)(cur + 0x30);
+                            if (objGuid == targetGuid) {
+                                targetObj = cur;
+                                break;
+                            }
+                            cur = *(uintptr_t*)(cur + 0x3C);
+                        }
+                    }
+
+                    // Вывод информации
+                    if (localPlayerObj) {
+                        uintptr_t localDesc = *(uintptr_t*)(localPlayerObj + 0x8);
+                        int hp = *(int*)(localDesc + 0x60);
+                        int maxHp = *(int*)(localDesc + 0x80);
+                        
+                        if (targetObj) {
+                            uintptr_t targetDesc = *(uintptr_t*)(targetObj + 0x8);
+                            int tHp = *(int*)(targetDesc + 0x60);
+                            int tMaxHp = *(int*)(targetDesc + 0x80);
+                            printf("ME: %d/%d HP | TARGET: %d/%d HP                          \r", hp, maxHp, tHp, tMaxHp);
+                        } else {
+                            printf("ME: %d/%d HP | TARGET: NONE                              \r", hp, maxHp);
+                        }
+                    } else {
                         printf("Local player not found in ObjectManager...                          \r");
                     }
                 } __except (EXCEPTION_EXECUTE_HANDLER) {
