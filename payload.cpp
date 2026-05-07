@@ -2,7 +2,6 @@
 #include <iostream>
 #include <cmath>
 #include <cstdio>
-#include <vector>
 #include <d3d9.h>
 
 #pragma comment(lib, "d3d9.lib")
@@ -41,7 +40,7 @@ void HookEndScene();
 void UnhookEndScene();
 
 HRESULT __stdcall HookedEndScene(IDirect3DDevice9* pDevice) {
-    UnhookEndScene(); // Временно снимаем хук для вызова оригинальных функций движка
+    UnhookEndScene(); // Временно снимаем хук
 
     // Все действия выполняются в контексте потока игры
     if (g_LocalPlayerObj != 0) {
@@ -52,28 +51,29 @@ HRESULT __stdcall HookedEndScene(IDirect3DDevice9* pDevice) {
                 g_QueuedMove = false;
             }
             if (g_QueuedAttack) {
-                Lua_DoString("if not IsCurrentSpell(6603) then StartAttack() end", "bot", 0);
-                // Пример каста паладина (Печать праведности)
+                // Безопасный каст: проверяем наличие цели, чтобы не крашнуть UI
+                Lua_DoString("if UnitExists('target') then if not IsCurrentSpell(6603) then StartAttack() end end", "bot", 0);
                 Lua_DoString("if not UnitBuff('player', 'Seal of Righteousness') then CastSpellByID(21084) end", "bot", 0);
                 g_QueuedAttack = false;
             }
             if (g_QueuedInteract) {
-                Lua_DoString("InteractUnit('target')", "bot", 0);
+                Lua_DoString("if UnitExists('target') then InteractUnit('target') end", "bot", 0);
                 g_QueuedInteract = false;
             }
             if (g_QueuedLoot) {
-                Lua_DoString("for i=1,GetNumLootItems() do LootSlot(i) end CloseLoot()", "bot", 0);
+                // БЕЗОПАСНЫЙ ЛУТ: Лутаем только если окно реально открылось, иначе краш!
+                Lua_DoString("if LootFrame:IsVisible() then for i=1,GetNumLootItems() do LootSlot(i) end CloseLoot() end", "bot", 0);
                 g_QueuedLoot = false;
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {
-            // Если упали тут - значит адреса функций неверные
+            // Глушим любые исключения движка
         }
     }
 
     typedef HRESULT(__stdcall* tEndScene)(IDirect3DDevice9*);
     HRESULT res = ((tEndScene)endSceneAddr)(pDevice);
 
-    HookEndScene(); // Возвращаем хук обратно
+    HookEndScene(); // Возвращаем хук
     return res;
 }
 
@@ -101,7 +101,6 @@ uintptr_t GetEndSceneAddress() {
     return addr;
 }
 
-// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 void SetConsoleCursor(int x, int y) {
     COORD c = {(SHORT)x, (SHORT)y};
     SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), c);
@@ -120,17 +119,17 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f; freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Paladin Industrial Bot (Internal Hook Edition) ---\n");
+    printf("--- Paladin Internal Bot (Crash-Proof Lua Edition) ---\n");
     endSceneAddr = GetEndSceneAddress();
     if (!endSceneAddr) {
-        printf("[!] Critical: D3D9 EndScene not found!\n");
+        printf("[!] Critical: D3D9 EndScene not found! Check overlays.\n");
         return 0;
     }
 
     memcpy(originalEndSceneBytes, (void*)endSceneAddr, 5);
     HookEndScene();
-    printf("[+] Engine Hooked. Background operation enabled.\n");
-    printf("[*] Press END to stop safely.\n");
+    printf("[+] Engine Hooked. Safe Lua execution enabled.\n");
+    printf("[*] Turn OFF Steam/Discord Overlays if game crashes!\n");
     printf("--------------------------------------------------\n");
 
     HMODULE base = GetModuleHandleA(NULL);
@@ -203,7 +202,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                             }
                             if (currentTargetGuid != 0) { 
                                 state = STATE_MOVE; 
-                                *(uint64_t*)(localDesc + 0x48) = currentTargetGuid; // Ставим таргет
+                                *(uint64_t*)(localDesc + 0x48) = currentTargetGuid; 
                                 WriteLog("Target Locked", lvl, hp);
                             }
                         }
@@ -229,15 +228,15 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                                         g_QueuedMove = true;
                                     } else {
                                         state = STATE_COMBAT;
-                                        g_QueuedAttack = true; // Запускаем цикл атаки в главном потоке
+                                        g_QueuedAttack = true; 
                                     }
                                 } else {
                                     state = STATE_LOOT;
                                     printf("[STATE] LOOTING...                               \n");
                                     g_QueuedInteract = true;
-                                    Sleep(800); 
-                                    g_QueuedLoot = true;
-                                    Sleep(1000);
+                                    Sleep(1000); // Даем пингу сервера время прислать окно лута
+                                    g_QueuedLoot = true; // Безопасный вызов (проверит окно сам)
+                                    Sleep(500);
                                     
                                     *(uint64_t*)(localDesc + 0x48) = 0; 
                                     currentTargetGuid = 0;
