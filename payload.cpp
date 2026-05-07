@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <iostream>
 #include <cmath>
+#include <fstream> // Для работы с файлами (логирование)
 
 #pragma comment(lib, "user32.lib")
 
@@ -63,9 +64,13 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     else printf("[-] Using Static Pointer: 0x%p\n", (void*)connectionAddr);
 
     printf("[*] Press END to unload the DLL.\n");
+    printf("[*] Logging target changes to bot_log.txt\n");
     printf("--------------------------------------------------\n");
     
-    int hudStartY = 6; 
+    int hudStartY = 7; // Сдвигаем вывод из-за новой строки логера
+    uint64_t lastLoggedGuid = 0; // Переменная для контроля спама в лог
+    bool isMoving = false; // Флаг для контроля залипания клавиши W
+    HWND wowWnd = FindWindowA(NULL, "World of Warcraft"); // Ищем окно игры
 
     while (!GetAsyncKeyState(VK_END)) {
         uintptr_t clientConnection = 0;
@@ -115,71 +120,136 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                         // 2. Ищем ближайшего живого моба
                         float closestDist = 999999.0f;
                         uint64_t closestGuid = 0;
-                        int closestHp = 0, closestMaxHp = 0;
+                        int closestHp = 0, closestMaxHp = 0, closestFaction = 0;
                         float cX = 0, cY = 0, cZ = 0;
+                        float cYaw = 0; // Угол поворота к цели
 
                         cur = *(uintptr_t*)(objMgr + 0xAC); // Сброс указателя на начало
                         while (cur != 0 && (cur & 1) == 0) {
                             int objType = *(int*)(cur + 0x14);
+                            uint64_t objGuid = *(uint64_t*)(cur + 0x30);
                             
-                            // Нас интересуют только NPC/Мобы (тип 4)
-                            if (objType == 4) {
+                            // Тип 3 - это NPC (Unit). Тип 4 - Игрок. Ищем строго мобов и игнорим себя!
+                            if (objType == 3 && objGuid != localGuid) {
                                 uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                                 int npcHp = *(int*)(desc + 0x60);
                                 
                                 // Мертвецов не трогаем
                                 if (npcHp > 0) {
-                                    float x = *(float*)(cur + 0x798);
-                                    float y = *(float*)(cur + 0x79C);
-                                    float z = *(float*)(cur + 0x7A0);
+                                    uint64_t summonedBy = *(uint64_t*)(desc + 0x38); // Оффсет хозяина (петы)
+                                    uint64_t createdBy = *(uint64_t*)(desc + 0x40);  // Оффсет создателя (тотемы)
                                     
-                                    float dx = x - myX;
-                                    float dy = y - myY;
-                                    float dz = z - myZ;
-                                    float dist = sqrt(dx*dx + dy*dy + dz*dz);
-                                    
-                                    // Находим минимальную дистанцию
-                                    if (dist < closestDist) {
-                                        closestDist = dist;
-                                        closestGuid = *(uint64_t*)(cur + 0x30);
-                                        closestHp = npcHp;
-                                        closestMaxHp = *(int*)(desc + 0x80);
-                                        cX = x; cY = y; cZ = z;
+                                    // ИГНОРИРУЕМ абсолютно всех петов и тотемы
+                                    if (summonedBy == 0 && createdBy == 0) {
+                                        float x = *(float*)(cur + 0x798);
+                                        float y = *(float*)(cur + 0x79C);
+                                        float z = *(float*)(cur + 0x7A0);
+                                        
+                                        float dx = x - myX;
+                                        float dy = y - myY;
+                                        float dz = z - myZ;
+                                        float dist = sqrt(dx*dx + dy*dy + dz*dz);
+                                        
+                                        // Находим минимальную дистанцию
+                                        if (dist < closestDist) {
+                                            closestDist = dist;
+                                            closestGuid = objGuid;
+                                            closestHp = npcHp;
+                                            closestMaxHp = *(int*)(desc + 0x80);
+                                            closestFaction = *(int*)(desc + 0x8C); // UNIT_FIELD_FACTIONTEMPLATE
+                                            cX = x; cY = y; cZ = z;
+                                            
+                                            // Вычисляем угол в радианах, куда должен смотреть бот для бега
+                                        cYaw = atan2(dy, dx);
+                                        if (cYaw < 0) cYaw += 2.0f * 3.14159265f;
                                     }
                                 }
                             }
-                            cur = *(uintptr_t*)(cur + 0x3C);
                         }
+                        cur = *(uintptr_t*)(cur + 0x3C);
+                    }
 
-                        if (closestGuid != 0) {
-                            printf("[AUTOTARGET: CLOSEST ALIVE NPC]                  \n");
-                            printf("HP: %d/%d                                        \n", closestHp, closestMaxHp);
-                            printf("POS: X:%.2f | Y:%.2f | Z:%.2f                    \n", cX, cY, cZ);
-                            printf("Distance: %.2f yards                             \n", closestDist);
+                    if (closestGuid != 0) {
+                        printf("[AUTOTARGET: CLOSEST ALIVE NPC]                  \n");
+                        printf("HP: %d/%d | Faction ID: %d                       \n", closestHp, closestMaxHp, closestFaction);
+                        printf("POS: X:%.2f | Y:%.2f | Z:%.2f                    \n", cX, cY, cZ);
+                        printf("Distance: %.2f yds | Req. Yaw: %.2f rad          \n", closestDist, cYaw);
+                        
+                        // --- ЛОГИКА ДВИЖЕНИЯ ---
+                        // Если до цели больше 5 ярдов (расстояние мили-атаки) и активно окно ВоВки
+                        if (closestDist > 5.0f && GetForegroundWindow() == wowWnd) {
+                            // ЖЕСТКО пишем нужный угол поворота прямо в память персонажа
+                            *(float*)(localPlayerObj + 0x7A8) = cYaw;
+                            
+                            // Симулируем нажатие клавиши 'W' для бега вперед
+                            if (!isMoving) {
+                                keybd_event('W', MapVirtualKey('W', 0), 0, 0);
+                                isMoving = true;
+                            }
+                        } else {
+                            // Дошли до цели или окно свернуто - отпускаем кнопку
+                            if (isMoving) {
+                                keybd_event('W', MapVirtualKey('W', 0), KEYEVENTF_KEYUP, 0);
+                                isMoving = false;
+                            }
+                        }
+                        
+                        // Пишем в лог-файл только если цель сменилась
+                        if (closestGuid != lastLoggedGuid) {
+                                std::ofstream logFile("bot_log.txt", std::ios::app);
+                                if (logFile.is_open()) {
+                                    logFile << "[LOG] Target Locked! Dist: " << closestDist 
+                                            << " yds | Faction: " << closestFaction 
+                                            << " | HP: " << closestHp << " | POS: " 
+                                            << cX << ", " << cY << ", " << cZ << "\n";
+                                    logFile.close();
+                                }
+                                lastLoggedGuid = closestGuid;
+                            }
                         } else {
                             printf("[AUTOTARGET] NO ALIVE MOBS AROUND                \n");
                             printf("                                                 \n");
                             printf("                                                 \n");
                             printf("                                                 \n");
+                            lastLoggedGuid = 0; // Сбрасываем таргет
                         }
                     } else {
-                        printf("Local player not found in ObjectManager...       \n");
-                        for(int i=0; i<8; i++) printf("                                                 \n");
+                        printf("[AUTOTARGET] NO ALIVE MOBS AROUND                \n");
+                        printf("                                                 \n");
+                        printf("                                                 \n");
+                        printf("                                                 \n");
+                        lastLoggedGuid = 0; // Сбрасываем таргет
+                        
+                        // Отпускаем кнопку если мобов вообще нет вокруг
+                        if (isMoving) {
+                            keybd_event('W', MapVirtualKey('W', 0), KEYEVENTF_KEYUP, 0);
+                            isMoving = false;
+                        }
                     }
-                } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    printf("Reading Error...                                     \n");
+                } else {
+                    printf("Local player not found in ObjectManager...       \n");
                     for(int i=0; i<8; i++) printf("                                                 \n");
                 }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                printf("Reading Error...                                     \n");
+                for(int i=0; i<8; i++) printf("                                                 \n");
             }
-        } else {
-            printf("Waiting for world...                                     \n");
-            for(int i=0; i<8; i++) printf("                                                 \n");
         }
-        Sleep(50); 
+    } else {
+        printf("Waiting for world...                                     \n");
+        for(int i=0; i<8; i++) printf("                                                 \n");
     }
+    Sleep(50); 
+}
 
-    printf("\n[*] Unloading...\n");
-    fclose(f);
+// --- БЕЗОПАСНЫЙ ВЫХОД ---
+// Отпускаем клавишу бега при выгрузке чита, чтобы персонаж не убежал в закат
+if (isMoving) {
+    keybd_event('W', MapVirtualKey('W', 0), KEYEVENTF_KEYUP, 0);
+}
+
+printf("\n[*] Unloading...\n");
+fclose(f);
     FreeConsole();
     FreeLibraryAndExitThread((HMODULE)lpParam, 0);
     return 0;
