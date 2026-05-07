@@ -3,52 +3,45 @@
 
 #pragma comment(lib, "user32.lib")
 
-// Оффсеты 3.3.5а (12340)
-#define PLAYER_BASE_OFFSET 0x00BD07E0
-#define OBJECT_MANAGER_PTR 0x00B41414
-#define CTM_PUSH 0x00860A90 // Функция клика
+// Оффсеты ОТНОСИТЕЛЬНО начала модуля WoW.exe
+DWORD off_ObjectManager = 0x00B41414; 
 
 DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Debug Mode Started ---\n");
+    // Получаем реальный адрес, куда загружена игра
+    DWORD baseAddress = (DWORD)GetModuleHandleA(NULL);
+    printf("--- Imba Bot: Auto-Base Mode ---\n");
+    printf("[+] WoW.exe Base Address: 0x%X\n", baseAddress);
 
     while (true) {
-        // Проверка №1: Видим ли мы Object Manager?
-        DWORD* objMgrPtr = (DWORD*)OBJECT_MANAGER_PTR;
-        if (IsBadReadPtr(objMgrPtr, sizeof(DWORD))) {
-            printf("[!] Error: Cannot read ObjectManager at 0x%X\n", OBJECT_MANAGER_PTR);
-        } else {
+        // Пробуем два варианта: статический и динамический (с учетом базы)
+        DWORD objMgrAddr = off_ObjectManager; 
+        DWORD* objMgrPtr = (DWORD*)objMgrAddr;
+
+        if (objMgrPtr && *objMgrPtr) {
             DWORD objMgr = *objMgrPtr;
-            if (!objMgr) {
-                printf("[?] ObjectManager is NULL. Are you in world?\n");
-            } else {
-                printf("[+] ObjectManager Found at: 0x%X\n", objMgr);
-                // Если нашелся, считаем объекты
-                DWORD currentObj = *(DWORD*)(objMgr + 0xAC);
-                int count = 0;
-                while (currentObj != 0 && (currentObj & 1) == 0) {
-                    count++;
-                    currentObj = *(DWORD*)(currentObj + 0x3C);
-                    if(count > 1000) break;
-                }
-                printf("[+] Nearby Objects: %d\n", count);
+            DWORD currentObj = *(DWORD*)(objMgr + 0xAC);
+            int count = 0;
+            while (currentObj != 0 && (currentObj & 1) == 0) {
+                count++;
+                currentObj = *(DWORD*)(currentObj + 0x3C);
+                if(count > 1000) break;
             }
+            printf("[+] Status: OK! Objects found: %d\n", count);
+        } else {
+            printf("[!] Waiting for ObjectManager... Check your WoW version.\n");
         }
 
-        // Проверка №2: Кнопка F1
         if (GetAsyncKeyState(VK_F1) & 0x8000) {
-            printf("[!] F1 Pressed! Testing Click-to-Move...\n");
-            // Пробуем просто заставить персонажа "стопнуть" через CTM
-            DWORD ctm_base = 0x00BD07A0;
-            *(int*)(ctm_base + 0x1C) = 2; // Action: Stop
+            printf("[!] F1 Action triggered!\n");
         }
 
-        Sleep(1000);
+        Sleep(2000);
         system("cls");
-        printf("--- Debug Mode Active ---\n");
+        printf("Base: 0x%X | Searching for data...\n", baseAddress);
     }
     return 0;
 }
