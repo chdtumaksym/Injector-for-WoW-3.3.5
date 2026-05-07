@@ -1,62 +1,49 @@
 #include <windows.h>
 #include <iostream>
-#include <stdio.h>
+#include <vector>
 
-// Подключаем библиотеку для MessageBox
 #pragma comment(lib, "user32.lib")
 
-// Оффсеты для WoW 3.3.5a (Build 12340)
+// Оффсеты 3.3.5а
 #define PLAYER_BASE_OFFSET 0x00BD07E0
-#define CTM_BASE 0x00BD07A0
-
-// Перечисления для Click-to-Move
-enum CTM_Action {
-    Face = 1,
-    Stop = 2,
-    Walk = 4,
-    MoveTo = 5,
-    InteractNPC = 6,
-    InteractObject = 7
-};
-
-// Функция движения
-void MoveToCoord(float x, float y, float z) {
-    float* ctm_ptr = (float*)CTM_BASE;
-    if (ctm_ptr) {
-        *(float*)(CTM_BASE + 0x8) = x;
-        *(float*)(CTM_BASE + 0xC) = y;
-        *(float*)(CTM_BASE + 0x10) = z;
-        *(int*)(CTM_BASE + 0x1C) = MoveTo;
-    }
-}
+#define OBJECT_MANAGER_PTR 0x00B41414
+#define FIRST_OBJECT_OFFSET 0xAC
+#define NEXT_OBJECT_OFFSET 0x3C
 
 DWORD WINAPI MainThread(LPVOID lpParam) {
-    // Создаем консоль для отладки
     AllocConsole();
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Professional Bot Debug Console ---\n");
-    MessageBoxA(NULL, "Imba Bot запущен внутри WoW!", "Status", MB_OK);
+    printf("--- Imba Bot: Object Scanner Active ---\n");
 
     while (true) {
-        // Читаем базу игрока
-        DWORD* playerBasePtr = (DWORD*)PLAYER_BASE_OFFSET;
-        if (playerBasePtr && *playerBasePtr) {
-            DWORD pBase = *playerBasePtr;
-            
-            float x = *(float*)(pBase + 0x798);
-            float y = *(float*)(pBase + 0x79C);
-            float z = *(float*)(pBase + 0x7A0);
+        // 1. Читаем координаты игрока
+        DWORD playerBase = *(DWORD*)PLAYER_BASE_OFFSET;
+        if (playerBase) {
+            float x = *(float*)(playerBase + 0x798);
+            float y = *(float*)(playerBase + 0x79C);
+            printf("Player Pos: X: %.2f Y: %.2f\n", x, y);
 
-            printf("My Pos: X: %.2f | Y: %.2f | Z: %.2f\r", x, y, z);
-            
-            // Тест движения на клавишу F1
-            if (GetAsyncKeyState(VK_F1) & 0x8000) {
-                MoveToCoord(x + 5.0f, y, z);
+            // 2. Сканируем объекты вокруг (Мобы, NPC)
+            DWORD objMgr = *(DWORD*)OBJECT_MANAGER_PTR;
+            if (objMgr) {
+                DWORD currentObj = *(DWORD*)(objMgr + FIRST_OBJECT_OFFSET);
+                int count = 0;
+                
+                while (currentObj != 0 && (currentObj & 1) == 0) {
+                    count++;
+                    // В следующих шагах мы будем вытягивать имена и HP этих объектов
+                    currentObj = *(DWORD*)(currentObj + NEXT_OBJECT_OFFSET);
+                    if(count > 100) break; // Защита от бесконечного цикла
+                }
+                printf("Objects found nearby: %d\n", count);
             }
         }
-        Sleep(100);
+
+        printf("------------------------------\n");
+        Sleep(2000); // Обновляем раз в 2 секунды
+        system("cls"); // Чистим консоль
     }
     return 0;
 }
