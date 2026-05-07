@@ -3,47 +3,49 @@
 
 #pragma comment(lib, "user32.lib")
 
-// Жесткие оффсеты для 12340
-#define ADDR_OBJMGR 0x00B41414
-#define ADDR_PLAYER 0x00BD07E0
+// Оффсеты БЕЗ учета базы (чистые смещения)
+#define OFFSET_OBJMGR 0x00B41414
+#define OFFSET_PLAYER 0x00BD07E0
 
 DWORD WINAPI MainThread(LPVOID lpParam) {
-    // Принудительно открываем консоль
     AllocConsole();
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- PROJECT IMBA: READY ---\n");
+    // 1. Получаем базу модуля (где начинается память WoW в этот раз)
+    uintptr_t baseAddr = (uintptr_t)GetModuleHandleA(NULL);
+    
+    printf("--- PRO SCANNER v2.0 ---\n");
+    printf("[*] Module Base: 0x%p\n", (void*)baseAddr);
 
     while (true) {
-        // Прямое чтение без лишних функций безопасности
-        DWORD* objMgrPtr = (DWORD*)ADDR_OBJMGR;
+        // 2. Считаем реальный адрес: База + Оффсет
+        // ВНИМАНИЕ: Если у тебя чистый 12340, база обычно 0x400000. 
+        // Но современные ОС могут её менять.
         
-        if (objMgrPtr) {
-            DWORD objMgr = *objMgrPtr;
-            if (objMgr != 0) {
-                DWORD firstObj = *(DWORD*)(objMgr + 0xAC);
-                printf("[+] ObjectManager: 0x%X | FirstObj: 0x%X\n", objMgr, firstObj);
-            } else {
-                printf("[-] ObjectManager is 0. Move your character!\n");
-            }
+        uintptr_t realObjMgrPtr = baseAddr + (OFFSET_OBJMGR - 0x400000);
+        uintptr_t realPlayerPtr = baseAddr + (OFFSET_PLAYER - 0x400000);
+
+        DWORD* objMgr = (DWORD*)realObjMgrPtr;
+        DWORD* player = (DWORD*)realPlayerPtr;
+
+        if (objMgr && !IsBadReadPtr(objMgr, sizeof(DWORD))) {
+            printf("[+] Real ObjMgr Addr: 0x%p | Value: 0x%X\n", (void*)realObjMgrPtr, *objMgr);
+        }
+        
+        if (player && !IsBadReadPtr(player, sizeof(DWORD))) {
+            printf("[+] Real Player Addr: 0x%p | Value: 0x%X\n", (void*)realPlayerPtr, *player);
         }
 
-        // Чекаем GUID игрока — если тут 0, значит мы вообще не в той памяти
-        DWORD playerGuid = *(DWORD*)ADDR_PLAYER;
-        printf("[*] Player Pointer: 0x%X\n", playerGuid);
-
-        Sleep(1000);
+        Sleep(1500);
         system("cls");
-        printf("--- PROJECT IMBA: SCANNING ---\n");
+        printf("Base: 0x%p | Scanning for life...\n", (void*)baseAddr);
     }
     return 0;
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
-        // Отключаем DEP для нашего потока (иногда помогает на Win10/11)
-        SetProcessDEPPolicy(0); 
         CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)MainThread, NULL, 0, NULL);
     }
     return TRUE;
