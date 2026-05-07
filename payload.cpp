@@ -85,21 +85,33 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
             
             if (objMgr) {
                 uintptr_t cur = *(uintptr_t*)(objMgr + 0xAC);
-                int count = 0;
+                int totalObjects = 0;
+                int players = 0;
+                int units = 0;
+                int gameObjects = 0;
                 
                 // Дополнительная проверка указателя cur
                 __try {
-                    while (cur != 0 && (cur & 1) == 0 && count < 2000) {
-                        count++;
+                    while (cur != 0 && (cur & 1) == 0 && totalObjects < 2000) {
+                        totalObjects++;
+                        
+                        // Читаем тип объекта (смещение 0x14)
+                        int objType = *(int*)(cur + 0x14);
+                        
+                        if (objType == 5) players++;         // Тип 5 - Игрок
+                        else if (objType == 4) units++;      // Тип 4 - NPC / Моб
+                        else if (objType == 6) gameObjects++;// Тип 6 - ГО (сундуки, объекты)
+
                         cur = *(uintptr_t*)(cur + 0x3C); // Смещение на следующий объект
                     }
-                    printf("Real-time Objects: %d          \r", count);
+                    printf("Total: %d | Players: %d | NPCs: %d | GOs: %d          \r", 
+                           totalObjects, players, units, gameObjects);
                 } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    printf("Reading Error...               \r");
+                    printf("Reading Error...                                      \r");
                 }
             }
         } else {
-            printf("Waiting for world...           \r");
+            printf("Waiting for world...                                          \r");
         }
         Sleep(100);
     }
