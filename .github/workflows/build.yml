@@ -5,16 +5,21 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v3
-      - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v1.1
-      - name: Compile Bot
+
+      - name: Initialize MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Compile
         run: |
-          cl.exe /O2 /LD /Fe:bot_payload.dll payload.cpp /EHsc /link /MACHINE:X86
-          cl.exe /O2 /Fe:injector.exe injector.cpp /EHsc /link /MACHINE:X86
-      - name: Upload Artifacts
+          cl.exe /O2 /EHsc injector.cpp /link /OUT:injector.exe
+          cl.exe /O2 /LD /EHsc payload.cpp /link /OUT:bot_payload.dll
+
+      - name: Upload
         uses: actions/upload-artifact@v3
         with:
-          name: Professional-Bot-Files
+          name: Bot-Files
           path: |
-            bot_payload.dll
             injector.exe
+            bot_payload.dll
