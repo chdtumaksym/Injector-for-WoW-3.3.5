@@ -85,29 +85,47 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
             
             if (objMgr) {
                 uintptr_t cur = *(uintptr_t*)(objMgr + 0xAC);
+                uint64_t localGuid = *(uint64_t*)(objMgr + 0xC0); // Получаем GUID нашего персонажа
                 int totalObjects = 0;
-                int players = 0;
-                int units = 0;
-                int gameObjects = 0;
                 
                 // Дополнительная проверка указателя cur
                 __try {
+                    bool foundMe = false;
                     while (cur != 0 && (cur & 1) == 0 && totalObjects < 2000) {
                         totalObjects++;
                         
-                        // Читаем тип объекта (смещение 0x14)
-                        int objType = *(int*)(cur + 0x14);
+                        // Читаем GUID текущего перебираемого объекта (смещение 0x30)
+                        uint64_t objGuid = *(uint64_t*)(cur + 0x30);
                         
-                        if (objType == 5) players++;         // Тип 5 - Игрок
-                        else if (objType == 4) units++;      // Тип 4 - NPC / Моб
-                        else if (objType == 6) gameObjects++;// Тип 6 - ГО (сундуки, объекты)
+                        // Если GUID совпал с нашим - читаем наши личные данные
+                        if (objGuid == localGuid && localGuid != 0) {
+                            foundMe = true;
+                            
+                            // Читаем указатель на Дескриптор (массив характеристик)
+                            uintptr_t descriptor = *(uintptr_t*)(cur + 0x8);
+                            
+                            // Читаем ХП из дескриптора (UNIT_FIELD_HEALTH = 0x17, UNIT_FIELD_MAXHEALTH = 0x1F)
+                            // Умножаем на 4, так как каждый оффсет это 4 байта (int)
+                            int hp = *(int*)(descriptor + 0x5C); 
+                            int maxHp = *(int*)(descriptor + 0x7C);
+                            
+                            // Читаем координаты X Y Z
+                            float x = *(float*)(cur + 0x798);
+                            float y = *(float*)(cur + 0x79C);
+                            float z = *(float*)(cur + 0x7A0);
+                            
+                            printf("ME: HP %d/%d | POS: X:%.1f Y:%.1f Z:%.1f (Total Obj: %d)          \r", 
+                                   hp, maxHp, x, y, z, totalObjects);
+                        }
 
                         cur = *(uintptr_t*)(cur + 0x3C); // Смещение на следующий объект
                     }
-                    printf("Total: %d | Players: %d | NPCs: %d | GOs: %d          \r", 
-                           totalObjects, players, units, gameObjects);
+                    
+                    if (!foundMe) {
+                        printf("Local player not found in ObjectManager...                          \r");
+                    }
                 } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    printf("Reading Error...                                      \r");
+                    printf("Reading Error...                                                    \r");
                 }
             }
         } else {
