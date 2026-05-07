@@ -11,7 +11,7 @@
 #define ADDR_LUA_EXECUTE      0x00819210
 #define ADDR_CLICK_TO_MOVE    0x00611130
 #define OFFSET_S_CUR_MGR      0x00879CE0 
-#define ADDR_GET_ACTIVE_PLAYER 0x004038BE // Нативная функция получения LocalPlayer
+#define ADDR_GET_ACTIVE_PLAYER 0x004038BE 
 
 typedef void(__cdecl* tFrameScript_Execute)(const char* command, const char* filename, void* reserved);
 typedef void(__thiscall* tClickToMove)(uintptr_t playerPtr, int clickType, uint64_t* interactGuid, float* pos, float precision);
@@ -22,10 +22,6 @@ tClickToMove ClickToMove = (tClickToMove)ADDR_CLICK_TO_MOVE;
 tGetActivePlayer GetActivePlayer = (tGetActivePlayer)ADDR_GET_ACTIVE_PLAYER;
 
 // --- ГЛОБАЛЬНЫЕ ДАННЫЕ СИНХРОНИЗАЦИИ ---
-uintptr_t endSceneAddr = 0;
-void* trampolineEndScene = nullptr;
-
-uint64_t g_TargetGuid = 0;
 float g_MoveX = 0, g_MoveY = 0, g_MoveZ = 0;
 
 // Очередь команд для главного потока
@@ -37,20 +33,26 @@ bool g_QueuedLoot = false;
 enum BotState { STATE_SEARCH, STATE_MOVE, STATE_COMBAT, STATE_LOOT };
 const char* stateNames[] = { "SEARCHING", "MOVING", "COMBAT", "LOOTING" };
 
-// --- ХУК ЛОГИКА (TRAMPOLINE) ---
+// --- VTABLE ХУК ЛОГИКА ---
+typedef HRESULT(__stdcall* tEndScene)(IDirect3DDevice9*);
+tEndScene oEndScene = nullptr;
+
 HRESULT __stdcall HookedEndScene(IDirect3DDevice9* pDevice) {
-    // Получаем СВЕЖИЙ указатель на игрока прямо из движка, никаких глобальных кешей!
+    if (pDevice == nullptr) return oEndScene(pDevice);
+
     uintptr_t pLocal = GetActivePlayer();
     
-    if (pLocal != 0) {
+    // Проверяем, что игрок существует и его тип == 4 (Player) во избежание крашей
+    if (pLocal != 0 && *(int*)(pLocal + 0x14) == 4) {
         __try {
             if (g_QueuedMove) {
                 float pos[3] = { g_MoveX, g_MoveY, g_MoveZ };
-                ClickToMove(pLocal, 4, &g_TargetGuid, pos, 0.5f); 
+                uint64_t emptyGuid = 0; // ПУСТОЙ GUID! Чтобы движок не искал трупы и не крашился на 0x14
+                ClickToMove(pLocal, 4, &emptyGuid, pos, 0.5f); 
                 g_QueuedMove = false;
             }
             if (g_QueuedAttack) {
-                Lua_DoString("if UnitExists('target') then if not IsCurrentSpell(6603) then StartAttack() end end", "bot", 0);
+                Lua_DoString("if UnitExists('target') and not IsCurrentSpell(6603) then StartAttack() end", "bot", 0);
                 Lua_DoString("if not UnitBuff('player', 'Seal of Righteousness') then CastSpellByID(21084) end", "bot", 0);
                 g_QueuedAttack = false;
             }
@@ -62,55 +64,52 @@ HRESULT __stdcall HookedEndScene(IDirect3DDevice9* pDevice) {
                 Lua_DoString("if LootFrame:IsVisible() then for i=1,GetNumLootItems() do LootSlot(i) end CloseLoot() end", "bot", 0);
                 g_QueuedLoot = false;
             }
-        } __except(1) {
-            // Заглушка от крашей при смене локации
-        }
+        } __except(1) {}
     }
 
-    // Вызываем оригинал через наш трамплин (хук НЕ СНИМАЕТСЯ, гонок потоков больше нет)
-    typedef HRESULT(__stdcall* tEndScene)(IDirect3DDevice9*);
-    return ((tEndScene)trampolineEndScene)(pDevice);
+    return oEndScene(pDevice);
 }
 
-bool InstallTrampoline() {
-    trampolineEndScene = VirtualAlloc(NULL, 15, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!trampolineEndScene) return false;
+bool InstallVTableHook() {
+    IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
+    if (!pD3D) return false;
+    D3DPRESENT_PARAMETERS d3dpp = {0}; d3dpp.Windowed = TRUE; d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    IDirect3DDevice9* pDev = nullptr;
+    
+    if (FAILED(pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, GetDesktopWindow(), D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDev))) {
+        pD3D->Release(); return false;
+    }
 
-    // Копируем первые 5 байт оригинальной функции
-    memcpy(trampolineEndScene, (void*)endSceneAddr, 5);
+    // Достаем глобальную VTable D3D9
+    uintptr_t* pVTable = *(uintptr_t**)pDev;
+    oEndScene = (tEndScene)pVTable[42];
 
-    // Добавляем JMP из трамплина обратно в EndScene + 5
-    *(BYTE*)((uintptr_t)trampolineEndScene + 5) = 0xE9;
-    *(uintptr_t*)((uintptr_t)trampolineEndScene + 6) = (endSceneAddr + 5) - ((uintptr_t)trampolineEndScene + 5) - 5;
-
-    // Ставим хук (перезаписываем оригинал JMP'ом на нашу HookedEndScene)
     DWORD old;
-    VirtualProtect((void*)endSceneAddr, 5, PAGE_EXECUTE_READWRITE, &old);
-    *(BYTE*)endSceneAddr = 0xE9;
-    *(uintptr_t*)(endSceneAddr + 1) = (uintptr_t)HookedEndScene - endSceneAddr - 5;
-    VirtualProtect((void*)endSceneAddr, 5, old, &old);
+    VirtualProtect(&pVTable[42], sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &old);
+    pVTable[42] = (uintptr_t)HookedEndScene; // Подменяем функцию
+    VirtualProtect(&pVTable[42], sizeof(uintptr_t), old, &old);
 
+    pDev->Release(); 
+    pD3D->Release();
     return true;
 }
 
-void UnhookTrampoline() {
-    if (!trampolineEndScene) return;
-    DWORD old;
-    VirtualProtect((void*)endSceneAddr, 5, PAGE_EXECUTE_READWRITE, &old);
-    memcpy((void*)endSceneAddr, trampolineEndScene, 5); // Возвращаем оригинальные байты
-    VirtualProtect((void*)endSceneAddr, 5, old, &old);
-    VirtualFree(trampolineEndScene, 0, MEM_RELEASE);
-}
-
-uintptr_t GetEndSceneAddress() {
+void UnhookVTable() {
+    if (!oEndScene) return;
     IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
-    if (!pD3D) return 0;
+    if (!pD3D) return;
     D3DPRESENT_PARAMETERS d3dpp = {0}; d3dpp.Windowed = TRUE; d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
     IDirect3DDevice9* pDev = nullptr;
-    if (FAILED(pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, GetDesktopWindow(), D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDev))) return 0;
-    uintptr_t addr = (*(uintptr_t**)pDev)[42];
-    pDev->Release(); pD3D->Release();
-    return addr;
+    
+    if (SUCCEEDED(pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, GetDesktopWindow(), D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDev))) {
+        uintptr_t* pVTable = *(uintptr_t**)pDev;
+        DWORD old;
+        VirtualProtect(&pVTable[42], sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &old);
+        pVTable[42] = (uintptr_t)oEndScene; // Возвращаем оригинал
+        VirtualProtect(&pVTable[42], sizeof(uintptr_t), old, &old);
+        pDev->Release();
+    }
+    pD3D->Release();
 }
 
 void SetConsoleCursor(int x, int y) {
@@ -123,19 +122,15 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f; freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Imba Bot Internal v4.0 (TRAMPOLINE EDITION) ---\n");
-    endSceneAddr = GetEndSceneAddress();
-    if (!endSceneAddr) {
-        printf("[!] Critical: D3D9 EndScene not found!\n");
-        return 0;
-    }
-
-    if (InstallTrampoline()) {
-        printf("[+] Trampoline Hook Installed! Thread race conditions eliminated.\n");
+    printf("--- Imba Bot Internal v5.0 (VTABLE HOOK - CRASH PROOF) ---\n");
+    
+    if (InstallVTableHook()) {
+        printf("[+] VTable Hook Installed! Zero instruction slicing.\n");
     } else {
-        printf("[-] Failed to install trampoline!\n");
+        printf("[-] Failed to install VTable hook!\n");
         return 0;
     }
+    printf("[*] Press END to stop safely.\n");
     printf("--------------------------------------------------\n");
 
     HMODULE base = GetModuleHandleA(NULL);
@@ -158,7 +153,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                 uint64_t myGuid = *(uint64_t*)(mgr + 0xC0);
                 
                 __try {
-                    uintptr_t pLocal = GetActivePlayer(); // Используем нативную функцию
+                    uintptr_t pLocal = GetActivePlayer(); 
                     if (pLocal) {
                         uintptr_t localDesc = *(uintptr_t*)(pLocal + 0x8);
                         int hp = *(int*)(localDesc + 0x60), maxHp = *(int*)(localDesc + 0x80), lvl = *(int*)(localDesc + 0xD8);
@@ -224,7 +219,6 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                                     if (dist > 4.5f) {
                                         state = STATE_MOVE;
                                         g_MoveX = tx; g_MoveY = ty; g_MoveZ = tz;
-                                        g_TargetGuid = currentTargetGuid;
                                         g_QueuedMove = true;
                                     } else {
                                         state = STATE_COMBAT;
@@ -259,7 +253,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
         Sleep(150);
     }
 
-    UnhookTrampoline();
+    UnhookVTable();
     fclose(f); FreeConsole(); 
     FreeLibraryAndExitThread((HMODULE)lpParam, 0); 
     return 0;
