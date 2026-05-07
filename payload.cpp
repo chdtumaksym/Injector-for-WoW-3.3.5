@@ -1,14 +1,20 @@
 #include <windows.h>
 #include <iostream>
+#include <cmath>
 
 #pragma comment(lib, "user32.lib")
 
-// Функция поиска сигнатуры с безопасным парсингом PE-заголовка
+void SetConsoleCursor(int x, int y) {
+    COORD coord;
+    coord.X = x;
+    coord.Y = y;
+    SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), coord);
+}
+
 uintptr_t FindPattern(HMODULE module, const char* pattern, const char* mask) {
     IMAGE_DOS_HEADER* dosHeader = (IMAGE_DOS_HEADER*)module;
     IMAGE_NT_HEADERS* ntHeaders = (IMAGE_NT_HEADERS*)((uint8_t*)module + dosHeader->e_lfanew);
 
-    // Сканируем весь образ модуля, используя VirtualQuery для защиты
     uintptr_t start = (uintptr_t)module;
     uintptr_t size = ntHeaders->OptionalHeader.SizeOfImage;
     size_t maskLen = strlen(mask);
@@ -18,7 +24,6 @@ uintptr_t FindPattern(HMODULE module, const char* pattern, const char* mask) {
         MEMORY_BASIC_INFORMATION mbi;
         if (!VirtualQuery((LPCVOID)current, &mbi, sizeof(mbi))) break;
 
-        // Проверяем, что страница памяти валидна и доступна для чтения
         if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
             uintptr_t regionEnd = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
             uintptr_t scanEnd = (regionEnd > start + size) ? start + size : regionEnd;
@@ -26,7 +31,6 @@ uintptr_t FindPattern(HMODULE module, const char* pattern, const char* mask) {
             for (uintptr_t i = current; i < scanEnd - maskLen; i++) {
                 bool found = true;
                 for (size_t j = 0; j < maskLen; j++) {
-                    // Важно: строгий каст к uint8_t для сырых байтов, чтобы не было конфликтов знака
                     if (mask[j] != '?' && (uint8_t)pattern[j] != *(uint8_t*)(i + j)) {
                         found = false;
                         break;
@@ -35,7 +39,6 @@ uintptr_t FindPattern(HMODULE module, const char* pattern, const char* mask) {
                 if (found) return i;
             }
         }
-        // Прыгаем на следующую страницу памяти
         current = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
     }
     return 0;
@@ -47,105 +50,134 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     freopen_s(&f, "CONOUT$", "w", stdout);
 
     HMODULE base = GetModuleHandleA(NULL);
-    printf("--- Pattern Scanner Active ---\n");
-    printf("[*] Base: 0x%p. Safe scanning entire module...\n", (void*)base);
+    printf("--- Autonomous Bot Radar Active ---\n");
+    printf("[*] Base: 0x%p. Scanning...\n", (void*)base);
 
     const char* pattern = "\x8B\x15\x00\x00\x00\x00\x8B\x42\x2C\x85\xC0";
     const char* mask = "xx????xxxxx";
 
     uintptr_t match = FindPattern(base, pattern, mask);
-    uintptr_t connectionAddr = 0;
+    uintptr_t connectionAddr = match ? *(uintptr_t*)(match + 2) : ((uintptr_t)base + 0x00879CE0);
 
-    if (match) {
-        connectionAddr = *(uintptr_t*)(match + 2);
-        printf("[!] FOUND Pattern! ClientConnection Pointer: 0x%p\n", (void*)connectionAddr);
-    } else {
-        printf("[-] Pattern not found. Trying 3.3.5a static fallback...\n");
-        // Статический адрес для 3.3.5a (Base + 0x00879CE0 = 0x00C79CE0)
-        connectionAddr = (uintptr_t)base + 0x00879CE0;
-        printf("[!] Using Static ClientConnection Pointer: 0x%p\n", (void*)connectionAddr);
-    }
+    if (match) printf("[!] FOUND Pattern! Pointer: 0x%p\n", (void*)connectionAddr);
+    else printf("[-] Using Static Pointer: 0x%p\n", (void*)connectionAddr);
 
     printf("[*] Press END to unload the DLL.\n");
+    printf("--------------------------------------------------\n");
+    
+    int hudStartY = 6; 
 
     while (!GetAsyncKeyState(VK_END)) {
         uintptr_t clientConnection = 0;
         
-        // Заворачиваем чтение в try/except на случай, если фолбэк адрес оказался неверным
         __try {
             clientConnection = *(uintptr_t*)connectionAddr;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             clientConnection = 0;
         }
         
-        // Если мы в мире и структура инициализирована
+        SetConsoleCursor(0, hudStartY);
+
         if (clientConnection) {
-            // Правильная цепочка: ClientConnection -> +0x2ED0 (ObjectManager) -> +0xAC (First Object)
             uintptr_t objMgr = *(uintptr_t*)(clientConnection + 0x2ED0);
             
             if (objMgr) {
                 uintptr_t cur = *(uintptr_t*)(objMgr + 0xAC);
-                uint64_t localGuid = *(uint64_t*)(objMgr + 0xC0); // Получаем GUID нашего персонажа
+                uint64_t localGuid = *(uint64_t*)(objMgr + 0xC0);
                 
                 __try {
                     uintptr_t localPlayerObj = 0;
-                    uint64_t targetGuid = 0;
-                    uintptr_t targetObj = 0;
 
-                    // Первый проход: ищем себя и узнаем GUID нашей цели
+                    // 1. Ищем только себя, чтобы получить свои координаты для расчетов
                     while (cur != 0 && (cur & 1) == 0) {
                         uint64_t objGuid = *(uint64_t*)(cur + 0x30);
                         if (objGuid == localGuid && localGuid != 0) {
                             localPlayerObj = cur;
-                            uintptr_t descriptor = *(uintptr_t*)(cur + 0x8);
-                            // 0x48 (index 0x12) - UNIT_FIELD_TARGET (uint64_t)
-                            targetGuid = *(uint64_t*)(descriptor + 0x48);
-                            break; // Нашли себя, дальше этот цикл крутить нет смысла
+                            break; 
                         }
                         cur = *(uintptr_t*)(cur + 0x3C);
                     }
 
-                    // Второй проход: если у нас есть цель, ищем её объект в памяти
-                    if (targetGuid != 0) {
-                        cur = *(uintptr_t*)(objMgr + 0xAC); // Сбрасываем указатель на начало списка
-                        while (cur != 0 && (cur & 1) == 0) {
-                            uint64_t objGuid = *(uint64_t*)(cur + 0x30);
-                            if (objGuid == targetGuid) {
-                                targetObj = cur;
-                                break;
-                            }
-                            cur = *(uintptr_t*)(cur + 0x3C);
-                        }
-                    }
-
-                    // Вывод информации
                     if (localPlayerObj) {
                         uintptr_t localDesc = *(uintptr_t*)(localPlayerObj + 0x8);
                         int hp = *(int*)(localDesc + 0x60);
                         int maxHp = *(int*)(localDesc + 0x80);
                         
-                        if (targetObj) {
-                            uintptr_t targetDesc = *(uintptr_t*)(targetObj + 0x8);
-                            int tHp = *(int*)(targetDesc + 0x60);
-                            int tMaxHp = *(int*)(targetDesc + 0x80);
-                            printf("ME: %d/%d HP | TARGET: %d/%d HP                          \r", hp, maxHp, tHp, tMaxHp);
+                        float myX = *(float*)(localPlayerObj + 0x798);
+                        float myY = *(float*)(localPlayerObj + 0x79C);
+                        float myZ = *(float*)(localPlayerObj + 0x7A0);
+                        
+                        printf("[BOT STATUS]                                     \n");
+                        printf("HP: %d/%d                                        \n", hp, maxHp);
+                        printf("POS: X:%.2f | Y:%.2f | Z:%.2f                    \n", myX, myY, myZ);
+                        printf("--------------------------------------------------\n");
+
+                        // 2. Ищем ближайшего живого моба
+                        float closestDist = 999999.0f;
+                        uint64_t closestGuid = 0;
+                        int closestHp = 0, closestMaxHp = 0;
+                        float cX = 0, cY = 0, cZ = 0;
+
+                        cur = *(uintptr_t*)(objMgr + 0xAC); // Сброс указателя на начало
+                        while (cur != 0 && (cur & 1) == 0) {
+                            int objType = *(int*)(cur + 0x14);
+                            
+                            // Нас интересуют только NPC/Мобы (тип 4)
+                            if (objType == 4) {
+                                uintptr_t desc = *(uintptr_t*)(cur + 0x8);
+                                int npcHp = *(int*)(desc + 0x60);
+                                
+                                // Мертвецов не трогаем
+                                if (npcHp > 0) {
+                                    float x = *(float*)(cur + 0x798);
+                                    float y = *(float*)(cur + 0x79C);
+                                    float z = *(float*)(cur + 0x7A0);
+                                    
+                                    float dx = x - myX;
+                                    float dy = y - myY;
+                                    float dz = z - myZ;
+                                    float dist = sqrt(dx*dx + dy*dy + dz*dz);
+                                    
+                                    // Находим минимальную дистанцию
+                                    if (dist < closestDist) {
+                                        closestDist = dist;
+                                        closestGuid = *(uint64_t*)(cur + 0x30);
+                                        closestHp = npcHp;
+                                        closestMaxHp = *(int*)(desc + 0x80);
+                                        cX = x; cY = y; cZ = z;
+                                    }
+                                }
+                            }
+                            cur = *(uintptr_t*)(cur + 0x3C);
+                        }
+
+                        if (closestGuid != 0) {
+                            printf("[AUTOTARGET: CLOSEST ALIVE NPC]                  \n");
+                            printf("HP: %d/%d                                        \n", closestHp, closestMaxHp);
+                            printf("POS: X:%.2f | Y:%.2f | Z:%.2f                    \n", cX, cY, cZ);
+                            printf("Distance: %.2f yards                             \n", closestDist);
                         } else {
-                            printf("ME: %d/%d HP | TARGET: NONE                              \r", hp, maxHp);
+                            printf("[AUTOTARGET] NO ALIVE MOBS AROUND                \n");
+                            printf("                                                 \n");
+                            printf("                                                 \n");
+                            printf("                                                 \n");
                         }
                     } else {
-                        printf("Local player not found in ObjectManager...                          \r");
+                        printf("Local player not found in ObjectManager...       \n");
+                        for(int i=0; i<8; i++) printf("                                                 \n");
                     }
                 } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    printf("Reading Error...                                                    \r");
+                    printf("Reading Error...                                     \n");
+                    for(int i=0; i<8; i++) printf("                                                 \n");
                 }
             }
         } else {
-            printf("Waiting for world...                                          \r");
+            printf("Waiting for world...                                     \n");
+            for(int i=0; i<8; i++) printf("                                                 \n");
         }
-        Sleep(100);
+        Sleep(50); 
     }
 
-    // Адекватное завершение работы
     printf("\n[*] Unloading...\n");
     fclose(f);
     FreeConsole();
@@ -155,7 +187,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(hinstDLL); // Оптимизация, чтобы не вызывать DllMain на каждый новый поток
+        DisableThreadLibraryCalls(hinstDLL);
         HANDLE hThread = CreateThread(NULL, 0, MainThread, hinstDLL, 0, NULL);
         if (hThread) CloseHandle(hThread);
     }
