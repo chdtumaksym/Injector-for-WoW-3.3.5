@@ -3,45 +3,47 @@
 
 #pragma comment(lib, "user32.lib")
 
-// Оффсеты ОТНОСИТЕЛЬНО начала модуля WoW.exe
-DWORD off_ObjectManager = 0x00B41414; 
+// Самые стабильные оффсеты для 12340
+#define ADDR_OBJMGR 0x00B41414
+#define ADDR_PLAYER_GUID 0x00BD07E0
 
 DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
 
-    // Получаем реальный адрес, куда загружена игра
-    DWORD baseAddress = (DWORD)GetModuleHandleA(NULL);
-    printf("--- Imba Bot: Auto-Base Mode ---\n");
-    printf("[+] WoW.exe Base Address: 0x%X\n", baseAddress);
+    printf("--- Professional WoW 3.3.5a Scanner ---\n");
 
     while (true) {
-        // Пробуем два варианта: статический и динамический (с учетом базы)
-        DWORD objMgrAddr = off_ObjectManager; 
-        DWORD* objMgrPtr = (DWORD*)objMgrAddr;
-
-        if (objMgrPtr && *objMgrPtr) {
+        // Пробуем прочитать указатель на менеджер объектов
+        DWORD* objMgrPtr = (DWORD*)ADDR_OBJMGR;
+        
+        if (objMgrPtr && !IsBadReadPtr(objMgrPtr, sizeof(DWORD)) && *objMgrPtr != 0) {
             DWORD objMgr = *objMgrPtr;
+            
+            // Если нашли менеджер, ищем первый объект
             DWORD currentObj = *(DWORD*)(objMgr + 0xAC);
             int count = 0;
+            
             while (currentObj != 0 && (currentObj & 1) == 0) {
                 count++;
                 currentObj = *(DWORD*)(currentObj + 0x3C);
-                if(count > 1000) break;
+                if (count > 2000) break;
             }
-            printf("[+] Status: OK! Objects found: %d\n", count);
+            printf("[SUCCESS] Found %d objects in memory!\n", count);
         } else {
-            printf("[!] Waiting for ObjectManager... Check your WoW version.\n");
-        }
-
-        if (GetAsyncKeyState(VK_F1) & 0x8000) {
-            printf("[!] F1 Action triggered!\n");
+            // Если менеджер пуст, пробуем прочитать хотя бы GUID игрока
+            DWORD* playerGuidPtr = (DWORD*)ADDR_PLAYER_GUID;
+            if (playerGuidPtr && *playerGuidPtr != 0) {
+                printf("[DEBUG] ObjMgr is NULL, but PlayerGUID found: 0x%X\n", *playerGuidPtr);
+            } else {
+                printf("[WAITING] Memory is locked or world not loaded...\n");
+            }
         }
 
         Sleep(2000);
         system("cls");
-        printf("Base: 0x%X | Searching for data...\n", baseAddress);
+        printf("--- Professional WoW 3.3.5a Scanner ---\n");
     }
     return 0;
 }
