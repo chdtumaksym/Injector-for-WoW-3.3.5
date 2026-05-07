@@ -4,7 +4,7 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4 # Обновили до v4
 
       - name: Initialize MSVC x86
         uses: ilammy/msvc-dev-cmd@v1
@@ -17,7 +17,7 @@ jobs:
           cl.exe /O2 /LD /EHsc payload.cpp /link /OUT:bot_payload.dll
 
       - name: Upload
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4 # ТУТ БЫЛА ОШИБКА, теперь v4
         with:
           name: Bot-Files
           path: |
