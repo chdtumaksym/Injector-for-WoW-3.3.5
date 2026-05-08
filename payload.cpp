@@ -3,107 +3,110 @@
 #include <stdint.h>
 #include <iostream>
 
-#define ADDR_ON_UPDATE          0x0047E7B0
-#define ADDR_CLICK_TO_MOVE      0x00611130
-#define ADDR_PLAYER_BASE        0x00BD07E0 // ТВОЙ рабочий адрес
-#define ADDR_S_CUR_MGR          0x00C79CE0
+#pragma comment(lib, "d3d9.lib")
+
+// --- АДРЕСА 3.3.5a (12340) ---
+#define ADDR_PLAYER_BASE        0x00BD07E0 // Подтвержденный адрес игрока
+#define ADDR_S_CUR_MGR          0x00C79CE0 // Connection / CurMgr
 #define OFFSET_OBJECT_MANAGER   0x2ED0
+#define ADDR_D3D9_DEVICE        0x00C5DF88
 
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
+#pragma strict_gs_check(off)
 
-typedef void(__fastcall* tClickToMove)(uintptr_t ecx, void* edx, int type, uint64_t* guid, float* pos, float prec);
+typedef HRESULT(__stdcall* tEndScene)(LPDIRECT3DDEVICE9 pDevice);
+tEndScene oEndScene = nullptr;
 
-bool g_Active = false;
-static uint64_t s_guid;
-static float s_pos[3];
-
-void SafeAction(uintptr_t p, int t, uint64_t g, float x, float y, float z) {
-    if (!p) return;
-    s_guid = g; s_pos[0] = x; s_pos[1] = y; s_pos[2] = z;
-    ((tClickToMove)ADDR_CLICK_TO_MOVE)(p, nullptr, t, &s_guid, s_pos, 0.5f);
-}
-
-void BotPulse() {
+HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
     static bool keyState = false;
+    
     if (GetAsyncKeyState(VK_END) & 0x8000) {
-        if (!keyState) { 
-            g_Active = !g_Active; 
-            keyState = true; 
-            Beep(g_Active ? 800 : 400, 100); 
-            printf("\n[!] BOT TICKER: %s\n", g_Active ? "ONLINE" : "OFFLINE");
-        }
-    } else { 
-        keyState = false; 
-    }
+        if (!keyState) {
+            keyState = true;
+            Beep(500, 100);
+            printf("\n--- СКАНИРОВАНИЕ ПАМЯТИ ---\n");
 
-    if (g_Active) {
-        // Получаем базу игрока напрямую из статики
-        uintptr_t pLocal = *(uintptr_t*)ADDR_PLAYER_BASE;
-        if (!pLocal) return; // Защита от работы в меню
+            uintptr_t pLocal = *(uintptr_t*)ADDR_PLAYER_BASE;
+            if (!pLocal) {
+                printf("[-] ОШИБКА: Игрок не найден (pLocal == 0)\n");
+                return oEndScene(pDevice);
+            }
 
-        uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
-        uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
-        if (!mgr) return;
+            uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
+            if (!conn) {
+                printf("[-] ОШИБКА: Соединение не найдено (conn == 0)\n");
+                return oEndScene(pDevice);
+            }
 
-        float myX = *(float*)(pLocal + 0x798), myY = *(float*)(pLocal + 0x79C);
-        uint64_t target = 0; float dist = 40.0f; float tPos[3];
+            uintptr_t mgr = *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER);
+            if (!mgr) {
+                printf("[-] ОШИБКА: Object Manager не найден (mgr == 0)\n");
+                return oEndScene(pDevice);
+            }
 
-        uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
-        while (cur && (cur & 1) == 0) {
-            if (*(int*)(cur + 0x14) == 3) {
-                uintptr_t d = *(uintptr_t*)(cur + 0x8);
-                if (d) {
-                    int hp = *(int*)(d + 0x60);
-                    uint32_t flags = *(uint32_t*)(d + 0x114);
-                    float dx = *(float*)(cur + 0x798) - myX, dy = *(float*)(cur + 0x79C) - myY;
-                    float d_curr = sqrt(dx*dx + dy*dy);
+            float myX = *(float*)(pLocal + 0x798);
+            float myY = *(float*)(pLocal + 0x79C);
+            float myZ = *(float*)(pLocal + 0x7A0);
+            printf("[+] Твои координаты: X:%.1f, Y:%.1f, Z:%.1f\n", myX, myY, myZ);
 
-                    if (hp > 0 && d_curr < dist) {
-                        dist = d_curr; target = *(uint64_t*)(cur + 0x30);
-                        tPos[0] = *(float*)(cur + 0x798); tPos[1] = *(float*)(cur + 0x79C); tPos[2] = *(float*)(cur + 0x7A0);
-                    }
-                    else if (hp <= 0 && (flags & 1) && d_curr < 5.0f && !target) {
-                        dist = d_curr; target = *(uint64_t*)(cur + 0x30);
-                        tPos[0] = *(float*)(cur + 0x798); tPos[1] = *(float*)(cur + 0x79C); tPos[2] = *(float*)(cur + 0x7A0);
+            int count = 0;
+            uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
+            
+            // Проходимся по списку объектов, выводим максимум 15 штук, чтобы не спамить
+            while (cur && (cur & 1) == 0 && count < 15) {
+                int type = *(int*)(cur + 0x14);
+                if (type == 3) { // Тип 3 = Unit (Мобы/НПЦ)
+                    uintptr_t desc = *(uintptr_t*)(cur + 0x8);
+                    if (desc) {
+                        int hp = *(int*)(desc + 0x60);
+                        uint64_t guid = *(uint64_t*)(cur + 0x30);
+                        float tX = *(float*)(cur + 0x798);
+                        float tY = *(float*)(cur + 0x79C);
+                        
+                        // Вычисляем дистанцию
+                        float dist = sqrt(pow(tX - myX, 2) + pow(tY - myY, 2));
+
+                        // Показываем только тех, кто в радиусе 50 метров
+                        if (dist < 50.0f) {
+                            printf("-> Юнит | GUID: %llu | HP: %d | Дистанция: %.1f\n", guid, hp, dist);
+                            count++;
+                        }
                     }
                 }
+                cur = *(uintptr_t*)(cur + 0x3C);
             }
-            cur = *(uintptr_t*)(cur + 0x3C);
+            printf("--- СКАНИРОВАНИЕ ЗАВЕРШЕНО (Найдено %d юнитов) ---\n", count);
         }
-
-        static DWORD last = 0;
-        if (target && GetTickCount() - last > 800) {
-            printf("Targeting: %llu | Dist: %.2f\r", target, dist);
-            SafeAction(pLocal, 4, target, tPos[0], tPos[1], tPos[2]);
-            last = GetTickCount();
-        }
+    } else {
+        keyState = false;
     }
-}
 
-void __declspec(naked) Hook() {
-    __asm {
-        pushad
-        call BotPulse
-        popad
-        mov edi, edi
-        push ebp
-        mov ebp, esp
-        push 0x0047E7B5
-        ret
-    }
+    return oEndScene(pDevice);
 }
 
 DWORD WINAPI Setup(LPVOID) {
-    AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("[+] Bot v112: Logic Fixed. Press END to start.\n");
-    DWORD o; VirtualProtect((void*)ADDR_ON_UPDATE, 5, PAGE_EXECUTE_READWRITE, &o);
-    *(BYTE*)ADDR_ON_UPDATE = 0xE9; *(DWORD*)(ADDR_ON_UPDATE + 1) = (DWORD)Hook - ADDR_ON_UPDATE - 5;
-    VirtualProtect((void*)ADDR_ON_UPDATE, 5, o, &o);
+    AllocConsole(); 
+    freopen("CONOUT$", "w", stdout);
+    printf("--- Bot v113: Memory Diagnostics Edition ---\n");
+    printf("[!] ЗАЙДИ В МИР И НАЖМИ 'END' ДЛЯ ЧТЕНИЯ КОБОЛЬДОВ\n");
+
+    uintptr_t deviceAddr = 0;
+    while (!(deviceAddr = *(uintptr_t*)ADDR_D3D9_DEVICE)) Sleep(100);
+
+    uintptr_t* vTable = *(uintptr_t**)deviceAddr;
+    if (vTable) {
+        DWORD old;
+        VirtualProtect(&vTable[42], 4, PAGE_EXECUTE_READWRITE, &old);
+        oEndScene = (tEndScene)vTable[42];
+        vTable[42] = (uintptr_t)HookedEndScene;
+        VirtualProtect(&vTable[42], 4, old, &old);
+        printf("[+] Хук графики установлен. Жду нажатия END.\n");
+    }
     return 0;
 }
 
-BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
+extern "C" BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
     if (r == DLL_PROCESS_ATTACH) CreateThread(0, 0, Setup, 0, 0, 0);
     return TRUE;
 }
