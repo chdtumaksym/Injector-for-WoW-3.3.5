@@ -2,152 +2,158 @@
 #include <cmath>
 #include <stdint.h>
 #include <iostream>
-#include <d3d9.h>
-
-#pragma comment(lib, "d3d9.lib")
 
 // --- АДРЕСА 3.3.5a (12340) ---
 #define ADDR_S_CUR_MGR          0x00C79CE0
 #define OFFSET_OBJECT_MANAGER   0x2ED0
 #define ADDR_CLICK_TO_MOVE      0x00611130
 #define ADDR_TARGET_GUID        0x00BD07B8
-#define ADDR_D3D9_DEVICE        0x00C5DF88
+#define ADDR_LUA_EXECUTE        0x00819210
 
-#define CTM_LOOT                6
-#define CTM_ATTACK_GUID         11
+#define CTM_MOVE                4 // Используем ТОЛЬКО безопасный тип движения
 
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
 #pragma strict_gs_check(off)
 
-typedef HRESULT(__stdcall* tEndScene)(LPDIRECT3DDEVICE9 pDevice);
 typedef void(__thiscall* tClickToMove)(uintptr_t pThis, int type, uint64_t* guid, float* pos, float prec);
+typedef void(__cdecl* tLuaExecute)(const char* code, const char* fileName, int state);
 
-tEndScene oEndScene = nullptr;
 bool g_Active = false;
+WNDPROC oWndProc = nullptr;
 
 struct CTM_BUFFER { uint64_t guid; float pos[3]; };
 static CTM_BUFFER g_ctm;
 
-void SafeAction(uintptr_t pLocal, int type, uint64_t guid, float x, float y, float z) {
-    if (!pLocal) return;
-    g_ctm.guid = guid; g_ctm.pos[0] = x; g_ctm.pos[1] = y; g_ctm.pos[2] = z;
-    ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, type, &g_ctm.guid, g_ctm.pos, 0.5f);
+// Безопасное выполнение макросов в главном потоке
+void ExecuteLua(const char* command) {
+    ((tLuaExecute)ADDR_LUA_EXECUTE)(command, "bot_core", 0);
 }
 
-HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
-    static bool keyState = false;
-    
-    if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
-        if (!keyState) {
-            g_Active = !g_Active;
-            keyState = true;
-            MessageBeep(MB_ICONINFORMATION); // Асинхронный писк, не блокирует поток игры!
-            printf("\n[!] BOT STATUS: %s\n", g_Active ? "ACTIVE" : "PAUSED");
+// Движение по координатам. Никакого взаимодействия с целями!
+void SafeMove(uintptr_t pLocal, float x, float y, float z) {
+    if (!pLocal) return;
+    g_ctm.guid = 0; 
+    g_ctm.pos[0] = x; g_ctm.pos[1] = y; g_ctm.pos[2] = z;
+    ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, CTM_MOVE, &g_ctm.guid, g_ctm.pos, 0.5f);
+}
+
+void BotPulse() {
+    if (!g_Active) return;
+
+    uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
+    uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
+    if (!mgr) return;
+
+    uint64_t localGuid = *(uint64_t*)(mgr + 0xC0);
+    uintptr_t pLocal = 0;
+    float myX = 0, myY = 0, myZ = 0;
+
+    // Ищем себя
+    uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
+    while (cur && (cur & 1) == 0) {
+        if (*(uint64_t*)(cur + 0x30) == localGuid) {
+            pLocal = cur;
+            myX = *(float*)(cur + 0x798); 
+            myY = *(float*)(cur + 0x79C); 
+            myZ = *(float*)(cur + 0x7A0);
+            break;
         }
-    } else {
-        keyState = false;
+        cur = *(uintptr_t*)(cur + 0x3C);
     }
+    if (!pLocal) return;
 
-    if (g_Active) {
-        static DWORD lastTick = 0;
-        // Жесткий ограничитель: выполняем логику раз в полсекунды, чтобы не перегрузить движок
-        if (GetTickCount() - lastTick > 500) {
-            lastTick = GetTickCount();
+    // Читаем GUID текущей цели, которую игра ВЫБРАЛА САМА
+    uint64_t targetGuid = *(uint64_t*)ADDR_TARGET_GUID;
+    bool hasTarget = false;
+    int targetHp = 0;
+    uint32_t targetFlags = 0;
+    float targetPos[3] = {0};
 
-            uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
-            uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
-            if (mgr) {
-                uint64_t localGuid = *(uint64_t*)(mgr + 0xC0);
-                uintptr_t pLocal = 0;
-                float myX = 0, myY = 0, myZ = 0;
-
-                uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
-                while (cur && (cur & 1) == 0) {
-                    if (*(uint64_t*)(cur + 0x30) == localGuid) {
-                        pLocal = cur;
-                        myX = *(float*)(cur + 0x798); 
-                        myY = *(float*)(cur + 0x79C); 
-                        myZ = *(float*)(cur + 0x7A0);
-                        break;
-                    }
-                    cur = *(uintptr_t*)(cur + 0x3C);
+    if (targetGuid) {
+        cur = *(uintptr_t*)(mgr + 0xAC);
+        while (cur && (cur & 1) == 0) {
+            if (*(uint64_t*)(cur + 0x30) == targetGuid) {
+                uintptr_t desc = *(uintptr_t*)(cur + 0x8);
+                if (desc) {
+                    targetHp = *(int*)(desc + 0x60);
+                    targetFlags = *(uint32_t*)(desc + 0x114);
+                    targetPos[0] = *(float*)(cur + 0x798);
+                    targetPos[1] = *(float*)(cur + 0x79C);
+                    targetPos[2] = *(float*)(cur + 0x7A0);
+                    hasTarget = true;
                 }
-
-                if (pLocal) {
-                    uint64_t attackGuid = 0; float attackDist = 40.0f; float aPos[3] = {0};
-                    uint64_t lootGuid = 0;   float lootDist = 15.0f;   float lPos[3] = {0};
-
-                    cur = *(uintptr_t*)(mgr + 0xAC);
-                    while (cur && (cur & 1) == 0) {
-                        if (*(int*)(cur + 0x14) == 3) { // Мобы
-                            uintptr_t desc = *(uintptr_t*)(cur + 0x8);
-                            if (desc) {
-                                uint64_t objGuid = *(uint64_t*)(cur + 0x30);
-                                if (objGuid != localGuid) {
-                                    int hp = *(int*)(desc + 0x60);
-                                    uint32_t flags = *(uint32_t*)(desc + 0x114);
-                                    float tX = *(float*)(cur + 0x798);
-                                    float tY = *(float*)(cur + 0x79C);
-                                    float dist = sqrt(pow(tX - myX, 2) + pow(tY - myY, 2));
-
-                                    if (hp > 0) {
-                                        if (dist < attackDist) {
-                                            attackDist = dist; attackGuid = objGuid;
-                                            aPos[0] = tX; aPos[1] = tY; aPos[2] = *(float*)(cur + 0x7A0);
-                                        }
-                                    } else if (hp <= 0 && (flags & 1)) {
-                                        if (dist < lootDist) {
-                                            lootDist = dist; lootGuid = objGuid;
-                                            lPos[0] = tX; lPos[1] = tY; lPos[2] = *(float*)(cur + 0x7A0);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        cur = *(uintptr_t*)(cur + 0x3C);
-                    }
-
-                    if (lootGuid && lootDist < 5.0f) {
-                        *(uint64_t*)ADDR_TARGET_GUID = lootGuid;
-                        SafeAction(pLocal, CTM_LOOT, lootGuid, lPos[0], lPos[1], lPos[2]);
-                        printf("Looting: %llu               \r", lootGuid);
-                    } 
-                    else if (attackGuid) {
-                        *(uint64_t*)ADDR_TARGET_GUID = attackGuid;
-                        SafeAction(pLocal, CTM_ATTACK_GUID, attackGuid, aPos[0], aPos[1], aPos[2]);
-                        printf("Attacking: %llu | Dist: %.1f  \r", attackGuid, attackDist);
-                    } 
-                    else if (lootGuid) {
-                        *(uint64_t*)ADDR_TARGET_GUID = lootGuid;
-                        SafeAction(pLocal, CTM_LOOT, lootGuid, lPos[0], lPos[1], lPos[2]);
-                        printf("Running to Loot: %llu       \r", lootGuid);
-                    }
-                }
+                break;
             }
+            cur = *(uintptr_t*)(cur + 0x3C);
         }
     }
-    return oEndScene(pDevice);
+
+    static DWORD lastAction = 0;
+    if (GetTickCount() - lastAction > 500) {
+        if (hasTarget) {
+            float dist = sqrt(pow(targetPos[0] - myX, 2) + pow(targetPos[1] - myY, 2));
+
+            if (targetHp > 0) {
+                // Живая цель - подбегаем и бьем
+                if (dist > 4.5f) {
+                    SafeMove(pLocal, targetPos[0], targetPos[1], targetPos[2]);
+                    printf("Moving to Enemy... Dist: %.1f \r", dist);
+                } else {
+                    ExecuteLua("AttackTarget()");
+                    printf("Attacking Enemy!              \r");
+                }
+            } else if (targetHp <= 0 && (targetFlags & 1)) {
+                // Мертвая цель с лутом - подбегаем и лутаем
+                if (dist > 4.5f) {
+                    SafeMove(pLocal, targetPos[0], targetPos[1], targetPos[2]);
+                    printf("Moving to Loot... Dist: %.1f  \r", dist);
+                } else {
+                    ExecuteLua("InteractUnit('target')");
+                    printf("Looting Corpse!               \r");
+                }
+            } else {
+                // Цель мертва и пуста - сбрасываем таргет
+                ExecuteLua("ClearTarget()");
+                printf("Target Empty. Clearing...     \r");
+            }
+        } else {
+            // Если нет цели - доверяем движку найти ближайшего врага
+            ExecuteLua("TargetNearestEnemy()");
+            printf("Scanning for enemies...       \r");
+        }
+        lastAction = GetTickCount();
+    }
+}
+
+LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (uMsg == WM_KEYDOWN && wParam == VK_INSERT) {
+        g_Active = !g_Active;
+        Beep(g_Active ? 800 : 400, 100);
+        printf("\n[!] BOT STATUS: %s\n", g_Active ? "ACTIVE" : "PAUSED");
+    }
+    if (uMsg == WM_TIMER && wParam == 1337) {
+        BotPulse();
+    }
+    return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
 }
 
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v124: Pure EndScene Engine ---\n");
-    printf("[+] All synchronous blocks removed. Render thread is safe.\n");
-    printf("[!] Press [INSERT] to start.\n");
+    printf("--- Bot v125: Perfect Auto-Grinder ---\n");
 
-    uintptr_t deviceAddr = 0;
-    while (!(deviceAddr = *(uintptr_t*)ADDR_D3D9_DEVICE)) Sleep(100);
-
-    uintptr_t* vTable = *(uintptr_t**)deviceAddr;
-    if (vTable) {
-        DWORD old;
-        VirtualProtect(&vTable[42], 4, PAGE_EXECUTE_READWRITE, &old);
-        oEndScene = (tEndScene)vTable[42];
-        vTable[42] = (uintptr_t)HookedEndScene;
-        VirtualProtect(&vTable[42], 4, old, &old);
-        printf("[+] Direct3D9 Hook injected perfectly.\n");
+    HWND hwnd = FindWindowA(NULL, "World of Warcraft");
+    if (!hwnd) {
+        printf("[-] ERROR: WoW window not found!\n");
+        return 0;
     }
+
+    oWndProc = (WNDPROC)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)HookedWndProc);
+    SetTimer(hwnd, 1337, 500, NULL);
+
+    printf("[+] Smart Lua Targeting Initialized.\n");
+    printf("[!] Make sure 'Click-to-Move' and 'Auto Loot' are ON.\n");
+    printf("[+] Press [INSERT] to unleash the bot.\n");
     return 0;
 }
 
