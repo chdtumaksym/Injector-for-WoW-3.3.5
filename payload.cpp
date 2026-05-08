@@ -7,7 +7,7 @@
 #pragma comment(lib, "user32.lib")
 
 // --- ОФФСЕТЫ 3.3.5a (12340) ---
-#define STATIC_CLIENT_CONNECTION 0x00C79CE0
+#define OFFSET_S_CUR_MGR         0x00879CE0
 #define OFFSET_OBJECT_MANAGER    0x2ED0
 #define ADDR_TARGET_GUID         0x00BD07B0 // Адрес текущей цели в UI
 
