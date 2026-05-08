@@ -27,7 +27,7 @@ tFrameScript_Execute Lua_DoString = (tFrameScript_Execute)ADDR_LUA_EXECUTE;
 tClickToMove ClickToMove = (tClickToMove)ADDR_CLICK_TO_MOVE;
 tGetActivePlayer GetPlayer = (tGetActivePlayer)ADDR_GET_PLAYER;
 
-// --- СИНХРОННАЯ ОЧЕРЕДЬ (Для Копайлота) ---
+// --- СИНХРОННАЯ ОЧЕРЕДЬ ---
 struct BotCommand {
     volatile int type; // 1: Move, 2: Attack, 3: Interact, 4: Loot, 5: Init Settings
     volatile uint64_t guid;
@@ -59,6 +59,19 @@ void TapKey(WORD vKey) {
     ip.ki.dwFlags = KEYEVENTF_KEYUP; SendInput(1, &ip, sizeof(INPUT));
 }
 
+// Ожидание выполнения команды с таймаутом (защита от зависания консоли)
+void WaitCommand() {
+    int timeout = 0;
+    while (g_Cmd.type != 0 && timeout < 200) {
+        Sleep(10);
+        timeout++;
+    }
+    if (g_Cmd.type != 0) {
+        printf("[!] ОШИБКА: Хук не отвечает! Игра заморожена или оффсет неверен.\n");
+        g_Cmd.type = 0; // Принудительный сброс, чтобы не висеть
+    }
+}
+
 // --- ЛОГИКА БОТА ДЛЯ MAIN THREAD ---
 void __stdcall DoBotLogic() {
     int cmd = g_Cmd.type;
@@ -69,7 +82,6 @@ void __stdcall DoBotLogic() {
         __try {
             if (cmd == 1) { 
                 float pos[3] = { g_Cmd.x, g_Cmd.y, g_Cmd.z };
-                // Передаем GUID цели в CTM, чтобы движок понял, куда мы бежим
                 ClickToMove(pLocal, 4, (uint64_t*)&g_Cmd.guid, pos, 0.5f);
             } else if (cmd == 2) { 
                 Lua_DoString("if not IsCurrentSpell(6603) then StartAttack() end", "bot", 0);
@@ -80,12 +92,10 @@ void __stdcall DoBotLogic() {
             } else if (cmd == 4) { 
                 Lua_DoString("if LootFrame:IsVisible() then for i=1,GetNumLootItems() do LootSlot(i) end CloseLoot() end", "bot", 0);
             } else if (cmd == 5) {
-                // Принудительно включаем Click-To-Move и AutoLoot
                 Lua_DoString("SetCVar('autoInteract', '1') SetCVar('autoLootDefault', '1')", "bot", 0);
             }
         } __except(1) {}
     }
-    // ЖЕЛЕЗОБЕТОННЫЙ СБРОС КОМАНДЫ, чтобы внешний поток никогда не зависал
     g_Cmd.type = 0;
 }
 
@@ -97,8 +107,8 @@ __declspec(naked) void Hook_CGGameUI_Update() {
         call DoBotLogic
         popfd
         popad
-        mov eax, g_Trampoline // Безопасный прыжок
-        jmp eax
+        // ИДЕАЛЬНЫЙ ПРЫЖОК: регистры не перезаписываются, крашей нет.
+        jmp dword ptr [g_Trampoline]
     }
 }
 
@@ -142,7 +152,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f; freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Paladin GodMode v19.0 (Anti-Idiot Settings) ---\n");
+    printf("--- Paladin GodMode v20.0 (Asm Fix & Timeout) ---\n");
     if (InstallDetourHook()) {
         printf("[+] CGGameUI::Update Hooked! FSM Sync verified.\n");
     } else {
@@ -150,6 +160,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
         return 0;
     }
     printf("[!] CTM & AutoLoot will be forced via Lua.\n");
+    printf("[!] ONLY BIND NEEDED: '9' - Heal.\n");
     printf("--------------------------------------------------\n");
 
     uintptr_t connectionAddr = (uintptr_t)GetModuleHandleA(NULL) + OFFSET_S_CUR_MGR;
@@ -158,147 +169,152 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     uint64_t activeTargetGuid = 0;
     DWORD stateStartTime = GetTickCount();
 
-    // Запускаем инициализацию настроек игры
+    // Инициализация настроек игры (с таймаутом)
     g_Cmd.type = 5;
-    while(g_Cmd.type != 0) Sleep(10);
+    WaitCommand();
 
     while (!GetAsyncKeyState(VK_END)) {
         uintptr_t clientConn = SafeRead<uintptr_t>(connectionAddr);
-        SetConsoleCursor(0, 6);
+        SetConsoleCursor(0, 7);
 
-        if (clientConn) {
-            uintptr_t mgr = SafeRead<uintptr_t>(clientConn + OFFSET_OBJECT_MANAGER);
-            if (mgr) {
-                uintptr_t cur = SafeRead<uintptr_t>(mgr + 0xAC);
-                uint64_t myGuid = SafeRead<uint64_t>(mgr + 0xC0);
-                uintptr_t pLocal = 0;
+        if (!clientConn) {
+            printf("[!] Ожидание подключения к миру (clientConn = 0)...        \n");
+            Sleep(500);
+            continue;
+        }
 
-                while (cur != 0 && (cur & 1) == 0) {
-                    if (SafeRead<uint64_t>(cur + 0x30) == myGuid && myGuid != 0) { pLocal = cur; break; }
-                    cur = SafeRead<uintptr_t>(cur + 0x3C);
+        uintptr_t mgr = SafeRead<uintptr_t>(clientConn + OFFSET_OBJECT_MANAGER);
+        if (mgr) {
+            uintptr_t cur = SafeRead<uintptr_t>(mgr + 0xAC);
+            uint64_t myGuid = SafeRead<uint64_t>(mgr + 0xC0);
+            uintptr_t pLocal = 0;
+
+            while (cur != 0 && (cur & 1) == 0) {
+                if (SafeRead<uint64_t>(cur + 0x30) == myGuid && myGuid != 0) { pLocal = cur; break; }
+                cur = SafeRead<uintptr_t>(cur + 0x3C);
+            }
+
+            if (pLocal) {
+                uintptr_t pDesc = SafeRead<uintptr_t>(pLocal + 0x8);
+                int hp = SafeRead<int>(pDesc + 0x60), maxHp = SafeRead<int>(pDesc + 0x80), lvl = SafeRead<int>(pDesc + 0xD8);
+                float myX = SafeRead<float>(pLocal + 0x798), myY = SafeRead<float>(pLocal + 0x79C);
+
+                printf("[PLAYER] HP: %-5d/%-5d | LVL: %d | POS: %.1f, %.1f      \n", hp, maxHp, lvl, myX, myY);
+                printf("--------------------------------------------------\n");
+
+                // Единственный аппаратный каст (Хил - защита от бана)
+                if (hp > 0 && maxHp > 0 && (hp * 100 / maxHp) < 40) {
+                    if (GetForegroundWindow() == g_WowWnd) {
+                        TapKey('9'); 
+                        Sleep(1500); 
+                    }
                 }
 
-                if (pLocal) {
-                    uintptr_t pDesc = SafeRead<uintptr_t>(pLocal + 0x8);
-                    int hp = SafeRead<int>(pDesc + 0x60), maxHp = SafeRead<int>(pDesc + 0x80), lvl = SafeRead<int>(pDesc + 0xD8);
-                    float myX = SafeRead<float>(pLocal + 0x798), myY = SafeRead<float>(pLocal + 0x79C);
+                DWORD elapsed = GetTickCount() - stateStartTime;
 
-                    printf("[PLAYER] HP: %-5d/%-5d | LVL: %d | POS: %.1f, %.1f      \n", hp, maxHp, lvl, myX, myY);
-                    printf("--------------------------------------------------\n");
-
-                    // Единственный безопасный хардверный каст (Хил)
-                    if (hp > 0 && maxHp > 0 && (hp * 100 / maxHp) < 40) {
-                        if (GetForegroundWindow() == g_WowWnd) {
-                            TapKey('9'); 
-                            Sleep(1500); 
-                        }
-                    }
-
-                    DWORD elapsed = GetTickCount() - stateStartTime;
-
-                    // --- FSM ---
-                    if (state == STATE_SEARCH) {
-                        float bestDist = 45.0f; activeTargetGuid = 0;
-                        cur = SafeRead<uintptr_t>(mgr + 0xAC);
-                        
-                        while (cur != 0 && (cur & 1) == 0) {
-                            if (SafeRead<int>(cur + 0x14) == 3) { 
-                                uintptr_t d = SafeRead<uintptr_t>(cur + 0x8);
-                                int mHp = SafeRead<int>(d + 0x60), mLvl = SafeRead<int>(d + 0xD8);
-                                uint64_t mSummoner = SafeRead<uint64_t>(d + 0x38);
-                                
-                                if (mHp > 0 && mLvl <= lvl + 2 && mSummoner == 0) {
-                                    float dx = SafeRead<float>(cur + 0x798) - myX, dy = SafeRead<float>(cur + 0x79C) - myY;
-                                    float dist = sqrt(dx*dx + dy*dy);
-                                    if (dist < bestDist) { bestDist = dist; activeTargetGuid = SafeRead<uint64_t>(cur + 0x30); }
-                                }
-                            }
-                            cur = SafeRead<uintptr_t>(cur + 0x3C);
-                        }
-                        
-                        if (activeTargetGuid != 0) { state = STATE_MOVE; stateStartTime = GetTickCount(); }
-                    }
-
-                    if (activeTargetGuid != 0) {
-                        if (pDesc) *(uint64_t*)(pDesc + 0x48) = activeTargetGuid; 
-                        *(uint64_t*)ADDR_TARGET_GUID = activeTargetGuid;
-
-                        uintptr_t tObj = 0; cur = SafeRead<uintptr_t>(mgr + 0xAC);
-                        while (cur != 0 && (cur & 1) == 0) { 
-                            if(SafeRead<uint64_t>(cur+0x30) == activeTargetGuid) { tObj = cur; break; } 
-                            cur = SafeRead<uintptr_t>(cur+0x3C); 
-                        }
-                        
-                        if (tObj) {
-                            uintptr_t td = SafeRead<uintptr_t>(tObj + 0x8);
-                            int thp = SafeRead<int>(td + 0x60);
-                            float tx = SafeRead<float>(tObj + 0x798), ty = SafeRead<float>(tObj + 0x79C), tz = SafeRead<float>(tObj + 0x7A0);
-                            float dx = tx - myX, dy = ty - myY;
-                            float dist = sqrt(dx*dx + dy*dy);
-                            float cYaw = atan2(dy, dx); if (cYaw < 0) cYaw += 6.283185f;
-
-                            printf("[TARGET] HP: %-5d | DIST: %.2f yds                  \n", thp, dist);
+                // --- FSM ---
+                if (state == STATE_SEARCH) {
+                    float bestDist = 45.0f; activeTargetGuid = 0;
+                    cur = SafeRead<uintptr_t>(mgr + 0xAC);
+                    
+                    while (cur != 0 && (cur & 1) == 0) {
+                        if (SafeRead<int>(cur + 0x14) == 3) { 
+                            uintptr_t d = SafeRead<uintptr_t>(cur + 0x8);
+                            int mHp = SafeRead<int>(d + 0x60), mLvl = SafeRead<int>(d + 0xD8);
+                            uint64_t mSummoner = SafeRead<uint64_t>(d + 0x38);
                             
-                            if (thp > 0) {
-                                *(float*)(pLocal + 0x7A8) = cYaw; 
-                                
-                                if (dist > 4.2f) {
-                                    if (state == STATE_MOVE && elapsed > 12000) {
-                                        printf("[!] ЗАСТРЯЛ! Сбрасываю таргет...              \n");
-                                        activeTargetGuid = 0; state = STATE_SEARCH; stateStartTime = GetTickCount();
-                                        continue;
-                                    }
-                                    if (state != STATE_MOVE) { state = STATE_MOVE; stateStartTime = GetTickCount(); }
-                                    
-                                    g_Cmd.guid = activeTargetGuid;
-                                    g_Cmd.x = tx; g_Cmd.y = ty; g_Cmd.z = tz; 
-                                    g_Cmd.type = 1;
-                                    while(g_Cmd.type != 0) Sleep(10);
-                                } else {
-                                    if (state == STATE_COMBAT && elapsed > 25000) {
-                                        printf("[!] БОЙ ЗАБАГАЛСЯ! Сбрасываю...               \n");
-                                        activeTargetGuid = 0; state = STATE_SEARCH; stateStartTime = GetTickCount();
-                                        continue;
-                                    }
-                                    if (state != STATE_COMBAT) { state = STATE_COMBAT; stateStartTime = GetTickCount(); }
-
-                                    g_Cmd.type = 2;
-                                    while(g_Cmd.type != 0) Sleep(10);
-                                    Sleep(100);
-                                }
-                            } else {
-                                if (state != STATE_LOOT) { state = STATE_LOOT; stateStartTime = GetTickCount(); }
-                                
-                                printf("[STATE] ЖДЕМ ГЕНЕРАЦИЮ ТРУПА СЕРВЕРОМ...         \n");
-                                Sleep(1500); 
-                                
-                                printf("[STATE] INTERNAL ВЗАИМОДЕЙСТВИЕ (LUA)...         \n");
-                                g_Cmd.guid = activeTargetGuid; g_Cmd.type = 3;
-                                while(g_Cmd.type != 0) Sleep(10);
-                                
-                                Sleep(1500); 
-                                
-                                printf("[STATE] LUA АВТОСБОР...                            \n");
-                                g_Cmd.type = 4;
-                                while(g_Cmd.type != 0) Sleep(10);
-                                
-                                Sleep(1000); 
-                                
-                                if (pDesc) *(uint64_t*)(pDesc + 0x48) = 0; 
-                                *(uint64_t*)ADDR_TARGET_GUID = 0; 
-                                activeTargetGuid = 0; 
-                                state = STATE_SEARCH;
-                                stateStartTime = GetTickCount();
+                            if (mHp > 0 && mLvl <= lvl + 2 && mSummoner == 0) {
+                                float dx = SafeRead<float>(cur + 0x798) - myX, dy = SafeRead<float>(cur + 0x79C) - myY;
+                                float dist = sqrt(dx*dx + dy*dy);
+                                if (dist < bestDist) { bestDist = dist; activeTargetGuid = SafeRead<uint64_t>(cur + 0x30); }
                             }
-                        } else { 
-                            activeTargetGuid = 0; state = STATE_SEARCH; stateStartTime = GetTickCount();
+                        }
+                        cur = SafeRead<uintptr_t>(cur + 0x3C);
+                    }
+                    
+                    if (activeTargetGuid != 0) { state = STATE_MOVE; stateStartTime = GetTickCount(); }
+                }
+
+                if (activeTargetGuid != 0) {
+                    if (pDesc) *(uint64_t*)(pDesc + 0x48) = activeTargetGuid; 
+                    *(uint64_t*)ADDR_TARGET_GUID = activeTargetGuid;
+
+                    uintptr_t tObj = 0; cur = SafeRead<uintptr_t>(mgr + 0xAC);
+                    while (cur != 0 && (cur & 1) == 0) { 
+                        if(SafeRead<uint64_t>(cur+0x30) == activeTargetGuid) { tObj = cur; break; } 
+                        cur = SafeRead<uintptr_t>(cur+0x3C); 
+                    }
+                    
+                    if (tObj) {
+                        uintptr_t td = SafeRead<uintptr_t>(tObj + 0x8);
+                        int thp = SafeRead<int>(td + 0x60);
+                        float tx = SafeRead<float>(tObj + 0x798), ty = SafeRead<float>(tObj + 0x79C), tz = SafeRead<float>(tObj + 0x7A0);
+                        float dx = tx - myX, dy = ty - myY;
+                        float dist = sqrt(dx*dx + dy*dy);
+                        float cYaw = atan2(dy, dx); if (cYaw < 0) cYaw += 6.283185f;
+
+                        printf("[TARGET] HP: %-5d | DIST: %.2f yds                  \n", thp, dist);
+                        
+                        if (thp > 0) {
+                            *(float*)(pLocal + 0x7A8) = cYaw; 
+                            
+                            if (dist > 4.2f) {
+                                if (state == STATE_MOVE && elapsed > 12000) {
+                                    printf("[!] ЗАСТРЯЛ! Сбрасываю таргет...              \n");
+                                    activeTargetGuid = 0; state = STATE_SEARCH; stateStartTime = GetTickCount();
+                                    continue;
+                                }
+                                if (state != STATE_MOVE) { state = STATE_MOVE; stateStartTime = GetTickCount(); }
+                                
+                                g_Cmd.guid = activeTargetGuid;
+                                g_Cmd.x = tx; g_Cmd.y = ty; g_Cmd.z = tz; 
+                                g_Cmd.type = 1;
+                                WaitCommand(); // Ожидаем без зависания
+                            } else {
+                                if (state == STATE_COMBAT && elapsed > 25000) {
+                                    printf("[!] БОЙ ЗАБАГАЛСЯ! Сбрасываю...               \n");
+                                    activeTargetGuid = 0; state = STATE_SEARCH; stateStartTime = GetTickCount();
+                                    continue;
+                                }
+                                if (state != STATE_COMBAT) { state = STATE_COMBAT; stateStartTime = GetTickCount(); }
+
+                                g_Cmd.type = 2;
+                                WaitCommand();
+                                Sleep(100);
+                            }
+                        } else {
+                            if (state != STATE_LOOT) { state = STATE_LOOT; stateStartTime = GetTickCount(); }
+                            
+                            printf("[STATE] ЖДЕМ ГЕНЕРАЦИЮ ТРУПА СЕРВЕРОМ...         \n");
+                            Sleep(1500); 
+                            
+                            printf("[STATE] INTERNAL ВЗАИМОДЕЙСТВИЕ (LUA)...         \n");
+                            g_Cmd.guid = activeTargetGuid; 
+                            g_Cmd.type = 3;
+                            WaitCommand();
+                            
+                            Sleep(1500); 
+                            
+                            printf("[STATE] LUA АВТОСБОР...                            \n");
+                            g_Cmd.type = 4;
+                            WaitCommand();
+                            
+                            Sleep(1000); 
+                            
+                            if (pDesc) *(uint64_t*)(pDesc + 0x48) = 0; 
+                            *(uint64_t*)ADDR_TARGET_GUID = 0; 
+                            activeTargetGuid = 0; 
+                            state = STATE_SEARCH;
+                            stateStartTime = GetTickCount();
                         }
                     } else { 
-                        printf("[TARGET] ПОИСК НОВОЙ ЦЕЛИ...                      \n");
-                        stateStartTime = GetTickCount();
+                        activeTargetGuid = 0; state = STATE_SEARCH; stateStartTime = GetTickCount();
                     }
-                    printf("[FSM] %-15s | JMP HOOK: ACTIVE         \n", stateNames[state]);
+                } else { 
+                    printf("[TARGET] ПОИСК НОВОЙ ЦЕЛИ...                      \n");
+                    stateStartTime = GetTickCount();
                 }
+                printf("[FSM] %-15s | JMP HOOK: ACTIVE         \n", stateNames[state]);
             }
         }
         Sleep(100);
