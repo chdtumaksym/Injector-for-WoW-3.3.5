@@ -4,7 +4,6 @@
 #include <tlhelp32.h>
 #include <vector>
 
-// Структура данных для Shellcode, который выполнится внутри WoW
 struct MANUAL_MAPPING_DATA {
     typedef HMODULE(WINAPI* pLoadLibraryA)(LPCSTR);
     typedef FARPROC(WINAPI* pGetProcAddress)(HMODULE, LPCSTR);
@@ -13,7 +12,6 @@ struct MANUAL_MAPPING_DATA {
     BYTE* pbase;
 };
 
-// Функция поиска ID процесса
 DWORD GetProcessId(const char* procName) {
     DWORD procId = 0;
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -32,7 +30,8 @@ DWORD GetProcessId(const char* procName) {
     return procId;
 }
 
-// Shellcode: этот код копируется в WoW и настраивает DLL "изнутри"
+// Отключаем оптимизацию, чтобы компилятор не вырезал заглушку и не менял порядок функций
+#pragma optimize("", off)
 void __stdcall ShellCode(MANUAL_MAPPING_DATA* pData) {
     if (!pData) return;
     BYTE* pBase = pData->pbase;
@@ -40,7 +39,6 @@ void __stdcall ShellCode(MANUAL_MAPPING_DATA* pData) {
     auto _LoadLibraryA = pData->fnLoadLibraryA;
     auto _GetProcAddress = pData->fnGetProcAddress;
 
-    // 1. Релокация (подстройка адресов)
     auto* pRelocDir = &pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
     if (pRelocDir->Size) {
         auto* pReloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>(pBase + pRelocDir->VirtualAddress);
@@ -57,7 +55,6 @@ void __stdcall ShellCode(MANUAL_MAPPING_DATA* pData) {
         }
     }
 
-    // 2. Импорты (подключение системных функций)
     auto* pImportDir = &pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (pImportDir->Size) {
         auto* pImportDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(pBase + pImportDir->VirtualAddress);
@@ -75,24 +72,31 @@ void __stdcall ShellCode(MANUAL_MAPPING_DATA* pData) {
         }
     }
 
-    // 3. Запуск DllMain
     if (pOpt->AddressOfEntryPoint) {
         auto _DllMain = reinterpret_cast<BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID)>(pBase + pOpt->AddressOfEntryPoint);
         _DllMain((HINSTANCE)pBase, DLL_PROCESS_ATTACH, nullptr);
     }
 }
 
-// Заглушка для определения размера ShellCode
 void __stdcall ShellCodeEnd() {}
+#pragma optimize("", on)
 
 int main() {
     const char* dllFile = "bot_payload.dll";
     const char* procName = "WoW.exe";
 
     DWORD pid = GetProcessId(procName);
-    if (!pid) return 1;
+    if (!pid) {
+        std::cout << "[-] Процесс не найден." << std::endl;
+        return 1;
+    }
 
     std::ifstream file(dllFile, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        std::cout << "[-] Не удалось открыть " << dllFile << std::endl;
+        return 1;
+    }
+
     auto fileSize = file.tellg();
     std::vector<BYTE> buffer(fileSize);
     file.seekg(0, std::ios::beg);
@@ -100,19 +104,26 @@ int main() {
     file.close();
 
     HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    if (!hProc) {
+        std::cout << "[-] Нет прав на открытие процесса." << std::endl;
+        return 1;
+    }
+
     auto* pOldHeader = reinterpret_cast<IMAGE_NT_HEADERS*>(buffer.data() + reinterpret_cast<IMAGE_DOS_HEADER*>(buffer.data())->e_lfanew);
-    
-    // Выделяем память под DLL в WoW
     BYTE* pTargetBase = (BYTE*)VirtualAllocEx(hProc, nullptr, pOldHeader->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     
-    // Копируем заголовки и секции
+    if (!pTargetBase) {
+        std::cout << "[-] Ошибка выделения памяти в целевом процессе." << std::endl;
+        CloseHandle(hProc);
+        return 1;
+    }
+    
     WriteProcessMemory(hProc, pTargetBase, buffer.data(), pOldHeader->OptionalHeader.SizeOfHeaders, nullptr);
     auto* pSectionHeader = IMAGE_FIRST_SECTION(pOldHeader);
     for (UINT i = 0; i != pOldHeader->FileHeader.NumberOfSections; ++i, ++pSectionHeader) {
         WriteProcessMemory(hProc, pTargetBase + pSectionHeader->VirtualAddress, buffer.data() + pSectionHeader->PointerToRawData, pSectionHeader->SizeOfRawData, nullptr);
     }
 
-    // Подготовка данных для Shellcode
     MANUAL_MAPPING_DATA data;
     data.fnLoadLibraryA = LoadLibraryA;
     data.fnGetProcAddress = GetProcAddress;
@@ -121,7 +132,6 @@ int main() {
     BYTE* pDataLoc = (BYTE*)VirtualAllocEx(hProc, nullptr, sizeof(MANUAL_MAPPING_DATA), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     WriteProcessMemory(hProc, pDataLoc, &data, sizeof(MANUAL_MAPPING_DATA), nullptr);
 
-    // Копируем сам Shellcode и запускаем его
     DWORD shellSize = (DWORD)ShellCodeEnd - (DWORD)ShellCode;
     BYTE* pCodeLoc = (BYTE*)VirtualAllocEx(hProc, nullptr, shellSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     WriteProcessMemory(hProc, pCodeLoc, ShellCode, shellSize, nullptr);
@@ -129,8 +139,10 @@ int main() {
     HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0, (LPTHREAD_START_ROUTINE)pCodeLoc, pDataLoc, 0, nullptr);
     
     if (hThread) {
-        std::cout << "[+] Stealth Inject Successful!" << std::endl;
+        std::cout << "[+] Стелс-инжект прошел успешно!" << std::endl;
         CloseHandle(hThread);
+    } else {
+        std::cout << "[-] Ошибка создания удаленного потока." << std::endl;
     }
 
     CloseHandle(hProc);
