@@ -1,16 +1,25 @@
 #include <windows.h>
 #include <cmath>
 #include <d3d9.h>
+#include <stdint.h>
+#include <psapi.h>
+
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "d3d9.lib")
+#pragma comment(lib, "psapi.lib")
 
 #define OFFSET_S_CUR_MGR 0x00879CE0
 #define OFFSET_OBJECT_MANAGER 0x2ED0
+#define ADDR_TARGET_GUID 0x00BD07B0
 #define ADDR_CLICK_TO_MOVE 0x00611130
 #define ADDR_GET_PLAYER 0x004038BE
 #define ADDR_D3D9_DEVICE 0x00C5DF88
+#define ADDR_LUA_EXECUTE 0x00819210
 
 typedef void(__thiscall* tClickToMove)(uintptr_t playerPtr, int clickType, uint64_t* interactGuid, float* pos, float precision);
 typedef uintptr_t(__cdecl* tGetPlayer)();
 typedef HRESULT(__stdcall* tEndScene)(LPDIRECT3DDEVICE9 pDevice);
+typedef void(__cdecl* tFrameScript_Execute)(const char* script, const char* name, void* state);
 
 tEndScene oEndScene = nullptr;
 bool g_BotActive = false;
@@ -26,6 +35,10 @@ bool IsValidRead(uintptr_t ptr) {
 
 template<typename T> T Read(uintptr_t addr) {
     return IsValidRead(addr) ? *(T*)addr : T();
+}
+
+template<typename T> void Write(uintptr_t addr, T val) {
+    if (IsValidRead(addr)) *(T*)addr = val;
 }
 
 HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
@@ -47,6 +60,7 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
             uintptr_t pLocal = ((tGetPlayer)ADDR_GET_PLAYER)();
             if (mgr && pLocal && Read<int>(pLocal + 0x14) == 4) {
                 float myX = Read<float>(pLocal + 0x798), myY = Read<float>(pLocal + 0x79C);
+                uintptr_t pDesc = Read<uintptr_t>(pLocal + 0x8);
                 uint64_t bestGuid = 0; float bestDist = 45.0f; uintptr_t bestObj = 0;
                 uintptr_t cur = Read<uintptr_t>(mgr + 0xAC);
                 
@@ -63,15 +77,27 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
                 }
                 
                 static DWORD lastAction = 0;
-                if (bestGuid && GetTickCount() - lastAction > 1500) {
+                if (bestGuid) {
                     float tx = Read<float>(bestObj + 0x798), ty = Read<float>(bestObj + 0x79C), tz = Read<float>(bestObj + 0x7A0);
-                    float pos[3] = { tx, ty, tz };
-                    if (bestDist > 4.5f) {
-                        ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 4, &bestGuid, pos, 0.5f);
+                    float dx = tx - myX, dy = ty - myY;
+                    float dist = sqrt(dx*dx + dy*dy);
+                    
+                    Write<uint64_t>(pDesc + 0x48, bestGuid);
+                    Write<uint64_t>(ADDR_TARGET_GUID, bestGuid);
+                    Write<float>(pLocal + 0x7A8, atan2(dy, dx) < 0 ? atan2(dy, dx) + 6.283185f : atan2(dy, dx));
+
+                    if (dist > 4.5f) {
+                        if (GetTickCount() - lastAction > 500) {
+                            float pos[3] = { tx, ty, tz };
+                            ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 4, &bestGuid, pos, 0.5f);
+                            lastAction = GetTickCount();
+                        }
                     } else {
-                        ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 11, &bestGuid, pos, 0.5f);
+                        if (GetTickCount() - lastAction > 2000) {
+                            ((tFrameScript_Execute)ADDR_LUA_EXECUTE)("InteractUnit('target')", "BotAttack", NULL);
+                            lastAction = GetTickCount();
+                        }
                     }
-                    lastAction = GetTickCount();
                 } else if (!bestGuid && GetTickCount() - lastAction > 2000) {
                     cur = Read<uintptr_t>(mgr + 0xAC);
                     while (cur && (cur & 1) == 0) {
@@ -81,8 +107,9 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
                                 float dx = Read<float>(cur + 0x798) - myX, dy = Read<float>(cur + 0x79C) - myY;
                                 if (sqrt(dx*dx + dy*dy) < 5.0f) {
                                     uint64_t deadGuid = Read<uint64_t>(cur + 0x30);
-                                    float pos[3] = { Read<float>(cur + 0x798), Read<float>(cur + 0x79C), Read<float>(cur + 0x7A0) };
-                                    ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 6, &deadGuid, pos, 0.5f);
+                                    Write<uint64_t>(pDesc + 0x48, deadGuid);
+                                    Write<uint64_t>(ADDR_TARGET_GUID, deadGuid);
+                                    ((tFrameScript_Execute)ADDR_LUA_EXECUTE)("InteractUnit('target')", "BotLoot", NULL);
                                     break;
                                 }
                             }
@@ -98,43 +125,39 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
 }
 
 DWORD WINAPI InitThread(LPVOID lpParam) {
-    // Ждем 10 секунд, пока игра полностью прогрузится и инициализирует DirectX
     Sleep(10000);
-    Beep(500, 200); // Сигнал, что попытка хука началась
+    Beep(500, 200); 
 
     uintptr_t* pDevicePtr = (uintptr_t*)ADDR_D3D9_DEVICE;
     if (IsValidRead((uintptr_t)pDevicePtr) && *pDevicePtr) {
         uintptr_t* vTable = *(uintptr_t**)*pDevicePtr;
         if (IsValidRead((uintptr_t)vTable)) {
-            
-            // Дополнительная проверка: убеждаемся, что адрес EndScene действительно находится в модуле d3d9.dll
             HMODULE hD3D9 = GetModuleHandleA("d3d9.dll");
             if (hD3D9) {
                 MODULEINFO mi;
-                GetModuleInformation(GetCurrentProcess(), hD3D9, &mi, sizeof(mi));
-                uintptr_t endSceneAddr = vTable[42];
-                
-                if (endSceneAddr >= (uintptr_t)mi.lpBaseOfDll && endSceneAddr <= ((uintptr_t)mi.lpBaseOfDll + mi.SizeOfImage)) {
-                    DWORD old;
-                    if (VirtualProtect(&vTable[42], 4, PAGE_EXECUTE_READWRITE, &old)) {
-                        oEndScene = (tEndScene)vTable[42];
-                        vTable[42] = (uintptr_t)HookedEndScene;
-                        VirtualProtect(&vTable[42], 4, old, &old);
-                        Beep(1000, 300); // Успешный хук
-                        return 0;
+                if (GetModuleInformation(GetCurrentProcess(), hD3D9, &mi, sizeof(mi))) {
+                    uintptr_t endSceneAddr = vTable[42];
+                    if (endSceneAddr >= (uintptr_t)mi.lpBaseOfDll && endSceneAddr <= ((uintptr_t)mi.lpBaseOfDll + mi.SizeOfImage)) {
+                        DWORD old;
+                        if (VirtualProtect(&vTable[42], 4, PAGE_EXECUTE_READWRITE, &old)) {
+                            oEndScene = (tEndScene)vTable[42];
+                            vTable[42] = (uintptr_t)HookedEndScene;
+                            VirtualProtect(&vTable[42], 4, old, &old);
+                            Beep(1000, 300); 
+                            return 0;
+                        }
                     }
                 }
             }
         }
     }
-    Beep(200, 500); // Ошибка хука
+    Beep(200, 500); 
     return 0;
 }
 
 BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hInst);
-        // Запускаем инициализацию в отдельном потоке, чтобы не вешать DllMain
         CreateThread(0, 0, InitThread, hInst, 0, 0);
     }
     return TRUE;
