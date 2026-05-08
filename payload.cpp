@@ -2,6 +2,7 @@
 #include <cmath>
 #include <stdint.h>
 #include <iostream>
+#include <d3d9.h>
 
 #pragma comment(lib, "d3d9.lib")
 
