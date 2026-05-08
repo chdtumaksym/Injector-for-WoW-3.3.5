@@ -2,7 +2,9 @@
 #include <iostream>
 #include <cmath>
 #include <cstdio>
+#include <d3d9.h>
 
+#pragma comment(lib, "d3d9.lib")
 #pragma comment(lib, "user32.lib")
 
 // --- ОФФСЕТЫ 3.3.5a (12340) ---
@@ -13,7 +15,6 @@
 #define ADDR_LUA_EXECUTE         0x00819210
 #define ADDR_CLICK_TO_MOVE       0x00611130
 #define ADDR_GET_PLAYER          0x004038BE
-#define ADDR_CGGAMEUI_UPDATE     0x007CDE10 
 
 enum BotState { STATE_SEARCH, STATE_MOVE, STATE_COMBAT, STATE_LOOT };
 const char* stateNames[] = { "SEARCHING", "MOVING", "COMBAT", "LOOTING" };
@@ -27,15 +28,12 @@ tFrameScript_Execute Lua_DoString = (tFrameScript_Execute)ADDR_LUA_EXECUTE;
 tClickToMove ClickToMove = (tClickToMove)ADDR_CLICK_TO_MOVE;
 tGetActivePlayer GetPlayer = (tGetActivePlayer)ADDR_GET_PLAYER;
 
-// --- СИНХРОННАЯ ОЧЕРЕДЬ ---
+// --- СИНХРОННАЯ ОЧЕРЕДЬ ДЛЯ ИНТЕРНАЛА ---
 struct BotCommand {
-    volatile int type; // 1: Move, 2: Attack, 3: Interact, 4: Loot, 5: Init Settings
+    volatile int type; // 0: None, 1: Move, 2: Attack, 3: Loot/Interact, 4: Heal
     volatile uint64_t guid;
     volatile float x, y, z;
 } g_Cmd;
-
-void* g_Trampoline = nullptr;
-HWND g_WowWnd = NULL;
 
 // --- БЕЗОПАСНОЕ ЧТЕНИЕ ПАМЯТИ ---
 template <typename T>
@@ -52,99 +50,94 @@ void SetConsoleCursor(int x, int y) {
     SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), c);
 }
 
-void TapKey(WORD vKey) {
-    INPUT ip = {0}; ip.type = INPUT_KEYBOARD; 
-    ip.ki.wVk = vKey; ip.ki.dwFlags = 0; SendInput(1, &ip, sizeof(INPUT));
-    Sleep(40);
-    ip.ki.dwFlags = KEYEVENTF_KEYUP; SendInput(1, &ip, sizeof(INPUT));
-}
+// --- VTABLE ХУК D3D9 ---
+typedef HRESULT(__stdcall* tEndScene)(IDirect3DDevice9*);
+tEndScene oEndScene = nullptr;
 
-// Ожидание выполнения команды с таймаутом (защита от зависания консоли)
-void WaitCommand() {
-    int timeout = 0;
-    while (g_Cmd.type != 0 && timeout < 200) {
-        Sleep(10);
-        timeout++;
-    }
-    if (g_Cmd.type != 0) {
-        printf("[!] ОШИБКА: Хук не отвечает! Игра заморожена или оффсет неверен.\n");
-        g_Cmd.type = 0; // Принудительный сброс, чтобы не висеть
-    }
-}
+HRESULT __stdcall HookedEndScene(IDirect3DDevice9* pDevice) {
+    if (!pDevice) return oEndScene(pDevice);
 
-// --- ЛОГИКА БОТА ДЛЯ MAIN THREAD ---
-void __stdcall DoBotLogic() {
     int cmd = g_Cmd.type;
-    if (cmd == 0) return;
+    if (cmd != 0) {
+        uintptr_t pLocal = GetPlayer();
+        if (pLocal && SafeRead<int>(pLocal + 0x14) == 4) {
+            __try {
+                // ЗВУКОВОЙ ИНДИКАТОР: Если хук дошел сюда, он работает.
+                Beep(1500, 50); 
 
-    uintptr_t pLocal = GetPlayer();
-    if (pLocal && SafeRead<int>(pLocal + 0x14) == 4) {
-        __try {
-            if (cmd == 1) { 
-                float pos[3] = { g_Cmd.x, g_Cmd.y, g_Cmd.z };
-                ClickToMove(pLocal, 4, (uint64_t*)&g_Cmd.guid, pos, 0.5f);
-            } else if (cmd == 2) { 
-                Lua_DoString("if not IsCurrentSpell(6603) then StartAttack() end", "bot", 0);
-            } else if (cmd == 3) { 
-                char cmdBuf[128];
-                sprintf_s(cmdBuf, "TargetUnit('0x%llX') InteractUnit('target')", g_Cmd.guid);
-                Lua_DoString(cmdBuf, "bot", 0);
-            } else if (cmd == 4) { 
-                Lua_DoString("if LootFrame:IsVisible() then for i=1,GetNumLootItems() do LootSlot(i) end CloseLoot() end", "bot", 0);
-            } else if (cmd == 5) {
-                Lua_DoString("SetCVar('autoInteract', '1') SetCVar('autoLootDefault', '1')", "bot", 0);
-            }
-        } __except(1) {}
+                if (cmd == 1) { 
+                    float pos[3] = { g_Cmd.x, g_Cmd.y, g_Cmd.z };
+                    ClickToMove(pLocal, 4, (uint64_t*)&g_Cmd.guid, pos, 0.5f);
+                } 
+                else if (cmd == 2) { 
+                    Lua_DoString("if UnitExists('target') and not IsCurrentSpell(6603) then StartAttack() end", "bot", 0);
+                    Lua_DoString("if not UnitBuff('player', 'Seal of Righteousness') then CastSpellByID(21084) end", "bot", 0);
+                } 
+                else if (cmd == 3) { 
+                    char cmdBuf[128];
+                    sprintf_s(cmdBuf, "TargetUnit('0x%llX') InteractUnit('target')", g_Cmd.guid);
+                    Lua_DoString(cmdBuf, "bot", 0);
+                    // Лутаем открытое окно
+                    Lua_DoString("if LootFrame:IsVisible() then for i=1,GetNumLootItems() do LootSlot(i) end CloseLoot() end", "bot", 0);
+                }
+                else if (cmd == 4) {
+                    Lua_DoString("CastSpellByID(19750)", "bot", 0); // Вспышка Света
+                }
+            } __except(1) {}
+        }
+        g_Cmd.type = 0; // Снимаем команду после выполнения
     }
-    g_Cmd.type = 0;
+
+    return oEndScene(pDevice);
 }
 
-// --- ГОЛЫЙ ХУК (NAKED) ---
-__declspec(naked) void Hook_CGGameUI_Update() {
-    __asm {
-        pushad
-        pushfd
-        call DoBotLogic
-        popfd
-        popad
-        // ИДЕАЛЬНЫЙ ПРЫЖОК: регистры не перезаписываются, крашей нет.
-        jmp dword ptr [g_Trampoline]
+// Установка хука через фиктивное устройство, чтобы не крашить систему
+bool InstallVTableHook() {
+    IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
+    if (!pD3D) return false;
+    HWND dummyWindow = CreateWindowA("STATIC", "Dummy", WS_OVERLAPPED, 0, 0, 100, 100, NULL, NULL, NULL, NULL);
+    D3DPRESENT_PARAMETERS d3dpp = {0}; d3dpp.Windowed = TRUE; d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD; d3dpp.hDeviceWindow = dummyWindow;
+    IDirect3DDevice9* pDev = nullptr;
+    if (FAILED(pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, dummyWindow, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDev))) {
+        pD3D->Release(); DestroyWindow(dummyWindow); return false;
     }
-}
-
-// --- УСТАНОВКА DETOUR ХУКА ---
-bool InstallDetourHook() {
-    void* target = (void*)ADDR_CGGAMEUI_UPDATE;
-    int len = 6; 
-    
-    g_Trampoline = VirtualAlloc(NULL, len + 5, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!g_Trampoline) return false;
-    
-    memcpy(g_Trampoline, target, len);
-    
-    uintptr_t gate = (uintptr_t)target + len;
-    *(BYTE*)((uintptr_t)g_Trampoline + len) = 0xE9; 
-    *(uintptr_t*)((uintptr_t)g_Trampoline + len + 1) = gate - ((uintptr_t)g_Trampoline + len) - 5;
-    
+    uintptr_t* pVTable = *(uintptr_t**)pDev;
+    oEndScene = (tEndScene)pVTable[42];
     DWORD old;
-    VirtualProtect(target, len, PAGE_EXECUTE_READWRITE, &old);
-    memset(target, 0x90, len); 
-    *(BYTE*)target = 0xE9; 
-    *(uintptr_t*)((uintptr_t)target + 1) = (uintptr_t)Hook_CGGameUI_Update - (uintptr_t)target - 5;
-    VirtualProtect(target, len, old, &old);
-    
+    VirtualProtect(&pVTable[42], sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &old);
+    pVTable[42] = (uintptr_t)HookedEndScene;
+    VirtualProtect(&pVTable[42], sizeof(uintptr_t), old, &old);
+    pDev->Release(); pD3D->Release(); DestroyWindow(dummyWindow);
     return true;
 }
 
-void RemoveDetourHook() {
-    if (g_Trampoline) {
-        void* target = (void*)ADDR_CGGAMEUI_UPDATE;
+void UnhookVTable() {
+    if (!oEndScene) return;
+    IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
+    if (!pD3D) return;
+    HWND dummyWindow = CreateWindowA("STATIC", "Dummy", WS_OVERLAPPED, 0, 0, 100, 100, NULL, NULL, NULL, NULL);
+    D3DPRESENT_PARAMETERS d3dpp = {0}; d3dpp.Windowed = TRUE; d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD; d3dpp.hDeviceWindow = dummyWindow;
+    IDirect3DDevice9* pDev = nullptr;
+    if (SUCCEEDED(pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, dummyWindow, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDev))) {
+        uintptr_t* pVTable = *(uintptr_t**)pDev;
         DWORD old;
-        VirtualProtect(target, 6, PAGE_EXECUTE_READWRITE, &old);
-        memcpy(target, g_Trampoline, 6); 
-        VirtualProtect(target, 6, old, &old);
-        VirtualFree(g_Trampoline, 0, MEM_RELEASE);
+        VirtualProtect(&pVTable[42], sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &old);
+        pVTable[42] = (uintptr_t)oEndScene;
+        VirtualProtect(&pVTable[42], sizeof(uintptr_t), old, &old);
+        pDev->Release();
     }
+    pD3D->Release(); DestroyWindow(dummyWindow);
+}
+
+// Ожидание выполнения команды с таймаутом
+void SendCommandAndWait(int type, uint64_t guid = 0, float x = 0, float y = 0, float z = 0) {
+    g_Cmd.guid = guid; g_Cmd.x = x; g_Cmd.y = y; g_Cmd.z = z; g_Cmd.type = type;
+    int timeout = 0;
+    while (g_Cmd.type != 0 && timeout < 100) { // 1 секунда таймаут
+        Sleep(10);
+        timeout++;
+    }
+    if (g_Cmd.type != 0) g_Cmd.type = 0; // Сбрасываем, если хук молчит
 }
 
 // --- ОСНОВНОЙ ПОТОК ---
@@ -152,33 +145,28 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f; freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Paladin GodMode v20.0 (Asm Fix & Timeout) ---\n");
-    if (InstallDetourHook()) {
-        printf("[+] CGGameUI::Update Hooked! FSM Sync verified.\n");
+    printf("--- Paladin Pure Internal v22.0 (Zero Binds) ---\n");
+    if (InstallVTableHook()) {
+        printf("[+] EndScene Hooked! \n");
     } else {
         printf("[-] Hook failed. Run as Administrator!\n");
         return 0;
     }
-    printf("[!] CTM & AutoLoot will be forced via Lua.\n");
-    printf("[!] ONLY BIND NEEDED: '9' - Heal.\n");
+    printf("[!] КРИТИЧЕСКИ ВАЖНО: Напиши в чате /console gxMultithread 0\n");
+    printf("[!] Иначе игра не будет обрабатывать вызовы!\n");
     printf("--------------------------------------------------\n");
 
     uintptr_t connectionAddr = (uintptr_t)GetModuleHandleA(NULL) + OFFSET_S_CUR_MGR;
-    g_WowWnd = FindWindowA(NULL, "World of Warcraft");
     BotState state = STATE_SEARCH;
     uint64_t activeTargetGuid = 0;
     DWORD stateStartTime = GetTickCount();
 
-    // Инициализация настроек игры (с таймаутом)
-    g_Cmd.type = 5;
-    WaitCommand();
-
     while (!GetAsyncKeyState(VK_END)) {
         uintptr_t clientConn = SafeRead<uintptr_t>(connectionAddr);
-        SetConsoleCursor(0, 7);
+        SetConsoleCursor(0, 6);
 
         if (!clientConn) {
-            printf("[!] Ожидание подключения к миру (clientConn = 0)...        \n");
+            printf("[!] Ожидание подключения к миру...                           \n");
             Sleep(500);
             continue;
         }
@@ -202,12 +190,10 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                 printf("[PLAYER] HP: %-5d/%-5d | LVL: %d | POS: %.1f, %.1f      \n", hp, maxHp, lvl, myX, myY);
                 printf("--------------------------------------------------\n");
 
-                // Единственный аппаратный каст (Хил - защита от бана)
+                // Внутренний Хил через Lua
                 if (hp > 0 && maxHp > 0 && (hp * 100 / maxHp) < 40) {
-                    if (GetForegroundWindow() == g_WowWnd) {
-                        TapKey('9'); 
-                        Sleep(1500); 
-                    }
+                    SendCommandAndWait(4); // Cast Heal
+                    Sleep(1500); 
                 }
 
                 DWORD elapsed = GetTickCount() - stateStartTime;
@@ -232,10 +218,14 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                         cur = SafeRead<uintptr_t>(cur + 0x3C);
                     }
                     
-                    if (activeTargetGuid != 0) { state = STATE_MOVE; stateStartTime = GetTickCount(); }
+                    if (activeTargetGuid != 0) { 
+                        state = STATE_MOVE; 
+                        stateStartTime = GetTickCount(); 
+                    }
                 }
 
                 if (activeTargetGuid != 0) {
+                    // Память обновляем для UI
                     if (pDesc) *(uint64_t*)(pDesc + 0x48) = activeTargetGuid; 
                     *(uint64_t*)ADDR_TARGET_GUID = activeTargetGuid;
 
@@ -256,7 +246,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                         printf("[TARGET] HP: %-5d | DIST: %.2f yds                  \n", thp, dist);
                         
                         if (thp > 0) {
-                            *(float*)(pLocal + 0x7A8) = cYaw; 
+                            *(float*)(pLocal + 0x7A8) = cYaw; // Поворот
                             
                             if (dist > 4.2f) {
                                 if (state == STATE_MOVE && elapsed > 12000) {
@@ -266,10 +256,8 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                                 }
                                 if (state != STATE_MOVE) { state = STATE_MOVE; stateStartTime = GetTickCount(); }
                                 
-                                g_Cmd.guid = activeTargetGuid;
-                                g_Cmd.x = tx; g_Cmd.y = ty; g_Cmd.z = tz; 
-                                g_Cmd.type = 1;
-                                WaitCommand(); // Ожидаем без зависания
+                                // ВНУТРЕННЕЕ ПЕРЕМЕЩЕНИЕ
+                                SendCommandAndWait(1, activeTargetGuid, tx, ty, tz);
                             } else {
                                 if (state == STATE_COMBAT && elapsed > 25000) {
                                     printf("[!] БОЙ ЗАБАГАЛСЯ! Сбрасываю...               \n");
@@ -278,28 +266,20 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                                 }
                                 if (state != STATE_COMBAT) { state = STATE_COMBAT; stateStartTime = GetTickCount(); }
 
-                                g_Cmd.type = 2;
-                                WaitCommand();
-                                Sleep(100);
+                                // ВНУТРЕННЯЯ АТАКА
+                                SendCommandAndWait(2);
                             }
                         } else {
                             if (state != STATE_LOOT) { state = STATE_LOOT; stateStartTime = GetTickCount(); }
                             
                             printf("[STATE] ЖДЕМ ГЕНЕРАЦИЮ ТРУПА СЕРВЕРОМ...         \n");
-                            Sleep(1500); 
+                            Sleep(1200); 
                             
-                            printf("[STATE] INTERNAL ВЗАИМОДЕЙСТВИЕ (LUA)...         \n");
-                            g_Cmd.guid = activeTargetGuid; 
-                            g_Cmd.type = 3;
-                            WaitCommand();
+                            printf("[STATE] INTERNAL ВЗАИМОДЕЙСТВИЕ И СБОР...        \n");
+                            // ВНУТРЕННИЙ ЛУТ
+                            SendCommandAndWait(3, activeTargetGuid);
                             
-                            Sleep(1500); 
-                            
-                            printf("[STATE] LUA АВТОСБОР...                            \n");
-                            g_Cmd.type = 4;
-                            WaitCommand();
-                            
-                            Sleep(1000); 
+                            Sleep(2000); // Даем окну лута время на автосбор
                             
                             if (pDesc) *(uint64_t*)(pDesc + 0x48) = 0; 
                             *(uint64_t*)ADDR_TARGET_GUID = 0; 
@@ -314,13 +294,13 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                     printf("[TARGET] ПОИСК НОВОЙ ЦЕЛИ...                      \n");
                     stateStartTime = GetTickCount();
                 }
-                printf("[FSM] %-15s | JMP HOOK: ACTIVE         \n", stateNames[state]);
+                printf("[FSM] %-15s | LUA ENGINE: ACTIVE       \n", stateNames[state]);
             }
         }
         Sleep(100);
     }
 
-    RemoveDetourHook();
+    UnhookVTable();
     fclose(f); FreeConsole(); FreeLibraryAndExitThread((HMODULE)lpParam, 0); return 0;
 }
 
