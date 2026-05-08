@@ -10,9 +10,9 @@
 #define ADDR_CLICK_TO_MOVE      0x00727400 
 #define ADDR_TARGET_GUID        0x00BD07B8 
 
-// Используем тип "Взаимодействие" (как клик правой кнопкой мыши)
-// Движок игры сам поймет: враг -> бить, труп -> лутать.
-#define CTM_INTERACT            5  
+// Два разных типа движений для обхода бага с застреванием
+#define CTM_MOVE                4 // Только бег (пока далеко)
+#define CTM_INTERACT            5 // Правый клик - Атака/Лут (когда в упор)
 
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
@@ -30,17 +30,13 @@ float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) 
     return sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2) + pow(z2 - z1, 2));
 }
 
-// Умный авто-преследователь
 void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, float z) {
     static uint64_t lastGuid = 0;
     static int lastType = 0;
-    static float lastX = 0, lastY = 0, lastZ = 0;
+    static DWORD lastTime = 0;
 
-    // Считаем, насколько сдвинулся моб с нашего прошлого приказа
-    float diff = sqrt(pow(x - lastX, 2) + pow(y - lastY, 2) + pow(z - lastZ, 2));
-
-    // Обновляем маршрут ТОЛЬКО если сменилась цель, тип действия, или моб отбежал > 2 метров
-    if (guid != lastGuid || type != lastType || diff > 2.0f) {
+    // Срабатывает, если: сменилась цель, сменилось действие (бег -> атака), либо прошло 1.5 сек
+    if (guid != lastGuid || type != lastType || (GetTickCount() - lastTime > 1500)) {
         uint64_t ctmGuid = guid;
         float ctmPos[3] = { x, y, z };
         
@@ -48,7 +44,7 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
         
         lastGuid = guid;
         lastType = type;
-        lastX = x; lastY = y; lastZ = z;
+        lastTime = GetTickCount();
     }
 }
 
@@ -61,6 +57,7 @@ void BotPulse() {
     uintptr_t pLocal = 0;
     float myX = 0, myY = 0, myZ = 0;
 
+    // 1. Ищем локального игрока
     uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
     while (cur && (cur & 1) == 0) {
         if (*(uint64_t*)(cur + 0x30) == localGuid) {
@@ -79,6 +76,7 @@ void BotPulse() {
     uint32_t targetFlags = 0;
     float tX = 0, tY = 0, tZ = 0;
 
+    // 2. Читаем статус текущей цели бота
     if (g_BotTarget != 0) {
         cur = *(uintptr_t*)(mgr + 0xAC);
         while (cur && (cur & 1) == 0) {
@@ -102,32 +100,41 @@ void BotPulse() {
         if (!hasTarget) g_BotTarget = 0; 
     }
 
+    // 3. Главная логика: Бег -> Бой -> Лут
     if (hasTarget) {
-        // Прописываем таргет в интерфейс игры
-        *(uint64_t*)ADDR_TARGET_GUID = g_BotTarget; 
-        uintptr_t pDesc = *(uintptr_t*)(pLocal + 0x8);
-        if (pDesc) *(uint64_t*)(pDesc + 0x48) = g_BotTarget; 
-
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
 
         if (targetHp > 0) {
-            // Эмуляция клика правой кнопкой по врагу (бежит и бьет)
-            ActionCTM(pLocal, CTM_INTERACT, g_BotTarget, tX, tY, tZ);
-            printf("Attacking Target... Dist: %.1f      \r", dist);
+            // Цель жива
+            if (dist > 4.5f) {
+                ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
+                printf("Running to Enemy... Dist: %.1f      \r", dist);
+            } else {
+                // Вплотную! Триггерим атаку (Правый клик)
+                ActionCTM(pLocal, CTM_INTERACT, g_BotTarget, tX, tY, tZ);
+                printf("Melee Combat! Dist: %.1f            \r", dist);
+            }
         } 
         else if (targetHp <= 0 && (targetFlags & 1)) {
-            // Эмуляция клика правой кнопкой по трупу (бежит и лутает)
-            ActionCTM(pLocal, CTM_INTERACT, g_BotTarget, tX, tY, tZ);
-            printf("Looting Corpse... Dist: %.1f        \r", dist);
+            // Цель мертва и есть лут
+            if (dist > 4.5f) {
+                ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
+                printf("Running to Loot... Dist: %.1f       \r", dist);
+            } else {
+                // Вплотную! Триггерим лут (Правый клик)
+                ActionCTM(pLocal, CTM_INTERACT, g_BotTarget, tX, tY, tZ);
+                printf("Looting Corpse! Dist: %.1f          \r", dist);
+            }
         } 
         else {
+            // Цель облутана. В черный список и сбрасываем.
             g_Blacklist.push_back(g_BotTarget);
             g_BotTarget = 0; 
-            *(uint64_t*)ADDR_TARGET_GUID = 0; 
-            if (pDesc) *(uint64_t*)(pDesc + 0x48) = 0;
+            *(uint64_t*)ADDR_TARGET_GUID = 0; // Чистим портрет интерфейса
             printf("Target Empty. Blacklisted.          \n");
         }
     } 
+    // 4. Поиск новой цели
     else {
         uint64_t bestGuid = 0;
         float bestDist = 40.0f; 
@@ -151,6 +158,7 @@ void BotPulse() {
                             float mZ = *(float*)(cur + 0x7A0);
                             float dist = GetDistance3D(myX, myY, myZ, mX, mY, mZ);
 
+                            // Отбрасываем багнутых мобов под текстурами
                             if (dist < bestDist && dist > 0.1f) {
                                 bestDist = dist;
                                 bestGuid = guid;
@@ -208,7 +216,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v11.0: Real Combat Engine ---\n");
+    printf("--- Bot v12.0: The Holy Grail (Pathfinding Bug Fixed) ---\n");
 
     HWND hwnd = FindWindowA(NULL, "World of Warcraft");
     if (!hwnd) {
@@ -219,9 +227,9 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(hwnd, 1337, 50, NULL); 
 
-    printf("[+] Smart Pathfinding + Interact Active.\n");
+    printf("[+] Dual-State Engine Active (Move -> Interact).\n");
     printf("[!] Make sure 'Click-to-Move' and 'Auto Loot' are ON.\n");
-    printf("[+] Press [INSERT] to start/stop the bot.\n");
+    printf("[+] Press[INSERT] to start/stop the bot.\n");
     return 0;
 }
 
