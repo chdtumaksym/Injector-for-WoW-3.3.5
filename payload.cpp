@@ -7,20 +7,23 @@
 
 #define ADDR_S_CUR_MGR          0x00C79CE0
 #define OFFSET_OBJECT_MANAGER   0x2ED0
-#define ADDR_TARGET_GUID        0x00BD07B8 
-#define ADDR_ON_RIGHT_CLICK     0x0060BEA0 
+#define ADDR_CLICK_TO_MOVE      0x00727400
+#define ADDR_TARGET_GUID        0x00BD07B8
+
+// Боевые типы движка WoW
+#define CTM_LOOT                6
+#define CTM_ATTACK              11
 
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
 #pragma strict_gs_check(off)
 
-// [!] ФИКС КРАША 0xc0000005: Жестко используем __fastcall, чтобы ecx = targetPtr
-typedef void(__fastcall* tOnRightClick)(uintptr_t ecx, uintptr_t edx);
+// __fastcall гарантирует отсутствие крашей памяти
+typedef void(__fastcall* tClickToMove)(uintptr_t ecx, uintptr_t edx, int type, uint64_t* guid, float* pos, float prec);
 
 bool g_Active = false;
-WNDPROC oWndProc = nullptr;
-std::vector<uint64_t> g_Blacklist; 
-uint64_t g_BotTarget = 0; 
+std::vector<uint64_t> g_Blacklist;
+uint64_t g_BotTarget = 0;
 
 float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) {
     return sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2) + pow(z2 - z1, 2));
@@ -35,12 +38,13 @@ void BotPulse() {
     uintptr_t pLocal = 0;
     float myX = 0, myY = 0, myZ = 0;
 
+    // Ищем себя
     uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
     while (cur && (cur & 1) == 0) {
         if (*(uint64_t*)(cur + 0x30) == localGuid) {
             pLocal = cur;
-            myX = *(float*)(cur + 0x798); 
-            myY = *(float*)(cur + 0x79C); 
+            myX = *(float*)(cur + 0x798);
+            myY = *(float*)(cur + 0x79C);
             myZ = *(float*)(cur + 0x7A0);
             break;
         }
@@ -51,19 +55,22 @@ void BotPulse() {
     bool hasTarget = false;
     int targetHp = 0;
     uint32_t targetFlags = 0;
-    uintptr_t targetPtr = 0; 
+    float tX = 0, tY = 0, tZ = 0;
 
+    // Читаем инфу о текущем таргете
     if (g_BotTarget != 0) {
         cur = *(uintptr_t*)(mgr + 0xAC);
         while (cur && (cur & 1) == 0) {
             if (*(uint64_t*)(cur + 0x30) == g_BotTarget) {
                 int objType = *(int*)(cur + 0x14);
-                if (objType == 3 || objType == 4) { 
-                    targetPtr = cur; 
+                if (objType == 3 || objType == 4) {
                     uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                     if (desc) {
-                        targetHp = *(int*)(desc + 0x60); 
+                        targetHp = *(int*)(desc + 0x60);
                         targetFlags = *(uint32_t*)(desc + 0x114);
+                        tX = *(float*)(cur + 0x798);
+                        tY = *(float*)(cur + 0x79C);
+                        tZ = *(float*)(cur + 0x7A0);
                         hasTarget = true;
                     }
                 }
@@ -71,62 +78,73 @@ void BotPulse() {
             }
             cur = *(uintptr_t*)(cur + 0x3C);
         }
-        if (!hasTarget) g_BotTarget = 0; 
+        if (!hasTarget) g_BotTarget = 0;
     }
 
-    static uint64_t lastAttacked = 0;
-    static uint64_t lastLooted = 0;
+    // Эти статические переменные не дадут боту спамить команды и прерывать атаку!
+    static uint64_t lastActionGuid = 0;
+    static int lastActionType = 0;
 
-    if (hasTarget && targetPtr) {
+    if (hasTarget) {
+        // Жестко рисуем таргет в интерфейсе игры
         *(uint64_t*)ADDR_TARGET_GUID = g_BotTarget; 
 
         if (targetHp > 0) {
-            // Цель жива. Кликаем по ней правой кнопкой ОДИН РАЗ. 
-            // WoW сам добежит и начнет бить.
-            if (g_BotTarget != lastAttacked) {
-                ((tOnRightClick)ADDR_ON_RIGHT_CLICK)(targetPtr, 0);
-                lastAttacked = g_BotTarget;
-                printf("Engaging Enemy (Game Engine AI taking over)...\n");
+            // [!] Отдаем команду на АТАКУ строго ОДИН РАЗ
+            if (lastActionGuid != g_BotTarget || lastActionType != CTM_ATTACK) {
+                float pos[3] = { tX, tY, tZ };
+                uint64_t guid = g_BotTarget;
+                ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, CTM_ATTACK, &guid, pos, 0.5f);
+
+                lastActionGuid = g_BotTarget;
+                lastActionType = CTM_ATTACK;
+                printf("Attack Command Sent! Waiting for kill...\n");
             }
-        } 
-        else if (targetHp <= 0 && (targetFlags & 1)) {
-            // Цель мертва и с лутом. Кликаем правой кнопкой ОДИН РАЗ.
-            // WoW сам подбежит к трупу и соберет лут.
-            if (g_BotTarget != lastLooted) {
-                ((tOnRightClick)ADDR_ON_RIGHT_CLICK)(targetPtr, 0);
-                lastLooted = g_BotTarget;
-                printf("Looting Corpse...\n");
-            }
-        } 
-        else {
-            g_Blacklist.push_back(g_BotTarget);
-            g_BotTarget = 0; 
-            lastAttacked = 0;
-            lastLooted = 0;
-            *(uint64_t*)ADDR_TARGET_GUID = 0; 
-            printf("Target Empty. Blacklisted.\n");
         }
-    } 
+        else if (targetHp <= 0 && (targetFlags & 1)) {
+            // [!] Отдаем команду на ЛУТ строго ОДИН РАЗ
+            if (lastActionGuid != g_BotTarget || lastActionType != CTM_LOOT) {
+                float pos[3] = { tX, tY, tZ };
+                uint64_t guid = g_BotTarget;
+                ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, CTM_LOOT, &guid, pos, 0.5f);
+
+                lastActionGuid = g_BotTarget;
+                lastActionType = CTM_LOOT;
+                printf("Loot Command Sent! Grabbing items...\n");
+            }
+        }
+        else {
+            // Моб пустой, сбрасываем состояние
+            g_Blacklist.push_back(g_BotTarget);
+            g_BotTarget = 0;
+            lastActionGuid = 0;
+            lastActionType = 0;
+            *(uint64_t*)ADDR_TARGET_GUID = 0;
+            printf("Target Dead & Empty. Blacklisted.\n");
+        }
+    }
     else {
+        // Умный поиск новой цели
         uint64_t bestGuid = 0;
-        float bestDist = 40.0f; 
+        float bestDist = 40.0f;
 
         cur = *(uintptr_t*)(mgr + 0xAC);
         while (cur && (cur & 1) == 0) {
             int type = *(int*)(cur + 0x14);
-            if (type == 3) { 
+            if (type == 3) {
                 uint64_t guid = *(uint64_t*)(cur + 0x30);
                 if (std::find(g_Blacklist.begin(), g_Blacklist.end(), guid) == g_Blacklist.end()) {
                     uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                     if (desc) {
-                        int hp = *(int*)(desc + 0x60); 
-                        int maxHp = *(int*)(desc + 0x80); 
+                        int hp = *(int*)(desc + 0x60);
+                        int maxHp = *(int*)(desc + 0x80);
                         if (hp > 0 && maxHp > 1) {
                             float mX = *(float*)(cur + 0x798);
                             float mY = *(float*)(cur + 0x79C);
                             float mZ = *(float*)(cur + 0x7A0);
                             float dist = GetDistance3D(myX, myY, myZ, mX, mY, mZ);
 
+                            // Отсеиваем багнутых подземных мобов
                             if (dist < bestDist && dist > 0.1f) {
                                 bestDist = dist;
                                 bestGuid = guid;
@@ -139,67 +157,58 @@ void BotPulse() {
         }
 
         if (bestGuid) {
-            g_BotTarget = bestGuid; 
+            g_BotTarget = bestGuid;
             printf("\nFound new target! Dist: %.1f\n", bestDist);
         }
     }
 }
 
-LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    if (uMsg == WM_TIMER && wParam == 1337) {
-        
-        static bool isPressed = false;
+// Бессмертный фоновый поток (кнопка Insert больше не зависнет)
+DWORD WINAPI BotThread(LPVOID) {
+    AllocConsole(); freopen("CONOUT$", "w", stdout);
+    printf("--- Bot v17.0: The Immortal Thread ---\n");
+    printf("[+] Keyboard Input isolated. Anti-Dance mechanics activated.\n");
+    printf("[!] Make sure 'Click-to-Move' and 'Auto Loot' are ON.\n");
+    printf("[+] Press [INSERT] to unleash the bot.\n");
+
+    bool isPressed = false;
+    DWORD lastPulse = 0;
+
+    while (true) {
+        // Мгновенная реакция на клавиши (глобально)
         if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
             if (!isPressed) {
                 isPressed = true;
                 g_Active = !g_Active;
                 Beep(g_Active ? 800 : 400, 100);
                 printf("\n[!] BOT STATUS: %s\n", g_Active ? "ACTIVE" : "PAUSED");
-                if (!g_Active) { 
-                    g_BotTarget = 0; 
-                    *(uint64_t*)ADDR_TARGET_GUID = 0; 
-                    g_Blacklist.clear(); 
+                if (!g_Active) {
+                    g_BotTarget = 0;
+                    *(uint64_t*)ADDR_TARGET_GUID = 0;
+                    g_Blacklist.clear();
                 }
             }
         } else {
             isPressed = false;
         }
 
-        static DWORD lastTick = 0;
-        static bool isPulsing = false; 
-
-        if (g_Active && !isPulsing && (GetTickCount() - lastTick > 400)) {
-            isPulsing = true;
+        // Вызов логики без перегрузки CPU
+        if (g_Active && (GetTickCount() - lastPulse > 400)) {
             __try {
                 BotPulse();
-            } __except (EXCEPTION_EXECUTE_HANDLER) {}
-            lastTick = GetTickCount();
-            isPulsing = false;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {} // Защита от выгрузки памяти
+            lastPulse = GetTickCount();
         }
+
+        Sleep(50);
     }
-    return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
-}
-
-DWORD WINAPI Setup(LPVOID) {
-    AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v16.0: Perfect Right-Click Engine ---\n");
-
-    HWND hwnd = FindWindowA(NULL, "World of Warcraft");
-    if (!hwnd) return 0;
-
-    oWndProc = (WNDPROC)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)HookedWndProc);
-    SetTimer(hwnd, 1337, 50, NULL); 
-
-    printf("[+] Memory-safe OnRightClick initialized.\n");
-    printf("[!] Auto-attack and Pathfinding now handled by WoW Engine.\n");
-    printf("[+] Press [INSERT] to start/stop the bot.\n");
     return 0;
 }
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
     if (r == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(h);
-        CreateThread(0, 0, Setup, 0, 0, 0);
+        CreateThread(0, 0, BotThread, 0, 0, 0); // Создаем чистый поток
     }
     return TRUE;
 }
