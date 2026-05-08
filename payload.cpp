@@ -1,68 +1,87 @@
-// Добавь эти проверки, чтобы не вылетало
-void RunBotLogic() {
-    uintptr_t s_curMgr = *(uintptr_t*)ADDR_CUR_MGR;
-    if (!s_curMgr || (s_curMgr & 1)) return; // Если менеджера нет - выходим
+#include <windows.h>
+#include <d3d9.h>
+#include <cmath>
 
-    uintptr_t localGuid = *(uintptr_t*)(s_curMgr + OFF_MGR_LOCAL_GUID);
-    uintptr_t currentObj = *(uintptr_t*)(s_curMgr + OFF_MGR_FIRST_OBJ);
+#pragma comment(lib, "d3d9.lib")
+
+struct Vector3 { float x, y, z; };
+
+typedef void(__thiscall* tClickToMove)(uintptr_t playerPtr, uint32_t clickType, uint64_t* targetGuid, Vector3* pos, float precision);
+tClickToMove ClickToMove = (tClickToMove)0x00611130;
+
+typedef HRESULT(STDMETHODCALLTYPE* tEndScene)(LPDIRECT3DDEVICE9 pDevice);
+tEndScene oEndScene = nullptr;
+
+// Безопасный поиск игрока
+uintptr_t GetPlayerPtr() {
+    uintptr_t s_curMgr = *(uintptr_t*)0x00CB2418;
+    if (!s_curMgr || (s_curMgr & 1)) return 0;
     
-    uintptr_t playerBase = 0;
-    // Сначала ищем себя, чтобы знать свои координаты
-    uintptr_t tempObj = currentObj;
-    while (tempObj && (tempObj & 1) == 0) {
-        if (*(uint64_t*)(tempObj + OFF_OBJ_GUID) == localGuid) {
-            playerBase = tempObj;
-            break;
-        }
-        tempObj = *(uintptr_t*)(tempObj + OFF_OBJ_NEXT);
-    }
+    uint64_t localGuid = *(uint64_t*)(s_curMgr + 0xC0);
+    uintptr_t currentObj = *(uintptr_t*)(s_curMgr + 0xAC);
 
-    if (!playerBase) return;
-
-    Vector3 myPos = *(Vector3*)(playerBase + OFF_UNIT_POS);
-    uintptr_t bestTarget = 0;
-    float minDist = 100.0f;
-
-    // Снова перебор - ищем ближайшего моба
     while (currentObj && (currentObj & 1) == 0) {
-        uint32_t type = *(uint32_t*)(currentObj + OFF_OBJ_TYPE);
-        
-        // Тип 3 - мобы, тип 4 - игроки
-        if (type == 3) {
-            Vector3 objPos = *(Vector3*)(currentObj + OFF_UNIT_POS);
-            float dist = sqrt(pow(objPos.x - myPos.x, 2) + pow(objPos.y - myPos.y, 2));
-
-            if (dist < minDist && dist > 0.1f) {
-                minDist = dist;
-                bestTarget = currentObj;
-            }
-        }
-        currentObj = *(uintptr_t*)(currentObj + OFF_OBJ_NEXT);
+        if (*(uint64_t*)(currentObj + 0x30) == localGuid) return currentObj;
+        currentObj = *(uintptr_t*)(currentObj + 0x3C);
     }
+    return 0;
+}
 
-    if (bestTarget) {
-        uint64_t targetGuid = *(uint64_t*)(bestTarget + OFF_OBJ_GUID);
-        Vector3 targetPos = *(Vector3*)(bestTarget + OFF_UNIT_POS);
-        // Используем 6 (Interact), чтобы он и бежал и бил
-        ClickToMove(playerBase, 6, &targetGuid, &targetPos, 2.0f);
+void RunBotLogic() {
+    uintptr_t player = GetPlayerPtr();
+    if (!player) return;
+
+    // Пока просто тест: если мы в мире, пусть персонаж бежит в координаты (0,0,0) 
+    // или к таргету, если нажмешь на него.
+    uint64_t targetGuid = *(uint64_t*)(player + 0x28); // Оффсет текущей цели
+    if (targetGuid != 0) {
+        Vector3 zeroPos = { 0, 0, 0 };
+        ClickToMove(player, 6, &targetGuid, &zeroPos, 2.0f);
     }
 }
 
+HRESULT STDMETHODCALLTYPE hkEndScene(LPDIRECT3DDEVICE9 pDevice) {
+    RunBotLogic();
+    return oEndScene(pDevice);
+}
+
 DWORD WINAPI MainThread(LPVOID lpParam) {
-    // Ждем, пока прогрузится мир (адрес устройства заполняется не сразу)
-    uintptr_t d3d9_ptr = 0;
-    while (!d3d9_ptr) {
-        d3d9_ptr = *(uintptr_t*)0x00C5DF88; 
-        Sleep(500);
+    // 1. Создаем фейковый девайс, чтобы найти адрес реальной таблицы EndScene
+    IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
+    if (!pD3D) return 0;
+
+    D3DPRESENT_PARAMETERS d3dpp = { 0 };
+    d3dpp.Windowed = TRUE;
+    d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    d3dpp.hDeviceWindow = GetForegroundWindow();
+
+    IDirect3DDevice9* pDummyDevice = nullptr;
+    if (FAILED(pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, d3dpp.hDeviceWindow, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDummyDevice))) {
+        pD3D->Release();
+        return 0;
     }
 
-    uintptr_t* vtable_ptr = *(uintptr_t**)d3d9_ptr;
-    oEndScene = (tEndScene)vtable_ptr[42]; // Берем оригинальный EndScene
+    uintptr_t* vtable = *(uintptr_t**)pDummyDevice;
+    oEndScene = (tEndScene)vtable[42]; // 42 - EndScene
 
-    DWORD oldProtect;
-    VirtualProtect(&vtable_ptr[42], sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &oldProtect);
-    vtable_ptr[42] = (uintptr_t)hkEndScene; // Подменяем
-    VirtualProtect(&vtable_ptr[42], sizeof(uintptr_t), oldProtect, &oldProtect);
+    // 2. Хукаем через VMT (подменяем указатель в таблице)
+    // Внимание: мы подменяем указатель в таблице КОНКРЕТНОГО девайса.
+    // Но так как у игры он один, мы найдем его через адрес в памяти.
+    uintptr_t realDevicePtr = *(uintptr_t*)0x00C5DF88; 
+    if (realDevicePtr) {
+        uintptr_t* realVtable = *(uintptr_t**)realDevicePtr;
+        DWORD oldProtect;
+        VirtualProtect(&realVtable[42], sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &oldProtect);
+        realVtable[42] = (uintptr_t)hkEndScene;
+        VirtualProtect(&realVtable[42], sizeof(uintptr_t), oldProtect, &oldProtect);
+    }
 
+    pDummyDevice->Release();
+    pD3D->Release();
     return 0;
+}
+
+BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID res) {
+    if (r == DLL_PROCESS_ATTACH) CreateThread(0, 0, MainThread, 0, 0, 0);
+    return TRUE;
 }
