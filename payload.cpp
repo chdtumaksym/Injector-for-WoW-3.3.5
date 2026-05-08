@@ -10,15 +10,15 @@
 #define ADDR_CLICK_TO_MOVE      0x00727400
 #define ADDR_TARGET_GUID        0x00BD07B8
 
-// Боевые типы движка WoW
-#define CTM_LOOT                6
-#define CTM_ATTACK              11
+// Три кита движка WoW
+#define CTM_MOVE                4  // Бежать в точку
+#define CTM_LOOT                6  // Собрать лут
+#define CTM_ATTACK              11 // Авто-атака
 
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
 #pragma strict_gs_check(off)
 
-// __fastcall гарантирует отсутствие крашей памяти
 typedef void(__fastcall* tClickToMove)(uintptr_t ecx, uintptr_t edx, int type, uint64_t* guid, float* pos, float prec);
 
 bool g_Active = false;
@@ -27,6 +27,28 @@ uint64_t g_BotTarget = 0;
 
 float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) {
     return sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2) + pow(z2 - z1, 2));
+}
+
+// Умный контроллер движений
+void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, float z) {
+    static uint64_t lastGuid = 0;
+    static int lastType = 0;
+    static float lastX = 0, lastY = 0, lastZ = 0;
+
+    // Считаем, насколько сдвинулся моб
+    float diff = sqrt(pow(x - lastX, 2) + pow(y - lastY, 2) + pow(z - lastZ, 2));
+
+    // Обновляем команду если: сменилась цель, сменилось действие (бег->атака), или моб отбежал > 1.5м
+    if (guid != lastGuid || type != lastType || diff > 1.5f) {
+        uint64_t ctmGuid = guid;
+        float ctmPos[3] = { x, y, z };
+        
+        ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, type, &ctmGuid, ctmPos, 0.5f);
+        
+        lastGuid = guid;
+        lastType = type;
+        lastX = x; lastY = y; lastZ = z;
+    }
 }
 
 void BotPulse() {
@@ -38,7 +60,7 @@ void BotPulse() {
     uintptr_t pLocal = 0;
     float myX = 0, myY = 0, myZ = 0;
 
-    // Ищем себя
+    // Ищем своего перса
     uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
     while (cur && (cur & 1) == 0) {
         if (*(uint64_t*)(cur + 0x30) == localGuid) {
@@ -57,7 +79,7 @@ void BotPulse() {
     uint32_t targetFlags = 0;
     float tX = 0, tY = 0, tZ = 0;
 
-    // Читаем инфу о текущем таргете
+    // Читаем инфу о цели
     if (g_BotTarget != 0) {
         cur = *(uintptr_t*)(mgr + 0xAC);
         while (cur && (cur & 1) == 0) {
@@ -81,50 +103,60 @@ void BotPulse() {
         if (!hasTarget) g_BotTarget = 0;
     }
 
-    // Эти статические переменные не дадут боту спамить команды и прерывать атаку!
-    static uint64_t lastActionGuid = 0;
-    static int lastActionType = 0;
+    static bool isEngaged = false; // Блокиратор спама атак (чтобы не танцевал)
 
     if (hasTarget) {
-        // Жестко рисуем таргет в интерфейсе игры
+        // [!] Жесткая установка таргета для игры [!]
         *(uint64_t*)ADDR_TARGET_GUID = g_BotTarget; 
+        uintptr_t pDesc = *(uintptr_t*)(pLocal + 0x8);
+        if (pDesc) *(uint64_t*)(pDesc + 0x48) = g_BotTarget;
+
+        float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
 
         if (targetHp > 0) {
-            // [!] Отдаем команду на АТАКУ строго ОДИН РАЗ
-            if (lastActionGuid != g_BotTarget || lastActionType != CTM_ATTACK) {
-                float pos[3] = { tX, tY, tZ };
-                uint64_t guid = g_BotTarget;
-                ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, CTM_ATTACK, &guid, pos, 0.5f);
-
-                lastActionGuid = g_BotTarget;
-                lastActionType = CTM_ATTACK;
-                printf("Attack Command Sent! Waiting for kill...\n");
+            // ФАЗА 1: Охота (если моб далеко - используем стабильный БЕГ)
+            if (dist > 4.0f) {
+                ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
+                isEngaged = false; // Мы вышли из мили-зоны, атаку нужно будет нажать заново
+                printf("Chasing Enemy... Dist: %.1f      \r", dist);
+            } 
+            // ФАЗА 2: Убийство (подошли вплотную - включаем АВТО-АТАКУ один раз!)
+            else {
+                if (!isEngaged) {
+                    ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
+                    isEngaged = true; // Заблокировали спам, перс бьет сам
+                    printf("Engaging Melee Combat!            \r");
+                }
             }
         }
         else if (targetHp <= 0 && (targetFlags & 1)) {
-            // [!] Отдаем команду на ЛУТ строго ОДИН РАЗ
-            if (lastActionGuid != g_BotTarget || lastActionType != CTM_LOOT) {
-                float pos[3] = { tX, tY, tZ };
-                uint64_t guid = g_BotTarget;
-                ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, CTM_LOOT, &guid, pos, 0.5f);
-
-                lastActionGuid = g_BotTarget;
-                lastActionType = CTM_LOOT;
-                printf("Loot Command Sent! Grabbing items...\n");
+            // ФАЗА 3: Бежим к трупу
+            if (dist > 4.0f) {
+                ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
+                isEngaged = false;
+                printf("Moving to Loot... Dist: %.1f     \r", dist);
+            } 
+            // ФАЗА 4: Лутаем (один раз!)
+            else {
+                if (!isEngaged) {
+                    ActionCTM(pLocal, CTM_LOOT, g_BotTarget, tX, tY, tZ);
+                    isEngaged = true;
+                    printf("Looting Corpse!                   \r");
+                }
             }
         }
         else {
-            // Моб пустой, сбрасываем состояние
+            // Цель пуста - сброс
             g_Blacklist.push_back(g_BotTarget);
             g_BotTarget = 0;
-            lastActionGuid = 0;
-            lastActionType = 0;
+            isEngaged = false;
             *(uint64_t*)ADDR_TARGET_GUID = 0;
+            if (pDesc) *(uint64_t*)(pDesc + 0x48) = 0;
             printf("Target Dead & Empty. Blacklisted.\n");
         }
     }
     else {
-        // Умный поиск новой цели
+        // Поиск новой жертвы
         uint64_t bestGuid = 0;
         float bestDist = 40.0f;
 
@@ -144,7 +176,6 @@ void BotPulse() {
                             float mZ = *(float*)(cur + 0x7A0);
                             float dist = GetDistance3D(myX, myY, myZ, mX, mY, mZ);
 
-                            // Отсеиваем багнутых подземных мобов
                             if (dist < bestDist && dist > 0.1f) {
                                 bestDist = dist;
                                 bestGuid = guid;
@@ -159,15 +190,17 @@ void BotPulse() {
         if (bestGuid) {
             g_BotTarget = bestGuid;
             printf("\nFound new target! Dist: %.1f\n", bestDist);
+        } else {
+            printf("Scanning for enemies...             \r");
         }
     }
 }
 
-// Бессмертный фоновый поток (кнопка Insert больше не зависнет)
+// Защищенный независимый поток управления
 DWORD WINAPI BotThread(LPVOID) {
     AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v17.0: The Immortal Thread ---\n");
-    printf("[+] Keyboard Input isolated. Anti-Dance mechanics activated.\n");
+    printf("--- Bot v18.0: Chaser & Striker Edition ---\n");
+    printf("[+] Dual-Phase Combat AI Activated.\n");
     printf("[!] Make sure 'Click-to-Move' and 'Auto Loot' are ON.\n");
     printf("[+] Press [INSERT] to unleash the bot.\n");
 
@@ -175,7 +208,6 @@ DWORD WINAPI BotThread(LPVOID) {
     DWORD lastPulse = 0;
 
     while (true) {
-        // Мгновенная реакция на клавиши (глобально)
         if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
             if (!isPressed) {
                 isPressed = true;
@@ -192,11 +224,10 @@ DWORD WINAPI BotThread(LPVOID) {
             isPressed = false;
         }
 
-        // Вызов логики без перегрузки CPU
         if (g_Active && (GetTickCount() - lastPulse > 400)) {
             __try {
                 BotPulse();
-            } __except (EXCEPTION_EXECUTE_HANDLER) {} // Защита от выгрузки памяти
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
             lastPulse = GetTickCount();
         }
 
@@ -208,7 +239,7 @@ DWORD WINAPI BotThread(LPVOID) {
 extern "C" BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
     if (r == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(h);
-        CreateThread(0, 0, BotThread, 0, 0, 0); // Создаем чистый поток
+        CreateThread(0, 0, BotThread, 0, 0, 0);
     }
     return TRUE;
 }
