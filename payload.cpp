@@ -12,23 +12,19 @@
 #define ADDR_TARGET_GUID         0x00BD07B0 
 
 #define ADDR_CLICK_TO_MOVE       0x00611130
-#define ADDR_INTERACT            0x00609390
 #define ADDR_GET_PLAYER          0x004038BE
 
 enum BotState { STATE_SEARCH, STATE_MOVE, STATE_COMBAT, STATE_LOOT };
 const char* stateNames[] = { "SEARCHING", "MOVING", "COMBAT", "LOOTING" };
 
-// --- ФУНКЦИИ ДВИЖКА (БЕЗ LUA) ---
 typedef void(__thiscall* tClickToMove)(uintptr_t playerPtr, int clickType, uint64_t* interactGuid, float* pos, float precision);
-typedef void(__thiscall* tInteract)(uintptr_t playerPtr, uintptr_t unitPtr);
 typedef uintptr_t(__cdecl* tGetActivePlayer)();
 
 tClickToMove EngineClickToMove = (tClickToMove)ADDR_CLICK_TO_MOVE;
-tInteract EngineInteractUnit = (tInteract)ADDR_INTERACT;
 tGetActivePlayer GetPlayer = (tGetActivePlayer)ADDR_GET_PLAYER;
 
 struct BotCommand {
-    volatile int type; // 0: None, 1: Move, 2: Interact (Attack/Loot)
+    volatile int type; // 0: None, 1: Move, 2: VTable Interact
     volatile uintptr_t pTarget;
     volatile uint64_t guid;
     volatile float x, y, z;
@@ -48,8 +44,27 @@ void SetConsoleCursor(int x, int y) {
     SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), c);
 }
 
-// --- IAT HOOKING (ПЕРЕХВАТ ТАБЛИЦЫ ИМПОРТА) ---
-// WoW 3.3.5a использует ASCII версию функции - PeekMessageA
+// --- VTABLE ВЗАИМОДЕЙСТВИЕ (БЕЗ ХАРДКОДНЫХ АДРЕСОВ) ---
+void VTableInteractUnit(uintptr_t pTargetObj) {
+    if (!pTargetObj) return;
+    __try {
+        // Читаем указатель на VTable из начала объекта
+        uintptr_t vtable = *(uintptr_t*)pTargetObj;
+        if (!vtable) return;
+        
+        // Согласно Гидре, функция Interact лежит по смещению 0xB0 (176 байт)
+        // Определяем сигнатуру виртуального метода (__thiscall, принимает только this)
+        typedef void(__thiscall* tVTableInteract)(uintptr_t pThis);
+        
+        // Вытаскиваем реальный адрес функции из таблицы объекта
+        tVTableInteract DynamicInteract = (tVTableInteract)(*(uintptr_t*)(vtable + 0xB0));
+        
+        // Вызываем функцию движка напрямую, минуя статические проверки
+        DynamicInteract(pTargetObj);
+    } __except(1) {}
+}
+
+// --- IAT HOOKING MAIN THREAD ---
 typedef BOOL(WINAPI* tPeekMessageA)(LPMSG, HWND, UINT, UINT, UINT);
 tPeekMessageA oPeekMessageA = nullptr;
 
@@ -64,8 +79,8 @@ BOOL WINAPI HookedPeekMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT 
                     EngineClickToMove(pLocal, 4, (uint64_t*)&g_Cmd.guid, pos, 0.5f);
                 } 
                 else if (cmd == 2 && g_Cmd.pTarget != 0) { 
-                    // InteractUnit автоматически начинает атаку или лутает труп
-                    EngineInteractUnit(pLocal, g_Cmd.pTarget); 
+                    // ИСПОЛЬЗУЕМ ДИНАМИЧЕСКИЙ ВЫЗОВ ИЗ ТАБЛИЦЫ ВИРТУАЛЬНЫХ МЕТОДОВ
+                    VTableInteractUnit(g_Cmd.pTarget); 
                 }
             } __except(1) {}
         }
@@ -94,7 +109,6 @@ bool InstallIATHook() {
             while (origFirstThunk->u1.AddressOfData != 0) {
                 if (!(origFirstThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG)) {
                     PIMAGE_IMPORT_BY_NAME importByName = (PIMAGE_IMPORT_BY_NAME)((uintptr_t)hExe + origFirstThunk->u1.AddressOfData);
-                    // ИЩЕМ PeekMessageA ВМЕСТО PeekMessageW
                     if (strcmp((char*)importByName->Name, "PeekMessageA") == 0) {
                         DWORD oldProtect;
                         VirtualProtect(&firstThunk->u1.Function, sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &oldProtect);
@@ -131,7 +145,7 @@ void RemoveIATHook() {
                     if (strcmp((char*)importByName->Name, "PeekMessageA") == 0) {
                         DWORD oldProtect;
                         VirtualProtect(&firstThunk->u1.Function, sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &oldProtect);
-                        firstThunk->u1.Function = (uintptr_t)oPeekMessageA; // Восстанавливаем оригинал
+                        firstThunk->u1.Function = (uintptr_t)oPeekMessageA; 
                         VirtualProtect(&firstThunk->u1.Function, sizeof(uintptr_t), oldProtect, &oldProtect);
                         return;
                     }
@@ -154,19 +168,19 @@ void SendCommandAndWait(int type, uint64_t guid = 0, float x = 0, float y = 0, f
 }
 
 DWORD WINAPI MainThread(LPVOID lpParam) {
-    setlocale(LC_ALL, "Russian"); // Чиним кракозябры в консоли
+    setlocale(LC_ALL, "Russian");
     AllocConsole();
     FILE* f; freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Paladin IAT Ghost v32.0 (PeekMessageA Bypass) ---\n");
+    printf("--- Paladin VTable Injector v34.0 (Ghidra Edition) ---\n");
     if (InstallIATHook()) {
-        printf("[+] Таблица импорта перехвачена. Мы внутри Main Thread.\n");
+        printf("[+] IAT Hook установлен. Главный поток под контролем.\n");
     } else {
-        printf("[-] ОШИБКА: Функция PeekMessageA не найдена в IAT.\n");
+        printf("[-] ОШИБКА IAT. Клиент не поддерживается.\n");
         return 0;
     }
-    printf("[!] ГАЛОЧКИ 'Перемещение по щелчку' И 'Автосбор' ДОЛЖНЫ БЫТЬ ВКЛЮЧЕНЫ!\n");
-    printf("[!] БИНДЫ НЕ НУЖНЫ. КНОПКИ НЕ НАЖИМАЮТСЯ. РАБОТАЕТ ПРОГРАММНО.\n");
+    printf("[+] Статические вызовы удалены. Используется обход через VTable.\n");
+    printf("[!] ГАЛОЧКИ 'Перемещение по щелчку' И 'Автосбор' ОБЯЗАТЕЛЬНЫ!\n");
     printf("--------------------------------------------------\n");
 
     uintptr_t connectionAddr = (uintptr_t)GetModuleHandleA(NULL) + OFFSET_S_CUR_MGR;
@@ -282,7 +296,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                             printf("[STATE] ЖДЕМ ГЕНЕРАЦИЮ ТРУПА СЕРВЕРОМ...         \n");
                             Sleep(1200); 
                             
-                            printf("[STATE] NATIVE ВЗАИМОДЕЙСТВИЕ (ЛУТ)...           \n");
+                            printf("[STATE] VTABLE ВЗАИМОДЕЙСТВИЕ (ЛУТ)...           \n");
                             SendCommandAndWait(2, activeTargetGuid, 0, 0, 0, tObj);
                             
                             Sleep(2000); 
@@ -300,7 +314,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                     printf("[TARGET] ПОИСК НОВОЙ ЦЕЛИ...                      \n");
                     stateStartTime = GetTickCount();
                 }
-                printf("[FSM] %-15s | IAT GHOST: ACTIVE        \n", stateNames[state]);
+                printf("[FSM] %-15s | VTABLE INJECT: ACTIVE      \n", stateNames[state]);
             }
         }
         Sleep(100);
