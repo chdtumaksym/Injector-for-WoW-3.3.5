@@ -9,10 +9,7 @@
 #define ADDR_S_CUR_MGR          0x00C79CE0
 #define OFFSET_OBJECT_MANAGER   0x2ED0
 #define ADDR_CLICK_TO_MOVE      0x00611130
-#define ADDR_TARGET_GUID        0x00BD07B8
-#define ADDR_LUA_EXECUTE        0x00819210
 
-#define CTM_MOVE                4 
 #define CTM_INTERACT            5 
 #define CTM_ATTACK              7 
 
@@ -21,16 +18,13 @@
 #pragma strict_gs_check(off)
 
 typedef void(__thiscall* tClickToMove)(uintptr_t pThis, int type, uint64_t* guid, float* pos, float prec);
-typedef void(__cdecl* tLuaExecute)(const char* code, const char* fileName, int state);
 
 bool g_Active = false;
 WNDPROC oWndProc = nullptr;
 std::vector<uint64_t> g_Blacklist; 
 
-// Безопасное выполнение незащищенных макросов (например, сброс цели)
-void ExecuteLua(const char* command) {
-    ((tLuaExecute)ADDR_LUA_EXECUTE)(command, "bot_core", 0);
-}
+// Виртуальный таргет бота (теперь мы не ломаем память интерфейса WoW!)
+uint64_t g_BotTarget = 0; 
 
 float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) {
     return sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2) + pow(z2 - z1, 2));
@@ -41,10 +35,10 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
     static int lastType = 0;
     static DWORD lastTime = 0;
 
-    // Защита от спама команд (раз в 3 сек или при смене цели)
+    // Шлем команду раз в 3 секунды, чтобы перс двигался, но не ломал анимацию
     if (guid != lastGuid || type != lastType || (GetTickCount() - lastTime > 3000)) {
         
-        // ВАЖНО: Создаем локальные копии переменных для стека, чтобы игра не читала мусор
+        // Локальные копии для безопасной передачи в движок
         uint64_t ctmGuid = guid;
         float ctmPos[3] = { x, y, z };
         
@@ -65,7 +59,7 @@ void BotPulse() {
     uintptr_t pLocal = 0;
     float myX = 0, myY = 0, myZ = 0;
 
-    // 1. Ищем локального игрока
+    // 1. Ищем себя
     uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
     while (cur && (cur & 1) == 0) {
         if (*(uint64_t*)(cur + 0x30) == localGuid) {
@@ -79,22 +73,18 @@ void BotPulse() {
     }
     if (!pLocal) return;
 
-    uint64_t targetGuid = *(uint64_t*)ADDR_TARGET_GUID;
     bool hasTarget = false;
     int targetHp = 0, targetMaxHp = 0;
     uint32_t targetFlags = 0;
     float tX = 0, tY = 0, tZ = 0;
 
-    // 2. Читаем инфу о ТЕКУЩЕЙ цели с ЖЕСТКОЙ проверкой типа!
-    if (targetGuid) {
+    // 2. Читаем инфу о нашем ВИРТУАЛЬНОМ таргете (если он есть)
+    if (g_BotTarget != 0) {
         cur = *(uintptr_t*)(mgr + 0xAC);
         while (cur && (cur & 1) == 0) {
-            if (*(uint64_t*)(cur + 0x30) == targetGuid) {
-                
+            if (*(uint64_t*)(cur + 0x30) == g_BotTarget) {
                 int objType = *(int*)(cur + 0x14);
-                // Защита от краша 0x0044d9c4 (UnitReaction): 
-                // Продолжаем работу ТОЛЬКО если цель это Юнит (3) или Игрок (4)
-                if (objType == 3 || objType == 4) {
+                if (objType == 3 || objType == 4) { // Строгая проверка: Юнит или Игрок
                     uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                     if (desc) {
                         targetHp = *(int*)(desc + 0x60);
@@ -105,46 +95,45 @@ void BotPulse() {
                         tZ = *(float*)(cur + 0x7A0);
                         hasTarget = true;
                     }
-                } else {
-                    // Игрок взял в таргет что-то не то (сундук, руду). Сбрасываем!
-                    ExecuteLua("ClearTarget()"); 
                 }
                 break;
             }
             cur = *(uintptr_t*)(cur + 0x3C);
         }
+        
+        // Если моб пропал из зоны видимости/памяти
+        if (!hasTarget) g_BotTarget = 0;
     }
 
-    // 3. Логика боя / Лута
+    // 3. Выполняем действия
     if (hasTarget) {
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
 
         if (targetHp > 0) {
-            ActionCTM(pLocal, CTM_ATTACK, targetGuid, tX, tY, tZ);
+            ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
             printf("Attacking Target... Dist: %.1f      \r", dist);
         } 
         else if (targetHp <= 0 && (targetFlags & 1)) {
-            ActionCTM(pLocal, CTM_INTERACT, targetGuid, tX, tY, tZ);
+            ActionCTM(pLocal, CTM_INTERACT, g_BotTarget, tX, tY, tZ);
             printf("Looting Corpse... Dist: %.1f        \r", dist);
         } 
         else {
-            // Цель мертва и пуста. Заносим в ЧС и БЕЗОПАСНО сбрасываем цель.
-            g_Blacklist.push_back(targetGuid);
-            ExecuteLua("ClearTarget()");
+            // Мертв и залутан - сбрасываем и вносим в ЧС
+            g_Blacklist.push_back(g_BotTarget);
+            g_BotTarget = 0; 
             printf("Target Empty. Blacklisted.          \r");
         }
     } 
-    // 4. Поиск новой цели
+    // 4. Поиск новой цели, если текущей нет
     else {
-        uint64_t bestTarget = 0;
-        float bestDist = 40.0f; // Макс. радиус агра
-        float bX = 0, bY = 0, bZ = 0;
+        uint64_t bestGuid = 0;
+        float bestDist = 40.0f; 
 
         cur = *(uintptr_t*)(mgr + 0xAC);
         while (cur && (cur & 1) == 0) {
             int type = *(int*)(cur + 0x14);
             
-            if (type == 3) { // ТОЛЬКО NPC
+            if (type == 3) { // ТОЛЬКО NPC (Тип 3)
                 uint64_t guid = *(uint64_t*)(cur + 0x30);
                 
                 if (std::find(g_Blacklist.begin(), g_Blacklist.end(), guid) == g_Blacklist.end()) {
@@ -161,8 +150,7 @@ void BotPulse() {
 
                             if (dist < bestDist) {
                                 bestDist = dist;
-                                bestTarget = guid;
-                                bX = mX; bY = mY; bZ = mZ;
+                                bestGuid = guid;
                             }
                         }
                     }
@@ -171,11 +159,8 @@ void BotPulse() {
             cur = *(uintptr_t*)(cur + 0x3C);
         }
 
-        if (bestTarget) {
-            // Нашли моба. Записываем в память (осторожно, т.к. мы уже проверили type == 3)
-            *(uint64_t*)ADDR_TARGET_GUID = bestTarget;
-            // И сразу командуем бежать к нему и бить
-            ActionCTM(pLocal, CTM_ATTACK, bestTarget, bX, bY, bZ);
+        if (bestGuid) {
+            g_BotTarget = bestGuid; // Берем цель виртуально! Краша не будет.
             printf("Found new target! Dist: %.1f        \r", bestDist);
         } else {
             printf("Scanning for enemies...             \r");
@@ -194,7 +179,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
                 Beep(g_Active ? 800 : 400, 100);
                 printf("\n[!] BOT STATUS: %s                                \n", g_Active ? "ACTIVE" : "PAUSED");
                 if (!g_Active) { 
-                    ExecuteLua("ClearTarget()"); 
+                    g_BotTarget = 0; 
                     g_Blacklist.clear(); 
                 }
             }
@@ -203,26 +188,25 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
         }
 
         static DWORD lastTick = 0;
-        static bool isPulsing = false; // Блокировка от рекурсии/реентерабельности
+        static bool isPulsing = false; 
 
         if (g_Active && !isPulsing && (GetTickCount() - lastTick > 400)) {
             isPulsing = true;
             __try {
                 BotPulse();
             } __except (EXCEPTION_EXECUTE_HANDLER) {
-                printf("\n[!] Crash Prevented by SEH Block!\n");
+                printf("\n[!] Memory Read Error Prevented!\n");
             }
             lastTick = GetTickCount();
             isPulsing = false;
         }
     }
-    
     return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
 }
 
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v3.0: Crash-Proof Edition ---\n");
+    printf("--- Bot v4.0: Virtual Target Engine ---\n");
 
     HWND hwnd = FindWindowA(NULL, "World of Warcraft");
     if (!hwnd) {
@@ -233,7 +217,7 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(hwnd, 1337, 50, NULL); 
 
-    printf("[+] Object Type Filtering Active.\n");
+    printf("[+] Virtual Targeting Active. Crash Vector Eliminated.\n");
     printf("[!] Make sure 'Click-to-Move' and 'Auto Loot' are ON.\n");
     printf("[+] Press [INSERT] to start/stop the bot.\n");
     return 0;
