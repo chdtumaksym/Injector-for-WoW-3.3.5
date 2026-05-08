@@ -7,7 +7,8 @@
 #define ADDR_S_CUR_MGR          0x00C79CE0
 #define OFFSET_OBJECT_MANAGER   0x2ED0
 #define ADDR_CLICK_TO_MOVE      0x00611130
-#define ADDR_TARGET_GUID        0x00BD07B8
+#define ADDR_MOUSEOVER_GUID     0x00BD07A0
+#define ADDR_LUA_EXECUTE        0x00819210
 
 // Константы ClickToMove для 3.3.5a
 #define CTM_LOOT                6
@@ -18,12 +19,21 @@
 #pragma strict_gs_check(off)
 
 typedef void(__thiscall* tClickToMove)(uintptr_t pThis, int type, uint64_t* guid, float* pos, float prec);
+typedef void(__cdecl* tLuaExecute)(const char* code, const char* fileName, int state);
 
 bool g_Active = false;
 WNDPROC oWndProc = nullptr;
 
 struct CTM_BUFFER { uint64_t guid; float pos[3]; };
 static CTM_BUFFER g_ctm;
+
+// Безопасное выделение цели через встроенный Lua-движок
+void SelectTarget(uint64_t guid) {
+    // Подменяем GUID под мышкой
+    *(uint64_t*)ADDR_MOUSEOVER_GUID = guid;
+    // Заставляем игру саму взять это в таргет (обновляет UI, сервер и дескрипторы)
+    ((tLuaExecute)ADDR_LUA_EXECUTE)("TargetUnit('mouseover')", "bot_core", 0);
+}
 
 void SafeAction(uintptr_t pLocal, int type, uint64_t guid, float x, float y, float z) {
     if (!pLocal) return;
@@ -42,6 +52,7 @@ void BotPulse() {
     uintptr_t pLocal = 0;
     float myX = 0, myY = 0, myZ = 0;
 
+    // Ищем локального игрока
     uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
     while (cur && (cur & 1) == 0) {
         if (*(uint64_t*)(cur + 0x30) == localGuid) {
@@ -61,7 +72,7 @@ void BotPulse() {
 
     cur = *(uintptr_t*)(mgr + 0xAC);
     while (cur && (cur & 1) == 0) {
-        if (*(int*)(cur + 0x14) == 3) { // Unit (Игроки/Мобы)
+        if (*(int*)(cur + 0x14) == 3) { // Unit
             uintptr_t desc = *(uintptr_t*)(cur + 0x8);
             if (desc) {
                 uint64_t objGuid = *(uint64_t*)(cur + 0x30);
@@ -73,13 +84,11 @@ void BotPulse() {
                     float dist = sqrt(pow(tX - myX, 2) + pow(tY - myY, 2));
 
                     if (hp > 0) {
-                        // Ищем ближайшую живую цель
                         if (dist < attackDist) {
                             attackDist = dist; attackGuid = objGuid;
                             aPos[0] = tX; aPos[1] = tY; aPos[2] = *(float*)(cur + 0x7A0);
                         }
                     } else if (hp <= 0 && (flags & 1)) { // Флаг 1 = Lootable
-                        // Ищем ближайший труп с лутом
                         if (dist < lootDist) {
                             lootDist = dist; lootGuid = objGuid;
                             lPos[0] = tX; lPos[1] = tY; lPos[2] = *(float*)(cur + 0x7A0);
@@ -92,22 +101,21 @@ void BotPulse() {
     }
 
     static DWORD lastAction = 0;
-    // Ограничиваем вызовы: 2 раза в секунду, чтобы движок успевал обрабатывать путь
     if (GetTickCount() - lastAction > 500) {
         if (lootGuid && lootDist < 5.0f) {
-            *(uint64_t*)ADDR_TARGET_GUID = lootGuid;
+            SelectTarget(lootGuid); // Сначала безопасно берем в таргет
             SafeAction(pLocal, CTM_LOOT, lootGuid, lPos[0], lPos[1], lPos[2]);
             printf("Looting: %llu               \r", lootGuid);
             lastAction = GetTickCount();
         } 
         else if (attackGuid) {
-            *(uint64_t*)ADDR_TARGET_GUID = attackGuid;
+            SelectTarget(attackGuid); // Синхронизируем дескрипторы для движка
             SafeAction(pLocal, CTM_ATTACK_GUID, attackGuid, aPos[0], aPos[1], aPos[2]);
             printf("Attacking: %llu | Dist: %.1f  \r", attackGuid, attackDist);
             lastAction = GetTickCount();
         } 
         else if (lootGuid) {
-            *(uint64_t*)ADDR_TARGET_GUID = lootGuid;
+            SelectTarget(lootGuid);
             SafeAction(pLocal, CTM_LOOT, lootGuid, lPos[0], lPos[1], lPos[2]);
             printf("Running to Loot: %llu       \r", lootGuid);
             lastAction = GetTickCount();
@@ -121,17 +129,15 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
         Beep(g_Active ? 800 : 400, 100);
         printf("\n[!] BOT STATUS: %s\n", g_Active ? "ACTIVE" : "PAUSED");
     }
-    
     if (uMsg == WM_TIMER && wParam == 1337) {
         BotPulse();
     }
-    
     return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
 }
 
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v120: Perfect Executioner ---\n");
+    printf("--- Bot v121: Hybrid Engine (WndProc + Lua) ---\n");
 
     HWND hwnd = FindWindowA(NULL, "World of Warcraft");
     if (!hwnd) {
@@ -143,8 +149,8 @@ DWORD WINAPI Setup(LPVOID) {
     SetTimer(hwnd, 1337, 500, NULL);
 
     printf("[+] Setup Complete.\n");
-    printf("[!] CRITICAL: Make sure 'Click-to-Move' is enabled in Interface -> Mouse.\n");
-    printf("[+] Focus WoW window and press [INSERT] to start farming.\n");
+    printf("[!] Click-to-Move MUST be enabled in game settings.\n");
+    printf("[+] Press [INSERT] to start farming.\n");
     return 0;
 }
 
