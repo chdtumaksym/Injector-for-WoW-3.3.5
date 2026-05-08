@@ -7,33 +7,26 @@
 
 #pragma comment(lib, "user32.lib")
 
-// --- ОФФСЕТЫ 3.3.5a (12340) ---
 #define OFFSET_S_CUR_MGR         0x00879CE0
 #define OFFSET_OBJECT_MANAGER    0x2ED0
 #define ADDR_TARGET_GUID         0x00BD07B0 
 #define ADDR_LUA_EXECUTE         0x00819210
 #define ADDR_GET_PLAYER          0x004038BE
 #define ADDR_CLICK_TO_MOVE       0x00611130
+#define ADDR_JMP_EAX_GADGET      0x0040C7B6
 
-// --- СТРУКТУРЫ И ТИПЫ ---
-typedef void(__cdecl* tFrameScript_Execute)(const char* script, const char* name, void* state);
 typedef void(__thiscall* tClickToMove)(uintptr_t playerPtr, int clickType, uint64_t* interactGuid, float* pos, float precision);
 typedef uintptr_t(__cdecl* tGetActivePlayer)();
 
-tFrameScript_Execute LuaExecute = (tFrameScript_Execute)ADDR_LUA_EXECUTE;
 tClickToMove EngineClickToMove = (tClickToMove)ADDR_CLICK_TO_MOVE;
 tGetActivePlayer GetPlayer = (tGetActivePlayer)ADDR_GET_PLAYER;
 
-enum BotState { STATE_SEARCH, STATE_MOVE, STATE_COMBAT, STATE_LOOT };
-const char* stateNames[] = { "SEARCHING", "MOVING", "COMBAT", "LOOTING" };
-
 struct BotCommand {
-    volatile int type; // 1: CTM, 2: Lua Interact
+    volatile int type;
     volatile uint64_t guid;
     volatile float x, y, z;
 } g_Cmd;
 
-// --- УТИЛИТЫ (ДЛЯ КОМПИЛЯЦИИ БЕЗ ОШИБОК) ---
 template <typename T>
 T SafeRead(uintptr_t address) {
     T buffer = T();
@@ -53,18 +46,21 @@ void SetConsoleCursor(int x, int y) {
     SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), c);
 }
 
-// --- SAFE LUA EXECUTE (С ПОДМЕНОЙ КОНТЕКСТА) ---
-void SafeLuaExecute(const char* script) {
+void SpoofedLuaExecute(const char* script) {
+    uintptr_t luaAddr = ADDR_LUA_EXECUTE;
+    uintptr_t gadget = ADDR_JMP_EAX_GADGET;
     __try {
-        // Мы вызываем Lua через оригинальную функцию регистрации стейта
-        // Это минимизирует шанс того, что Warden увидит "левый" вызов
-        LuaExecute(script, script, NULL);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        printf("[!] CRITICAL: Lua Engine rejected the call! \n");
-    }
+        __asm {
+            push 0
+            push script
+            push script
+            mov eax, luaAddr
+            call gadget
+            add esp, 12
+        }
+    } __except(1) {}
 }
 
-// --- IAT HOOK (MAIN THREAD CONTEXT) ---
 typedef BOOL(WINAPI* tPeekMessageA)(LPMSG, HWND, UINT, UINT, UINT);
 tPeekMessageA oPeekMessageA = nullptr;
 
@@ -77,8 +73,7 @@ BOOL WINAPI HookedPeekMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT 
                 EngineClickToMove(pLocal, 4, (uint64_t*)&g_Cmd.guid, pos, 0.5f);
             } 
             else if (g_Cmd.type == 2) {
-                // Перед взаимодействием сбрасываем кеш таргета, чтобы Lua его увидел
-                SafeLuaExecute("InteractUnit('target')");
+                SpoofedLuaExecute("InteractUnit('target')");
             }
         }
         g_Cmd.type = 0;
@@ -126,18 +121,18 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f; freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Paladin Stack Sentinel v38.0 ---\n");
+    printf("--- Paladin Inline Spoof v39.0 ---\n");
     if (InstallIATHook()) printf("[+] IAT Hook: ACTIVE\n");
     else { printf("[-] IAT Hook: FAILED\n"); return 0; }
 
     uintptr_t connAddr = (uintptr_t)GetModuleHandleA(NULL) + OFFSET_S_CUR_MGR;
-    BotState state = STATE_SEARCH;
+    int state = 0; 
     uint64_t activeGuid = 0;
 
     while (!GetAsyncKeyState(VK_END)) {
         uintptr_t conn = SafeRead<uintptr_t>(connAddr);
-        SetConsoleCursor(0, 6);
-        if (!conn) { printf("[!] Ждем подключения к миру... \n"); Sleep(500); continue; }
+        SetConsoleCursor(0, 5);
+        if (!conn) { printf("[!] Ожидание... \n"); Sleep(500); continue; }
 
         uintptr_t mgr = SafeRead<uintptr_t>(conn + OFFSET_OBJECT_MANAGER);
         if (mgr) {
@@ -153,7 +148,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                 uintptr_t pDesc = SafeRead<uintptr_t>(pLocal + 0x8);
                 float myX = SafeRead<float>(pLocal + 0x798), myY = SafeRead<float>(pLocal + 0x79C);
 
-                if (state == STATE_SEARCH) {
+                if (state == 0) {
                     float best = 45.0f; activeGuid = 0;
                     cur = SafeRead<uintptr_t>(mgr + 0xAC);
                     while (cur && (cur & 1) == 0) {
@@ -165,7 +160,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                         }
                         cur = SafeRead<uintptr_t>(cur + 0x3C);
                     }
-                    if (activeGuid) state = STATE_MOVE;
+                    if (activeGuid) state = 1;
                 }
 
                 if (activeGuid) {
@@ -179,14 +174,14 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                         float tx = SafeRead<float>(tObj + 0x798), ty = SafeRead<float>(tObj + 0x79C), tz = SafeRead<float>(tObj + 0x7A0);
                         float dist = sqrt(pow(tx-myX, 2) + pow(ty-myY, 2));
                         if (SafeRead<int>(SafeRead<uintptr_t>(tObj+0x8) + 0x60) > 0) {
-                            if (dist > 4.5f) { state = STATE_MOVE; SendCmd(1, activeGuid, tx, ty, tz); }
-                            else { state = STATE_COMBAT; SendCmd(2); Sleep(1000); }
+                            if (dist > 4.5f) { state = 1; SendCmd(1, activeGuid, tx, ty, tz); }
+                            else { state = 2; SendCmd(2); Sleep(1000); }
                         } else {
-                            state = STATE_LOOT; SendCmd(2); Sleep(2000); activeGuid = 0; state = STATE_SEARCH;
+                            state = 3; SendCmd(2); Sleep(2000); activeGuid = 0; state = 0;
                         }
-                    } else { activeGuid = 0; state = STATE_SEARCH; }
+                    } else { activeGuid = 0; state = 0; }
                 }
-                printf("[FSM] State: %-15s | Target: %llX \n", stateNames[state], activeGuid);
+                printf("[FSM] Активно, цель: %llX \n", activeGuid);
             }
         }
         Sleep(100);
