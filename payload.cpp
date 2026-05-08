@@ -10,22 +10,22 @@
 // --- СТАТИЧНЫЕ ОФФСЕТЫ 3.3.5a (12340) ---
 #define OFFSET_S_CUR_MGR         0x00879CE0
 #define OFFSET_OBJECT_MANAGER    0x2ED0
-#define ADDR_TARGET_GUID         0x00BD07B0 
 #define ADDR_CLICK_TO_MOVE       0x00611130
 #define ADDR_GET_PLAYER          0x004038BE
 #define ADDR_D3D9_DEVICE         0x00C5DF88
 #define ADDR_LUA_EXECUTE         0x00819210
+#define ADDR_SET_TARGET          0x00493540 // Правильная функция движка для выбора цели
 
 typedef void(__thiscall* tClickToMove)(uintptr_t playerPtr, int clickType, uint64_t* interactGuid, float* pos, float precision);
 typedef uintptr_t(__cdecl* tGetPlayer)();
 typedef HRESULT(__stdcall* tEndScene)(LPDIRECT3DDEVICE9 pDevice);
 typedef void(__cdecl* tFrameScript_Execute)(const char* script, const char* name, void* state);
+typedef void(__cdecl* tSetTarget)(uint64_t targetGuid);
 
 tEndScene oEndScene = nullptr;
 bool g_BotActive = false;
-uintptr_t g_BaseAddress = 0; // Кэшируем базу модуля
+uintptr_t g_BaseAddress = 0;
 
-// Убираем убогий VirtualQuery из горячего цикла, доверяем валидности указателей игры
 template<typename T> T Read(uintptr_t addr) {
     if (!addr) return T();
     return *(T*)addr;
@@ -53,7 +53,6 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
     uintptr_t mgr = conn ? Read<uintptr_t>(conn + OFFSET_OBJECT_MANAGER) : 0;
     uintptr_t pLocal = ((tGetPlayer)ADDR_GET_PLAYER)();
 
-    // Вывод логов из твоего старого main.h теперь привязан к нормальным событиям, а не к бесконечному циклу
     static DWORD lastLogTime = 0;
     if (pLocal && GetTickCount() - lastLogTime > 1000) {
         float x = Read<float>(pLocal + 0x798);
@@ -63,7 +62,6 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
         lastLogTime = GetTickCount();
     }
 
-    // Тот самый тестовый мувмент, который был в мертвом main.h
     if (GetAsyncKeyState(VK_F1) & 0x8000) {
         if (!keyStateF1 && pLocal) {
             float x = Read<float>(pLocal + 0x798);
@@ -81,7 +79,6 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
 
     if (g_BotActive && mgr && pLocal && Read<int>(pLocal + 0x14) == 4) {
         float myX = Read<float>(pLocal + 0x798), myY = Read<float>(pLocal + 0x79C);
-        uintptr_t pDesc = Read<uintptr_t>(pLocal + 0x8);
         
         uint64_t bestGuid = 0; 
         float bestDist = 40.0f; 
@@ -89,7 +86,7 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
         uintptr_t cur = Read<uintptr_t>(mgr + 0xAC);
         
         while (cur && (cur & 1) == 0) {
-            if (Read<int>(cur + 0x14) == 3) { // Unit
+            if (Read<int>(cur + 0x14) == 3) { 
                 uintptr_t desc = Read<uintptr_t>(cur + 0x8);
                 if (desc && Read<int>(desc + 0x60) > 0 && Read<uint64_t>(desc + 0x38) == 0) {
                     float dx = Read<float>(cur + 0x798) - myX;
@@ -109,8 +106,8 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
         if (bestGuid && bestObj) {
             float tx = Read<float>(bestObj + 0x798), ty = Read<float>(bestObj + 0x79C), tz = Read<float>(bestObj + 0x7A0);
             
-            Write<uint64_t>(pDesc + 0x48, bestGuid);
-            Write<uint64_t>(ADDR_TARGET_GUID, bestGuid);
+            // Используем нативную функцию установки цели вместо крашащей записи в память
+            ((tSetTarget)ADDR_SET_TARGET)(bestGuid);
 
             if (bestDist > 4.5f) {
                 if (GetTickCount() - lastAction > 300) {
@@ -129,6 +126,29 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
                     lastAction = GetTickCount();
                 }
             }
+        } else {
+            if (GetTickCount() - lastAction > 2000) {
+                cur = Read<uintptr_t>(mgr + 0xAC);
+                while (cur && (cur & 1) == 0) {
+                    if (Read<int>(cur + 0x14) == 3) {
+                        uintptr_t desc = Read<uintptr_t>(cur + 0x8);
+                        if (desc && Read<int>(desc + 0x60) == 0) { 
+                            float dx = Read<float>(cur + 0x798) - myX, dy = Read<float>(cur + 0x79C) - myY;
+                            if (sqrt(dx*dx + dy*dy) < 5.0f) {
+                                uint64_t deadGuid = Read<uint64_t>(cur + 0x30);
+                                
+                                // То же самое для лута - ставим таргет безопасно
+                                ((tSetTarget)ADDR_SET_TARGET)(deadGuid);
+                                ((tFrameScript_Execute)ADDR_LUA_EXECUTE)("InteractUnit('target')", "Loot", NULL);
+                                
+                                lastAction = GetTickCount();
+                                break;
+                            }
+                        }
+                    }
+                    cur = Read<uintptr_t>(cur + 0x3C);
+                }
+            }
         }
     }
     return oEndScene(pDevice);
@@ -142,13 +162,12 @@ void SetupConsole() {
 
 DWORD WINAPI InitThread(LPVOID lpParam) {
     SetupConsole();
-    g_BaseAddress = (uintptr_t)GetModuleHandleA(NULL); // Кэшируем один раз при старте
+    g_BaseAddress = (uintptr_t)GetModuleHandleA(NULL); 
 
-    // Вместо тупого слипа в 10 секунд адекватно ждем появления модуля директикса
     while (!GetModuleHandleA("d3d9.dll")) {
         Sleep(100);
     }
-    Sleep(2000); // Даем игре немного времени завершить инициализацию D3D окна
+    Sleep(2000); 
 
     uintptr_t* pDevicePtr = (uintptr_t*)ADDR_D3D9_DEVICE;
     if (pDevicePtr && *pDevicePtr) {
