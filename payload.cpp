@@ -12,30 +12,33 @@
 #define OFFSET_OBJECT_MANAGER    0x2ED0
 #define ADDR_TARGET_GUID         0x00BD07B0 
 
-#define ADDR_LUA_EXECUTE         0x00819210
 #define ADDR_CLICK_TO_MOVE       0x00611130
 #define ADDR_GET_PLAYER          0x004038BE
+#define ADDR_INTERACT            0x00609390
+#define ADDR_USE_ACTION          0x007C4180
 
 enum BotState { STATE_SEARCH, STATE_MOVE, STATE_COMBAT, STATE_LOOT };
 const char* stateNames[] = { "SEARCHING", "MOVING", "COMBAT", "LOOTING" };
 
-// --- ФУНКЦИИ ДВИЖКА ---
-typedef void(__cdecl* tFrameScript_Execute)(const char* command, const char* filename, void* reserved);
+// --- ФУНКЦИИ ДВИЖКА (БЕЗ LUA) ---
 typedef void(__thiscall* tClickToMove)(uintptr_t playerPtr, int clickType, uint64_t* interactGuid, float* pos, float precision);
 typedef uintptr_t(__cdecl* tGetActivePlayer)();
+typedef void(__thiscall* tInteract)(uintptr_t unitPtr);
+typedef void(__cdecl* tUseAction)(unsigned int slot, char checkCursor, char checkUnk);
 
-tFrameScript_Execute Lua_DoString = (tFrameScript_Execute)ADDR_LUA_EXECUTE;
 tClickToMove ClickToMove = (tClickToMove)ADDR_CLICK_TO_MOVE;
 tGetActivePlayer GetPlayer = (tGetActivePlayer)ADDR_GET_PLAYER;
+tInteract InteractUnit = (tInteract)ADDR_INTERACT;
+tUseAction UseAction = (tUseAction)ADDR_USE_ACTION;
 
 // --- СИНХРОННАЯ ОЧЕРЕДЬ ДЛЯ ИНТЕРНАЛА ---
 struct BotCommand {
-    volatile int type; // 0: None, 1: Move, 2: Attack, 3: Loot/Interact, 4: Heal
+    volatile int type; // 0: None, 1: Move, 2: Attack, 3: Interact/Loot, 4: Heal
     volatile uint64_t guid;
     volatile float x, y, z;
+    volatile uintptr_t ptr;
 } g_Cmd;
 
-// --- БЕЗОПАСНОЕ ЧТЕНИЕ ПАМЯТИ ---
 template <typename T>
 T SafeRead(uintptr_t address) {
     T buffer = T();
@@ -50,7 +53,6 @@ void SetConsoleCursor(int x, int y) {
     SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), c);
 }
 
-// --- VTABLE ХУК D3D9 ---
 typedef HRESULT(__stdcall* tEndScene)(IDirect3DDevice9*);
 tEndScene oEndScene = nullptr;
 
@@ -62,36 +64,27 @@ HRESULT __stdcall HookedEndScene(IDirect3DDevice9* pDevice) {
         uintptr_t pLocal = GetPlayer();
         if (pLocal && SafeRead<int>(pLocal + 0x14) == 4) {
             __try {
-                // ЗВУКОВОЙ ИНДИКАТОР: Если хук дошел сюда, он работает.
-                Beep(1500, 50); 
-
                 if (cmd == 1) { 
                     float pos[3] = { g_Cmd.x, g_Cmd.y, g_Cmd.z };
                     ClickToMove(pLocal, 4, (uint64_t*)&g_Cmd.guid, pos, 0.5f);
                 } 
                 else if (cmd == 2) { 
-                    Lua_DoString("if UnitExists('target') and not IsCurrentSpell(6603) then StartAttack() end", "bot", 0);
-                    Lua_DoString("if not UnitBuff('player', 'Seal of Righteousness') then CastSpellByID(21084) end", "bot", 0);
+                    UseAction(1, 0, 0); // Прожимает Слот 1 на панели (Атака)
                 } 
                 else if (cmd == 3) { 
-                    char cmdBuf[128];
-                    sprintf_s(cmdBuf, "TargetUnit('0x%llX') InteractUnit('target')", g_Cmd.guid);
-                    Lua_DoString(cmdBuf, "bot", 0);
-                    // Лутаем открытое окно
-                    Lua_DoString("if LootFrame:IsVisible() then for i=1,GetNumLootItems() do LootSlot(i) end CloseLoot() end", "bot", 0);
+                    if (g_Cmd.ptr) InteractUnit(g_Cmd.ptr); // Нативный клик по трупу (если автолут вкл, лутает всё)
                 }
                 else if (cmd == 4) {
-                    Lua_DoString("CastSpellByID(19750)", "bot", 0); // Вспышка Света
+                    UseAction(9, 0, 0); // Прожимает Слот 9 на панели (Хил)
                 }
             } __except(1) {}
         }
-        g_Cmd.type = 0; // Снимаем команду после выполнения
+        g_Cmd.type = 0; 
     }
 
     return oEndScene(pDevice);
 }
 
-// Установка хука через фиктивное устройство, чтобы не крашить систему
 bool InstallVTableHook() {
     IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
     if (!pD3D) return false;
@@ -129,31 +122,30 @@ void UnhookVTable() {
     pD3D->Release(); DestroyWindow(dummyWindow);
 }
 
-// Ожидание выполнения команды с таймаутом
-void SendCommandAndWait(int type, uint64_t guid = 0, float x = 0, float y = 0, float z = 0) {
-    g_Cmd.guid = guid; g_Cmd.x = x; g_Cmd.y = y; g_Cmd.z = z; g_Cmd.type = type;
+void SendCommandAndWait(int type, uint64_t guid = 0, float x = 0, float y = 0, float z = 0, uintptr_t ptr = 0) {
+    g_Cmd.guid = guid; g_Cmd.x = x; g_Cmd.y = y; g_Cmd.z = z; g_Cmd.ptr = ptr; g_Cmd.type = type;
     int timeout = 0;
-    while (g_Cmd.type != 0 && timeout < 100) { // 1 секунда таймаут
+    while (g_Cmd.type != 0 && timeout < 100) { 
         Sleep(10);
         timeout++;
     }
-    if (g_Cmd.type != 0) g_Cmd.type = 0; // Сбрасываем, если хук молчит
+    if (g_Cmd.type != 0) g_Cmd.type = 0; 
 }
 
-// --- ОСНОВНОЙ ПОТОК ---
 DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f; freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Paladin Pure Internal v22.0 (Zero Binds) ---\n");
+    printf("--- Paladin Native API v23.0 (Zero Lua Edition) ---\n");
     if (InstallVTableHook()) {
         printf("[+] EndScene Hooked! \n");
     } else {
         printf("[-] Hook failed. Run as Administrator!\n");
         return 0;
     }
-    printf("[!] КРИТИЧЕСКИ ВАЖНО: Напиши в чате /console gxMultithread 0\n");
-    printf("[!] Иначе игра не будет обрабатывать вызовы!\n");
+    printf("[!] КРИТИЧЕСКИ ВАЖНО: /console gxMultithread 0 в чат!\n");
+    printf("[!] ПОЛОЖИ АТАКУ НА КНОПКУ 1, А ХИЛ НА КНОПКУ 9 (Action Bar).\n");
+    printf("[!] ВКЛЮЧИ 'Click-to-Move' И 'AutoLoot' В НАСТРОЙКАХ!\n");
     printf("--------------------------------------------------\n");
 
     uintptr_t connectionAddr = (uintptr_t)GetModuleHandleA(NULL) + OFFSET_S_CUR_MGR;
@@ -163,7 +155,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
 
     while (!GetAsyncKeyState(VK_END)) {
         uintptr_t clientConn = SafeRead<uintptr_t>(connectionAddr);
-        SetConsoleCursor(0, 6);
+        SetConsoleCursor(0, 7);
 
         if (!clientConn) {
             printf("[!] Ожидание подключения к миру...                           \n");
@@ -190,15 +182,13 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                 printf("[PLAYER] HP: %-5d/%-5d | LVL: %d | POS: %.1f, %.1f      \n", hp, maxHp, lvl, myX, myY);
                 printf("--------------------------------------------------\n");
 
-                // Внутренний Хил через Lua
                 if (hp > 0 && maxHp > 0 && (hp * 100 / maxHp) < 40) {
-                    SendCommandAndWait(4); // Cast Heal
+                    SendCommandAndWait(4); 
                     Sleep(1500); 
                 }
 
                 DWORD elapsed = GetTickCount() - stateStartTime;
 
-                // --- FSM ---
                 if (state == STATE_SEARCH) {
                     float bestDist = 45.0f; activeTargetGuid = 0;
                     cur = SafeRead<uintptr_t>(mgr + 0xAC);
@@ -225,7 +215,6 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                 }
 
                 if (activeTargetGuid != 0) {
-                    // Память обновляем для UI
                     if (pDesc) *(uint64_t*)(pDesc + 0x48) = activeTargetGuid; 
                     *(uint64_t*)ADDR_TARGET_GUID = activeTargetGuid;
 
@@ -246,7 +235,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                         printf("[TARGET] HP: %-5d | DIST: %.2f yds                  \n", thp, dist);
                         
                         if (thp > 0) {
-                            *(float*)(pLocal + 0x7A8) = cYaw; // Поворот
+                            *(float*)(pLocal + 0x7A8) = cYaw; 
                             
                             if (dist > 4.2f) {
                                 if (state == STATE_MOVE && elapsed > 12000) {
@@ -256,7 +245,6 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                                 }
                                 if (state != STATE_MOVE) { state = STATE_MOVE; stateStartTime = GetTickCount(); }
                                 
-                                // ВНУТРЕННЕЕ ПЕРЕМЕЩЕНИЕ
                                 SendCommandAndWait(1, activeTargetGuid, tx, ty, tz);
                             } else {
                                 if (state == STATE_COMBAT && elapsed > 25000) {
@@ -266,7 +254,6 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                                 }
                                 if (state != STATE_COMBAT) { state = STATE_COMBAT; stateStartTime = GetTickCount(); }
 
-                                // ВНУТРЕННЯЯ АТАКА
                                 SendCommandAndWait(2);
                             }
                         } else {
@@ -275,11 +262,10 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                             printf("[STATE] ЖДЕМ ГЕНЕРАЦИЮ ТРУПА СЕРВЕРОМ...         \n");
                             Sleep(1200); 
                             
-                            printf("[STATE] INTERNAL ВЗАИМОДЕЙСТВИЕ И СБОР...        \n");
-                            // ВНУТРЕННИЙ ЛУТ
-                            SendCommandAndWait(3, activeTargetGuid);
+                            printf("[STATE] NATIVE ВЗАИМОДЕЙСТВИЕ И СБОР...          \n");
+                            SendCommandAndWait(3, activeTargetGuid, 0, 0, 0, tObj);
                             
-                            Sleep(2000); // Даем окну лута время на автосбор
+                            Sleep(2000); 
                             
                             if (pDesc) *(uint64_t*)(pDesc + 0x48) = 0; 
                             *(uint64_t*)ADDR_TARGET_GUID = 0; 
@@ -294,7 +280,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                     printf("[TARGET] ПОИСК НОВОЙ ЦЕЛИ...                      \n");
                     stateStartTime = GetTickCount();
                 }
-                printf("[FSM] %-15s | LUA ENGINE: ACTIVE       \n", stateNames[state]);
+                printf("[FSM] %-15s | NATIVE API: ACTIVE       \n", stateNames[state]);
             }
         }
         Sleep(100);
