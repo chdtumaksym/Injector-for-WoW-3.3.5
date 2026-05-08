@@ -5,12 +5,10 @@
 #include <vector>
 #include <algorithm>
 
-// --- ПРАВИЛЬНЫЕ АДРЕСА 3.3.5a (12340) ---
 #define ADDR_S_CUR_MGR          0x00C79CE0
 #define OFFSET_OBJECT_MANAGER   0x2ED0
-
-// [!!!] ВОТ ОНА — ЕДИНСТВЕННАЯ ПРИЧИНА КРАШЕЙ. ИСТИННЫЙ АДРЕС CTM:
 #define ADDR_CLICK_TO_MOVE      0x00727400 
+#define ADDR_TARGET_GUID        0x00BD07B8 // Адрес таргета в интерфейсе игры
 
 #define CTM_INTERACT            5  
 #define CTM_ATTACK              11 
@@ -19,7 +17,6 @@
 #pragma check_stack(off)
 #pragma strict_gs_check(off)
 
-// Эмуляция __thiscall через __fastcall (ecx = pLocal, edx = 0)
 typedef void(__fastcall* tClickToMove)(uintptr_t ecx, uintptr_t edx, int type, uint64_t* guid, float* pos, float prec);
 
 bool g_Active = false;
@@ -40,7 +37,8 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
     static uint64_t ctmGuid = 0;
     static float ctmPos[3] = { 0, 0, 0 };
 
-    if (guid != lastGuid || type != lastType || (GetTickCount() - lastTime > 3000)) {
+    // Обновляем команду раз в 2 секунды (чтобы бот гнался за мобом, если тот убегает)
+    if (guid != lastGuid || type != lastType || (GetTickCount() - lastTime > 2000)) {
         ctmGuid = guid;
         ctmPos[0] = x; ctmPos[1] = y; ctmPos[2] = z;
         
@@ -106,16 +104,21 @@ void BotPulse() {
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
 
         if (targetHp > 0) {
+            // [!] ЕСЛИ ЦЕЛЬ ЖИВА - БЕРЕМ В ТАРГЕТ И БЬЕМ
+            *(uint64_t*)ADDR_TARGET_GUID = g_BotTarget; 
             ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
             printf("Attacking Target... Dist: %.1f      \r", dist);
         } 
         else if (targetHp <= 0 && (targetFlags & 1)) {
+            // [!] ЛУТАЕМ
             ActionCTM(pLocal, CTM_INTERACT, g_BotTarget, tX, tY, tZ);
             printf("Looting Corpse... Dist: %.1f        \r", dist);
         } 
         else {
+            // [!] СБРАСЫВАЕМ ТАРГЕТ
             g_Blacklist.push_back(g_BotTarget);
             g_BotTarget = 0; 
+            *(uint64_t*)ADDR_TARGET_GUID = 0; 
             printf("Target Empty. Blacklisted.          \n");
         }
     } 
@@ -155,6 +158,7 @@ void BotPulse() {
 
         if (bestGuid) {
             g_BotTarget = bestGuid; 
+            *(uint64_t*)ADDR_TARGET_GUID = g_BotTarget; //[!] БЕРЕМ В ТАРГЕТ СРАЗУ ПРИ ПОИСКЕ
             printf("\nFound new target! Dist: %.1f        \n", bestDist);
         } else {
             printf("Scanning for enemies...             \r");
@@ -174,6 +178,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
                 printf("\n[!] BOT STATUS: %s                                \n", g_Active ? "ACTIVE" : "PAUSED");
                 if (!g_Active) { 
                     g_BotTarget = 0; 
+                    *(uint64_t*)ADDR_TARGET_GUID = 0; // Сбрасываем таргет при паузе
                     g_Blacklist.clear(); 
                 }
             }
@@ -199,7 +204,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v8.0: The Real Address Fix ---\n");
+    printf("--- Bot v9.0: The Terminator ---\n");
 
     HWND hwnd = FindWindowA(NULL, "World of Warcraft");
     if (!hwnd) {
@@ -210,7 +215,7 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(hwnd, 1337, 50, NULL); 
 
-    printf("[+] Correct CTM Address 0x00727400 Applied.\n");
+    printf("[+] Target Selection logic restored.\n");
     printf("[!] Make sure 'Click-to-Move' and 'Auto Loot' are ON.\n");
     printf("[+] Press [INSERT] to start/stop the bot.\n");
     return 0;
