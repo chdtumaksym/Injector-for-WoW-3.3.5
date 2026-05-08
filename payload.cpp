@@ -22,11 +22,12 @@ tEndScene oEndScene = nullptr;
 HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
     static bool keyState = false;
     
-    if (GetAsyncKeyState(VK_END) & 0x8000) {
+    // Поменяли клавишу на F5
+    if (GetAsyncKeyState(VK_F5) & 0x8000) {
         if (!keyState) {
             keyState = true;
             Beep(500, 100);
-            printf("\n--- СКАНИРОВАНИЕ ПАМЯТИ ---\n");
+            printf("\n--- СКАНИРОВАНИЕ ПАМЯТИ (F5) ---\n");
 
             uintptr_t pLocal = *(uintptr_t*)ADDR_PLAYER_BASE;
             if (!pLocal) {
@@ -89,8 +90,8 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v113: Memory Diagnostics Edition ---\n");
-    printf("[!] ЗАЙДИ В МИР И НАЖМИ 'END' ДЛЯ ЧТЕНИЯ КОБОЛЬДОВ\n");
+    printf("--- Bot v114: Memory Diagnostics Edition ---\n");
+    printf("[!] ЗАЙДИ В МИР И НАЖМИ 'F5' ДЛЯ ЧТЕНИЯ КОБОЛЬДОВ\n");
 
     uintptr_t deviceAddr = 0;
     while (!(deviceAddr = *(uintptr_t*)ADDR_D3D9_DEVICE)) Sleep(100);
@@ -102,7 +103,7 @@ DWORD WINAPI Setup(LPVOID) {
         oEndScene = (tEndScene)vTable[42];
         vTable[42] = (uintptr_t)HookedEndScene;
         VirtualProtect(&vTable[42], 4, old, &old);
-        printf("[+] Хук графики установлен. Жду нажатия END.\n");
+        printf("[+] Хук графики установлен. Жду нажатия F5.\n");
     }
     return 0;
 }
