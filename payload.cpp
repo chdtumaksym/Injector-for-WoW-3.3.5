@@ -16,8 +16,9 @@
 #define ADDR_LUA_EXECUTE        0x00819210 // Встроенный интерпретатор макросов
 
 // Боевые типы Click-To-Move
-#define CTM_LOOT                6 
-#define CTM_ATTACK              11 
+#define CTM_MOVE                4  // Обычный бег
+#define CTM_INTERACT            5  // Нативный правый клик (идеально для лута)
+#define CTM_ATTACK              11 // Атака в движении
 
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
@@ -152,15 +153,20 @@ void BotPulse() {
             }
         } 
         else if (targetHp <= 0 && (targetFlags & 1)) {
-            // Бежим лутать
-            ActionCTM(pLocal, CTM_LOOT, g_BotTarget, tX, tY, tZ);
-            printf("Looting Corpse... Dist: %.1f        \r", dist);
-            
-            // Если стоим на трупе - собираем вещи
-            if (dist < 5.0f) {
+            // Бежим лутать (используем CTM_MOVE издалека)
+            if (dist > 4.5f) {
+                ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
+                printf("Running to Corpse... Dist: %.1f        \r", dist);
+            } 
+            // Если стоим на трупе - собираем вещи нативно (обходим блок Lua)
+            else {
+                printf("Looting Corpse (Native)... Dist: %.1f  \r", dist);
                 static DWORD lastLoot = 0;
                 if (GetTickCount() - lastLoot > 1500) {
-                    ExecuteLua("InteractUnit('target')");
+                    uint64_t lootGuid = g_BotTarget;
+                    float lootPos[3] = { tX, tY, tZ };
+                    // Шлем команду CTM_INTERACT (5) напрямую в движок!
+                    ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, CTM_INTERACT, &lootGuid, lootPos, 0.5f);
                     lastLoot = GetTickCount();
                 }
             }
@@ -170,7 +176,7 @@ void BotPulse() {
             g_Blacklist.push_back(g_BotTarget);
             g_BotTarget = 0; 
             ExecuteLua("ClearTarget()"); 
-            printf("Target Empty. Blacklisted.          \n");
+            printf("Target Empty. Blacklisted.             \n");
         }
     } 
     // 4. Поиск новой цели
@@ -270,7 +276,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v129: Flawless Logic ---\n");
+    printf("--- Bot v130: Flawless Logic + Native Loot ---\n");
 
     HWND hwnd = FindWindowA(NULL, "World of Warcraft");
     if (!hwnd) {
@@ -285,6 +291,7 @@ DWORD WINAPI Setup(LPVOID) {
     printf("[+] Anti-Dance Logic: INTEGRATED.\n");
     printf("[+] Safe WndProc Main Thread: INTEGRATED.\n");
     printf("[+] Native Lua Server Sync: INTEGRATED.\n");
+    printf("[+] Engine CTM Loot Bypasser: INTEGRATED.\n");
     printf("[!] Focus WoW window and press [INSERT] to start.\n");
     return 0;
 }
