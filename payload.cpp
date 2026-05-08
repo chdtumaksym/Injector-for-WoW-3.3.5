@@ -8,9 +8,9 @@
 #define OFFSET_OBJECT_MANAGER   0x2ED0
 #define ADDR_CLICK_TO_MOVE      0x00611130
 #define ADDR_MOUSEOVER_GUID     0x00BD07A0
+#define ADDR_TARGET_GUID        0x00BD07B8
 #define ADDR_LUA_EXECUTE        0x00819210
 
-// Используем только Move (Тип 4). Никаких Attack или Loot для CTM!
 #define CTM_MOVE                4
 
 #pragma runtime_checks("", off)
@@ -31,16 +31,10 @@ void ExecuteLua(const char* command) {
     ((tLuaExecute)ADDR_LUA_EXECUTE)(command, "bot_core", 0);
 }
 
-// Захват цели через мышь (безопасно для движка)
-void SelectTarget(uint64_t guid) {
-    *(uint64_t*)ADDR_MOUSEOVER_GUID = guid;
-    ExecuteLua("TargetUnit('mouseover')");
-}
-
-// Безопасное передвижение (Без крашей UnitReaction)
+// Транспортный движок - абсолютно безопасен, так как не передает GUID (0)
 void SafeMove(uintptr_t pLocal, float x, float y, float z) {
     if (!pLocal) return;
-    g_ctm.guid = 0; // Для передвижения GUID должен быть 0!
+    g_ctm.guid = 0; 
     g_ctm.pos[0] = x; g_ctm.pos[1] = y; g_ctm.pos[2] = z;
     ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, CTM_MOVE, &g_ctm.guid, g_ctm.pos, 0.5f);
 }
@@ -56,7 +50,7 @@ void BotPulse() {
     uintptr_t pLocal = 0;
     float myX = 0, myY = 0, myZ = 0;
 
-    // Ищем себя
+    // Ищем локального игрока
     uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
     while (cur && (cur & 1) == 0) {
         if (*(uint64_t*)(cur + 0x30) == localGuid) {
@@ -74,6 +68,7 @@ void BotPulse() {
     uint64_t attackGuid = 0; float attackDist = 40.0f; float aPos[3] = {0};
     uint64_t lootGuid = 0;   float lootDist = 15.0f;   float lPos[3] = {0};
 
+    // Поиск целей
     cur = *(uintptr_t*)(mgr + 0xAC);
     while (cur && (cur & 1) == 0) {
         if (*(int*)(cur + 0x14) == 3) { // Unit
@@ -92,7 +87,7 @@ void BotPulse() {
                             attackDist = dist; attackGuid = objGuid;
                             aPos[0] = tX; aPos[1] = tY; aPos[2] = *(float*)(cur + 0x7A0);
                         }
-                    } else if (hp <= 0 && (flags & 1)) {
+                    } else if (hp <= 0 && (flags & 1)) { // Флаг 1 = Lootable
                         if (dist < lootDist) {
                             lootDist = dist; lootGuid = objGuid;
                             lPos[0] = tX; lPos[1] = tY; lPos[2] = *(float*)(cur + 0x7A0);
@@ -105,34 +100,44 @@ void BotPulse() {
     }
 
     static DWORD lastAction = 0;
-    // Тик раз в 500мс
+    // Ограничитель в 500мс
     if (GetTickCount() - lastAction > 500) {
         
         // ПРИОРИТЕТ 1: ЛУТ
         if (lootGuid) {
             if (lootDist > 4.5f) {
-                // Если далеко - просто бежим туда (CTM Type 4)
                 SafeMove(pLocal, lPos[0], lPos[1], lPos[2]);
                 printf("Moving to Loot... Dist: %.1f    \r", lootDist);
             } else {
-                // Если близко - лутаем через безопасный Lua API
-                SelectTarget(lootGuid);
-                ExecuteLua("InteractUnit('target')");
-                printf("Looting!                        \r");
+                // ДВУХСТУПЕНЧАТАЯ ЛОГИКА
+                if (*(uint64_t*)ADDR_TARGET_GUID != lootGuid) {
+                    *(uint64_t*)ADDR_MOUSEOVER_GUID = lootGuid;
+                    ExecuteLua("TargetUnit('mouseover')");
+                    printf("Targeting Loot...               \r");
+                } else {
+                    // Взаимодействуем ТОЛЬКО если ядро подтвердило таргет
+                    ExecuteLua("InteractUnit('target')");
+                    printf("Looting!                        \r");
+                }
             }
             lastAction = GetTickCount();
         } 
         // ПРИОРИТЕТ 2: АТАКА
         else if (attackGuid) {
             if (attackDist > 4.5f) {
-                // Бежим к врагу
                 SafeMove(pLocal, aPos[0], aPos[1], aPos[2]);
                 printf("Moving to Target... Dist: %.1f  \r", attackDist);
             } else {
-                // Бьем врага через Lua
-                SelectTarget(attackGuid);
-                ExecuteLua("AttackTarget()");
-                printf("Attacking!                      \r");
+                // ДВУХСТУПЕНЧАТАЯ ЛОГИКА
+                if (*(uint64_t*)ADDR_TARGET_GUID != attackGuid) {
+                    *(uint64_t*)ADDR_MOUSEOVER_GUID = attackGuid;
+                    ExecuteLua("TargetUnit('mouseover')");
+                    printf("Acquiring Target...             \r");
+                } else {
+                    // Имитация правого клика. Сама начнет атаку. Не крашит игру.
+                    ExecuteLua("InteractUnit('target')");
+                    printf("Attacking!                      \r");
+                }
             }
             lastAction = GetTickCount();
         }
@@ -153,7 +158,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v122: Safe-Mode Taxi Engine ---\n");
+    printf("--- Bot v123: 2-Step Execution Engine ---\n");
 
     HWND hwnd = FindWindowA(NULL, "World of Warcraft");
     if (!hwnd) {
@@ -162,9 +167,9 @@ DWORD WINAPI Setup(LPVOID) {
     }
 
     oWndProc = (WNDPROC)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)HookedWndProc);
-    SetTimer(hwnd, 1337, 500, NULL);
+    SetTimer(hwnd, 1337, 500, NULL); // Таймер на 500мс для защиты от гонок потоков
 
-    printf("[+] Setup Complete. Crash-proof logic activated.\n");
+    printf("[+] Setup Complete. Anti-Crash Delays Activated.\n");
     printf("[+] Focus WoW window and press [INSERT] to start farming.\n");
     return 0;
 }
