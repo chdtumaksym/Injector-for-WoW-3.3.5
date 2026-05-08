@@ -4,41 +4,61 @@
 #include <cstdio>
 #include <clocale>
 #include <stdint.h>
-#include <tlhelp32.h>
+#include <d3d9.h>
 
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "d3d9.lib")
 
 #define OFFSET_S_CUR_MGR         0x00879CE0
 #define OFFSET_OBJECT_MANAGER    0x2ED0
 #define ADDR_TARGET_GUID         0x00BD07B0 
 #define ADDR_CLICK_TO_MOVE       0x00611130
 #define ADDR_GET_PLAYER          0x004038BE
-#define ADDR_PEEK_MESSAGE        0x008A20E0 // Примерный адрес функции, которая часто вызывается в Main Thread (или используем импорт)
+#define ADDR_D3D9_DEVICE         0x00C5DF88
+#define ADDR_LUA_EXECUTE         0x00819210
 
 typedef void(__thiscall* tClickToMove)(uintptr_t playerPtr, int clickType, uint64_t* interactGuid, float* pos, float precision);
 typedef uintptr_t(__cdecl* tGetActivePlayer)();
+typedef HRESULT(__stdcall* tEndScene)(LPDIRECT3DDEVICE9 pDevice);
+typedef void(__cdecl* tFrameScript_Execute)(const char* script, const char* name, void* state);
 
 tClickToMove EngineClickToMove = (tClickToMove)ADDR_CLICK_TO_MOVE;
 tGetActivePlayer GetPlayer = (tGetActivePlayer)ADDR_GET_PLAYER;
+tFrameScript_Execute LuaExecute = (tFrameScript_Execute)ADDR_LUA_EXECUTE;
+tEndScene oEndScene = nullptr;
 
 struct BotCommand {
-    volatile int actionType; // 4: Бег, 11: Атака, 6: Лут
+    volatile int type;
     volatile uint64_t guid;
     volatile float x, y, z;
 } g_Cmd;
 
+// Замена SEH на VirtualQuery для совместимости с кривыми Manual Map инжекторами
+bool IsValidPtr(uintptr_t address) {
+    if (!address) return false;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery((LPCVOID)address, &mbi, sizeof(mbi))) {
+        bool isCommit = (mbi.State == MEM_COMMIT);
+        bool isReadable = (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE));
+        bool isGuarded = (mbi.Protect & PAGE_GUARD) || (mbi.Protect & PAGE_NOACCESS);
+        return isCommit && isReadable && !isGuarded;
+    }
+    return false;
+}
+
 template <typename T>
 T SafeRead(uintptr_t address) {
-    T buffer = T();
-    if (!address) return buffer;
-    __try { buffer = *(T*)address; } __except(1) {}
-    return buffer;
+    if (IsValidPtr(address)) {
+        return *(T*)address;
+    }
+    return T();
 }
 
 template <typename T>
 void SafeWrite(uintptr_t address, T value) {
-    if (!address) return;
-    __try { *(T*)address = value; } __except(1) {}
+    if (IsValidPtr(address)) {
+        *(T*)address = value;
+    }
 }
 
 void SetConsoleCursor(int x, int y) {
@@ -46,120 +66,70 @@ void SetConsoleCursor(int x, int y) {
     SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), c);
 }
 
-// Глобальные переменные для HWBP
-PVOID g_VehHandle = nullptr;
-DWORD g_MainThreadId = 0;
-uintptr_t g_HookAddress = 0;
-
-// Обработчик исключений (VEH)
-LONG WINAPI ExceptionHandler(EXCEPTION_POINTERS* ExceptionInfo) {
-    // Проверяем, что это исключение от нашей аппаратной точки останова
-    if (ExceptionInfo->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {
-        if ((uintptr_t)ExceptionInfo->ExceptionRecord->ExceptionAddress == g_HookAddress) {
-            
-            int currentAction = g_Cmd.actionType;
-            if (currentAction != 0) {
-                uintptr_t pLocal = GetPlayer();
-                if (pLocal && SafeRead<int>(pLocal + 0x14) == 4) {
-                    __try {
-                        float pos[3] = { g_Cmd.x, g_Cmd.y, g_Cmd.z };
-                        EngineClickToMove(pLocal, currentAction, (uint64_t*)&g_Cmd.guid, pos, 0.5f);
-                    } __except(1) {}
-                }
-                g_Cmd.actionType = 0;
+HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
+    int cmd = g_Cmd.type;
+    if (cmd != 0) {
+        uintptr_t pLocal = GetPlayer();
+        if (pLocal && SafeRead<int>(pLocal + 0x14) == 4) {
+            if (cmd == 1) {
+                float pos[3] = { g_Cmd.x, g_Cmd.y, g_Cmd.z };
+                EngineClickToMove(pLocal, 4, (uint64_t*)&g_Cmd.guid, pos, 0.5f);
+            } 
+            else if (cmd == 2) {
+                LuaExecute("InteractUnit('target')", "InternalBot", NULL);
             }
-
-            // Возобновляем выполнение, сбрасывая флаг Resume
-            ExceptionInfo->ContextRecord->EFlags |= (1 << 16); 
-            return EXCEPTION_CONTINUE_EXECUTION;
         }
+        g_Cmd.type = 0;
     }
-    return EXCEPTION_CONTINUE_SEARCH;
+    return oEndScene(pDevice);
 }
 
-DWORD GetMainThreadId(DWORD processId) {
-    HANDLE hThreadSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (hThreadSnap == INVALID_HANDLE_VALUE) return 0;
-    THREADENTRY32 te32;
-    te32.dwSize = sizeof(THREADENTRY32);
-    if (!Thread32First(hThreadSnap, &te32)) { CloseHandle(hThreadSnap); return 0; }
-    DWORD mainThreadId = 0;
-    ULONGLONG minCreateTime = 0xFFFFFFFFFFFFFFFF;
-    do {
-        if (te32.th32OwnerProcessID == processId) {
-            HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te32.th32ThreadID);
-            if (hThread) {
-                FILETIME creationTime, exitTime, kernelTime, userTime;
-                if (GetThreadTimes(hThread, &creationTime, &exitTime, &kernelTime, &userTime)) {
-                    ULONGLONG currentTime = ((ULONGLONG)creationTime.dwHighDateTime << 32) | creationTime.dwLowDateTime;
-                    if (currentTime < minCreateTime) {
-                        minCreateTime = currentTime;
-                        mainThreadId = te32.th32ThreadID;
-                    }
-                }
-                CloseHandle(hThread);
-            }
-        }
-    } while (Thread32Next(hThreadSnap, &te32));
-    CloseHandle(hThreadSnap);
-    return mainThreadId;
-}
-
-bool InstallHWBP() {
-    HMODULE hUser32 = GetModuleHandleA("USER32.dll");
-    if (!hUser32) return false;
-    g_HookAddress = (uintptr_t)GetProcAddress(hUser32, "PeekMessageA");
-    if (!g_HookAddress) return false;
-
-    g_VehHandle = AddVectoredExceptionHandler(1, ExceptionHandler);
-    if (!g_VehHandle) return false;
-
-    g_MainThreadId = GetMainThreadId(GetCurrentProcessId());
-    if (!g_MainThreadId) return false;
-
-    HANDLE hThread = OpenThread(THREAD_SET_CONTEXT | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, g_MainThreadId);
-    if (!hThread) return false;
-
-    SuspendThread(hThread);
-    CONTEXT ctx = { 0 };
-    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    GetThreadContext(hThread, &ctx);
+bool InstallDXHook() {
+    uintptr_t* pDevicePtr = (uintptr_t*)ADDR_D3D9_DEVICE;
+    if (!IsValidPtr((uintptr_t)pDevicePtr) || !*pDevicePtr) return false;
     
-    // Записываем адрес в DR0 и активируем его на выполнение (DR7)
-    ctx.Dr0 = g_HookAddress;
-    ctx.Dr7 |= 1; // Локальное включение DR0
-    ctx.Dr7 &= ~(0xF0000); // Очистка условий для DR0 (Выполнение)
-    
-    SetThreadContext(hThread, &ctx);
-    ResumeThread(hThread);
-    CloseHandle(hThread);
+    uintptr_t* vTable = *(uintptr_t**)*pDevicePtr;
+    if (!IsValidPtr((uintptr_t)vTable)) return false;
+
+    oEndScene = (tEndScene)vTable[42];
+    DWORD oldProtect;
+    VirtualProtect(&vTable[42], sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &oldProtect);
+    vTable[42] = (uintptr_t)HookedEndScene;
+    VirtualProtect(&vTable[42], sizeof(uintptr_t), oldProtect, &oldProtect);
     return true;
 }
 
-void SendCTMCommand(int actionType, uint64_t guid, float x, float y, float z) {
-    g_Cmd.guid = guid; g_Cmd.x = x; g_Cmd.y = y; g_Cmd.z = z; g_Cmd.actionType = actionType;
-    for (int i = 0; i < 50 && g_Cmd.actionType != 0; i++) Sleep(5);
+void SendActionAndWait(int type, uint64_t guid = 0, float x = 0, float y = 0, float z = 0) {
+    g_Cmd.guid = guid; g_Cmd.x = x; g_Cmd.y = y; g_Cmd.z = z; g_Cmd.type = type;
+    for (int i = 0; i < 50 && g_Cmd.type != 0; i++) Sleep(5);
 }
 
-DWORD WINAPI BotLogicThread(LPVOID lpParam) {
+DWORD WINAPI MainThread(LPVOID lpParam) {
     setlocale(LC_ALL, "Russian");
     AllocConsole();
     FILE* f; freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Paladin HWBP Stealth Internal v44.0 ---\n");
-    if (InstallHWBP()) printf("[+] Аппаратный хук (HWBP) установлен на DR0. Память чиста.\n");
-    else { printf("[-] ОШИБКА: Не удалось установить дебаг-регистры.\n"); return 0; }
+    printf("--- Paladin DX9 VirtualQuery Edition v46.0 ---\n");
+    printf("[+] Полный отказ от SEH. Защита от крашей Manual Map.\n");
+    
+    while (!IsValidPtr(ADDR_D3D9_DEVICE) || SafeRead<uintptr_t>(ADDR_D3D9_DEVICE) == 0) {
+        Sleep(100);
+    }
+    
+    if (InstallDXHook()) printf("[+] EndScene хук: ОК. Контекст потока идеален.\n");
+    else { printf("[-] ОШИБКА: D3D9 Hook провален.\n"); return 0; }
+    printf("[!] ВКЛЮЧИ АВТОСБОР (Auto Loot) В НАСТРОЙКАХ ИГРЫ!\n");
     printf("--------------------------------------------------\n");
 
     uintptr_t connAddr = (uintptr_t)GetModuleHandleA(NULL) + OFFSET_S_CUR_MGR;
     int state = 0; 
     uint64_t activeGuid = 0;
-    DWORD lastActionTime = 0;
+    DWORD lastCombatTick = 0;
 
     while (!GetAsyncKeyState(VK_END)) {
         uintptr_t conn = SafeRead<uintptr_t>(connAddr);
-        SetConsoleCursor(0, 4);
-        if (!conn) { printf("[!] Ожидание подключения к миру... \n"); Sleep(500); continue; }
+        SetConsoleCursor(0, 6);
+        if (!conn) { printf("[!] Ожидание загрузки мира...                  \n"); Sleep(500); continue; }
 
         uintptr_t mgr = SafeRead<uintptr_t>(conn + OFFSET_OBJECT_MANAGER);
         if (mgr) {
@@ -206,52 +176,39 @@ DWORD WINAPI BotLogicThread(LPVOID lpParam) {
                     if (tObj) {
                         int thp = SafeRead<int>(SafeRead<uintptr_t>(tObj + 0x8) + 0x60);
                         float tx = SafeRead<float>(tObj + 0x798), ty = SafeRead<float>(tObj + 0x79C), tz = SafeRead<float>(tObj + 0x7A0);
-                        float dist = sqrt(pow(tx-myX, 2) + pow(ty-myY, 2));
+                        float dx = tx - myX, dy = ty - myY;
+                        float dist = sqrt(dx*dx + dy*dy);
 
                         if (thp > 0) {
+                            SafeWrite<float>(pLocal + 0x7A8, atan2(dy, dx) < 0 ? atan2(dy, dx) + 6.283185f : atan2(dy, dx));
                             if (dist > 4.5f) { 
-                                state = 1; 
-                                SendCTMCommand(4, activeGuid, tx, ty, tz); 
+                                state = 1; SendActionAndWait(1, activeGuid, tx, ty, tz); 
                             } else { 
                                 state = 2; 
-                                if (GetTickCount() - lastActionTime > 1500) {
-                                    SendCTMCommand(11, activeGuid, tx, ty, tz); 
-                                    lastActionTime = GetTickCount();
+                                if (GetTickCount() - lastCombatTick > 2000) {
+                                    SendActionAndWait(2); 
+                                    lastCombatTick = GetTickCount();
                                 }
                             }
                         } else {
                             state = 3; 
-                            printf("[ЛОГ] Отправка CTM команды на лут из VEH... \n");
-                            Sleep(1000);
-                            SendCTMCommand(6, activeGuid, tx, ty, tz); 
-                            Sleep(2000); 
+                            printf("[ЛОГ] Цель убита. Лутаем через Lua...           \n");
+                            Sleep(1000); SendActionAndWait(2); Sleep(2000); 
+                            SafeWrite<uint64_t>(pDesc + 0x48, 0); SafeWrite<uint64_t>(ADDR_TARGET_GUID, 0);
                             activeGuid = 0; state = 0;
                         }
                     } else { activeGuid = 0; state = 0; }
                 }
-                const char* sNames[] = { "ПОИСК", "ПРОГРАММНЫЙ БЕГ", "ПРОГРАММНАЯ АТАКА", "ПРОГРАММНЫЙ ЛУТ" };
-                printf("[СТАТУС] Текущее действие: %-15s \n", sNames[state]);
+                const char* sNames[] = { "ПОИСК ЦЕЛИ", "БЕГ (ПРОГРАММНЫЙ)", "АТАКА (LUA)", "СБОР ЛУТА (LUA)" };
+                printf("[СТАТУС] %-25s \n", sNames[state]);
             }
         }
         Sleep(100);
     }
-
-    if (g_MainThreadId) {
-        HANDLE hThread = OpenThread(THREAD_SET_CONTEXT | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, g_MainThreadId);
-        if (hThread) {
-            SuspendThread(hThread);
-            CONTEXT ctx = { 0 }; ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-            GetThreadContext(hThread, &ctx);
-            ctx.Dr0 = 0; ctx.Dr7 &= ~1;
-            SetThreadContext(hThread, &ctx);
-            ResumeThread(hThread); CloseHandle(hThread);
-        }
-    }
-    if (g_VehHandle) RemoveVectoredExceptionHandler(g_VehHandle);
     fclose(f); FreeConsole(); FreeLibraryAndExitThread((HMODULE)lpParam, 0); return 0;
 }
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID res) {
-    if (r == DLL_PROCESS_ATTACH) { DisableThreadLibraryCalls(h); CreateThread(0,0,BotLogicThread,h,0,0); }
+    if (r == DLL_PROCESS_ATTACH) { DisableThreadLibraryCalls(h); CreateThread(0,0,MainThread,h,0,0); }
     return TRUE;
 }
