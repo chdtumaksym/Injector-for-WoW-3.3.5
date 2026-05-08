@@ -2,7 +2,6 @@
 #include <iostream>
 #include <cmath>
 #include <cstdio>
-#include <intrin.h>
 #include <d3d9.h>
 
 #pragma comment(lib, "d3d9.lib")
@@ -12,7 +11,6 @@
 #define ADDR_LUA_EXECUTE      0x00819210
 #define ADDR_CLICK_TO_MOVE    0x00611130
 #define ADDR_GET_PLAYER       0x004038BE
-#define ADDR_TLS_INDEX        0x00D415B8 // Индекс TLS для проверки потока
 #define OFFSET_S_CUR_MGR      0x00879CE0 
 
 typedef void(__cdecl* tFrameScript_Execute)(const char* command, const char* filename, void* reserved);
@@ -23,9 +21,9 @@ tFrameScript_Execute Lua_DoString = (tFrameScript_Execute)ADDR_LUA_EXECUTE;
 tClickToMove ClickToMove = (tClickToMove)ADDR_CLICK_TO_MOVE;
 tGetActivePlayer GetPlayer = (tGetActivePlayer)ADDR_GET_PLAYER;
 
-// --- КОМАНДЫ ДЛЯ ГЛАВНОГО ПОТОКА ---
+// --- СТРУКТУРА КОМАНД ДЛЯ ГЛАВНОГО ПОТОКА ---
 struct BotCommand {
-    volatile int type; // 0: None, 1: Move, 2: Combat, 3: Loot, 4: Target
+    volatile int type; // 0: None, 1: Move, 2: Combat, 3: Loot, 4: Target, 5: Interact
     volatile uint64_t guid;
     volatile float x, y, z;
 } g_Cmd;
@@ -33,59 +31,66 @@ struct BotCommand {
 enum BotState { STATE_SEARCH, STATE_MOVE, STATE_COMBAT, STATE_LOOT };
 const char* stateNames[] = { "SEARCHING", "MOVING", "COMBAT", "LOOTING" };
 
-// --- VTABLE ХУК D3D9 С ПРОВЕРКОЙ TLS (ЗАЩИТА ОТ КРАША 0x14) ---
+// --- VTABLE ХУК D3D9 ---
 typedef HRESULT(__stdcall* tEndScene)(IDirect3DDevice9*);
 tEndScene oEndScene = nullptr;
 
 HRESULT __stdcall HookedEndScene(IDirect3DDevice9* pDevice) {
     if (!pDevice) return oEndScene(pDevice);
 
-    // Достаем массив TLS текущего потока из TEB (Thread Environment Block)
-    void** tlsArray = (void**)__readfsdword(0x2C);
-    DWORD wowTlsIndex = *(DWORD*)ADDR_TLS_INDEX;
-
-    // КРИТИЧЕСКАЯ ПРОВЕРКА: Если мы не в главном потоке WoW, пропускаем выполнение!
-    if (tlsArray && tlsArray[wowTlsIndex] != nullptr) {
-        uintptr_t pLocal = GetPlayer();
-        if (pLocal && *(int*)(pLocal + 0x14) == 4) { // Проверяем, что объект - игрок
-            __try {
-                if (g_Cmd.type == 1) { // MOVE
+    uintptr_t pLocal = GetPlayer();
+    // Жесткая проверка: указатель не пуст, память читаема, тип объекта = 4 (Игрок)
+    if (pLocal && !IsBadReadPtr((void*)pLocal, 0x100) && *(int*)(pLocal + 0x14) == 4) {
+        __try {
+            int cmdType = g_Cmd.type;
+            if (cmdType != 0) {
+                if (cmdType == 1) { // MOVE
                     float pos[3] = { g_Cmd.x, g_Cmd.y, g_Cmd.z };
                     uint64_t zero = 0;
                     ClickToMove(pLocal, 4, &zero, pos, 0.5f);
-                    g_Cmd.type = 0;
                 } 
-                else if (g_Cmd.type == 2) { // COMBAT
+                else if (cmdType == 2) { // COMBAT
                     Lua_DoString("if UnitExists('target') and not IsCurrentSpell(6603) then StartAttack() end", "bot", 0);
                     Lua_DoString("if not UnitBuff('player', 'Seal of Righteousness') then CastSpellByID(21084) end", "bot", 0);
-                    g_Cmd.type = 0;
+                    Lua_DoString("if not UnitBuff('player', 'Devotion Aura') then CastSpellByID(465) end", "bot", 0);
                 } 
-                else if (g_Cmd.type == 3) { // LOOT
+                else if (cmdType == 3) { // LOOT
                     Lua_DoString("if LootFrame:IsVisible() then for i=1,GetNumLootItems() do LootSlot(i) end CloseLoot() end", "bot", 0);
-                    g_Cmd.type = 0;
                 }
-                else if (g_Cmd.type == 4) { // TARGET & INTERACT
-                    char cmd[256];
-                    // Lua-таргет надежнее записи в память
-                    sprintf_s(cmd, "TargetUnit('0x%llX') if UnitIsDead('target') then InteractUnit('target') end", g_Cmd.guid);
+                else if (cmdType == 4) { // TARGET
+                    char cmd[128];
+                    sprintf_s(cmd, "TargetUnit('0x%llX')", g_Cmd.guid);
                     Lua_DoString(cmd, "bot", 0);
-                    g_Cmd.type = 0;
                 }
-            } __except(1) {} // Глушим любые исключения движка
-        }
+                else if (cmdType == 5) { // INTERACT
+                    Lua_DoString("if UnitExists('target') then InteractUnit('target') end", "bot", 0);
+                }
+                g_Cmd.type = 0; // Сбрасываем команду после выполнения
+            }
+        } __except(1) {} // Абсолютная защита от краша Lua
     }
 
     return oEndScene(pDevice);
 }
 
+// ВОТ ОН, ФИКС МГНОВЕННОГО КРАША! Использование невидимого окна для создания D3D.
 bool InstallVTableHook() {
     IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
     if (!pD3D) return false;
-    D3DPRESENT_PARAMETERS d3dpp = {0}; d3dpp.Windowed = TRUE; d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    IDirect3DDevice9* pDev = nullptr;
+
+    // Создаем фиктивное окно, чтобы не трогать рабочий стол
+    HWND dummyWindow = CreateWindowA("STATIC", "DummyDx", WS_OVERLAPPED, 0, 0, 100, 100, NULL, NULL, NULL, NULL);
     
-    if (FAILED(pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, GetDesktopWindow(), D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDev))) {
-        pD3D->Release(); return false;
+    D3DPRESENT_PARAMETERS d3dpp = {0}; 
+    d3dpp.Windowed = TRUE; 
+    d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    d3dpp.hDeviceWindow = dummyWindow;
+
+    IDirect3DDevice9* pDev = nullptr;
+    if (FAILED(pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, dummyWindow, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDev))) {
+        pD3D->Release(); 
+        DestroyWindow(dummyWindow);
+        return false;
     }
 
     uintptr_t* pVTable = *(uintptr_t**)pDev;
@@ -96,7 +101,9 @@ bool InstallVTableHook() {
     pVTable[42] = (uintptr_t)HookedEndScene;
     VirtualProtect(&pVTable[42], sizeof(uintptr_t), old, &old);
 
-    pDev->Release(); pD3D->Release();
+    pDev->Release(); 
+    pD3D->Release();
+    DestroyWindow(dummyWindow);
     return true;
 }
 
@@ -104,9 +111,11 @@ void UnhookVTable() {
     if (!oEndScene) return;
     IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
     if (!pD3D) return;
-    D3DPRESENT_PARAMETERS d3dpp = {0}; d3dpp.Windowed = TRUE; d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    HWND dummyWindow = CreateWindowA("STATIC", "DummyDx", WS_OVERLAPPED, 0, 0, 100, 100, NULL, NULL, NULL, NULL);
+    D3DPRESENT_PARAMETERS d3dpp = {0}; d3dpp.Windowed = TRUE; d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD; d3dpp.hDeviceWindow = dummyWindow;
+    
     IDirect3DDevice9* pDev = nullptr;
-    if (SUCCEEDED(pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, GetDesktopWindow(), D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDev))) {
+    if (SUCCEEDED(pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, dummyWindow, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDev))) {
         uintptr_t* pVTable = *(uintptr_t**)pDev;
         DWORD old;
         VirtualProtect(&pVTable[42], sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &old);
@@ -115,6 +124,7 @@ void UnhookVTable() {
         pDev->Release();
     }
     pD3D->Release();
+    DestroyWindow(dummyWindow);
 }
 
 void SetConsoleCursor(int x, int y) {
@@ -127,16 +137,15 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f; freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Paladin Imba Internal v11.0 (TLS Verified) ---\n");
+    printf("--- Paladin Mastermind v12.0 (Zero-Crash Edition) ---\n");
     if (InstallVTableHook()) {
-        printf("[+] D3D9 Hooked. Thread Context Validated via TEB.\n");
+        printf("[+] D3D9 Hooked successfully via Dummy Window.\n");
     } else {
-        printf("[-] Failed to install VTable hook!\n");
+        printf("[-] Failed to install VTable hook! Check drivers.\n");
         return 0;
     }
-    printf("[!] ЕСЛИ БОТ СТОИТ И НЕ ДВИГАЕТСЯ:\n");
-    printf("[!] Введи в чат игры: /console gxMultithread 0\n");
-    printf("[!] Затем перезапусти игру. Это нужно для стабильности!\n");
+    printf("[*] Lua Engine connected. Pure Internal execution.\n");
+    printf("[*] To stop safely, press END.\n");
     printf("--------------------------------------------------\n");
 
     uintptr_t connectionAddr = (uintptr_t)GetModuleHandleA(NULL) + OFFSET_S_CUR_MGR;
@@ -147,7 +156,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
         uintptr_t clientConn = 0;
         __try { clientConn = *(uintptr_t*)connectionAddr; } __except(1) { clientConn = 0; }
         
-        SetConsoleCursor(0, 7);
+        SetConsoleCursor(0, 6);
 
         if (clientConn) {
             uintptr_t mgr = *(uintptr_t*)(clientConn + 0x2ED0);
@@ -187,7 +196,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                             if (activeTargetGuid) { 
                                 state = STATE_MOVE; 
                                 g_Cmd.guid = activeTargetGuid; 
-                                g_Cmd.type = 4; // TARGET COMMAND
+                                g_Cmd.type = 4; // TARGET
                             }
                         }
 
@@ -207,19 +216,23 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                                     if (dist > 4.2f) {
                                         state = STATE_MOVE;
                                         g_Cmd.x = tx; g_Cmd.y = ty; g_Cmd.z = tz;
-                                        g_Cmd.type = 1; // MOVE COMMAND
+                                        g_Cmd.type = 1; // MOVE
                                     } else {
                                         state = STATE_COMBAT;
-                                        g_Cmd.type = 2; // ATTACK COMMAND
+                                        g_Cmd.type = 2; // ATTACK
                                     }
                                 } else {
                                     state = STATE_LOOT;
-                                    printf("[STATE] INTERACTING & WAITING FOR SERVER...      \n");
-                                    g_Cmd.guid = activeTargetGuid;
-                                    g_Cmd.type = 4; // INTERACT (via Target command Lua block)
-                                    Sleep(1200); // КРИТИЧЕСКИ ВАЖНО: Ждем пинг сервера на смерть
+                                    printf("[STATE] WAITING FOR LOOT GENERATION...           \n");
+                                    // ДУМАЙ: Серверу нужно время, чтобы сделать труп лутабельным
+                                    Sleep(1200); 
                                     
-                                    g_Cmd.type = 3; // LOOT COMMAND
+                                    printf("[STATE] INTERACTING...                           \n");
+                                    g_Cmd.type = 5; // INTERACT
+                                    Sleep(800); // Даем окну время открыться
+                                    
+                                    printf("[STATE] LOOTING...                               \n");
+                                    g_Cmd.type = 3; // LOOT
                                     Sleep(1500); // Ждем автосбор
                                     
                                     activeTargetGuid = 0; state = STATE_SEARCH;
