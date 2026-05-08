@@ -1,85 +1,112 @@
 #include <windows.h>
 #include <d3d9.h>
-#include <cstdint>
-#include "MinHook.h" // Обязательно скачай и подключи
+#include <vector>
+#include <cmath>
 
-// Струкутра вектора для координат
+// Структуры
 struct Vector3 { float x, y, z; };
 
-// Прототипы функций WoW 3.3.5a (12340)
+// Оффсеты WoW 3.3.5a (12340)
+#define ADDR_CUR_MGR 0x00CB2418
+#define ADDR_CLMT 0x00611130
+#define OFF_MGR_LOCAL_GUID 0xC0
+#define OFF_MGR_FIRST_OBJ 0xAC
+#define OFF_OBJ_NEXT 0x3C
+#define OFF_OBJ_GUID 0x30
+#define OFF_OBJ_TYPE 0x14
+#define OFF_UNIT_POS 0x7D8
+
+// Прототипы функций игры
 typedef void(__thiscall* tClickToMove)(uintptr_t playerPtr, uint32_t clickType, uint64_t* targetGuid, Vector3* pos, float precision);
-tClickToMove ClickToMove = (tClickToMove)0x00611130;
+tClickToMove ClickToMove = (tClickToMove)ADDR_CLMT;
 
-// Указатель на игрока (Local Player)
-uintptr_t GetPlayerPtr() {
-    uintptr_t s_curMgr = *(uintptr_t*)0x00CB2418; // Статический адрес CurMgr
-    if (!s_curMgr) return 0;
-    return *(uintptr_t*)(s_curMgr + 0x34); // Оффсет локального игрока
-}
-
-// Оригинальная функция EndScene (для вызова после нашего кода)
+// Для VMT Хука
 typedef HRESULT(STDMETHODCALLTYPE* tEndScene)(LPDIRECT3DDEVICE9 pDevice);
 tEndScene oEndScene = nullptr;
+uintptr_t* vtable = nullptr;
 
-// Наша функция-хук, которая будет работать ВНУТРИ цикла игры
-HRESULT STDMETHODCALLTYPE hkEndScene(LPDIRECT3DDEVICE9 pDevice) {
-    static bool botActive = true; 
+// Получение указателя на игрока
+uintptr_t GetPlayerPtr() {
+    uintptr_t s_curMgr = *(uintptr_t*)ADDR_CUR_MGR;
+    if (!s_curMgr) return 0;
+    uint64_t localGuid = *(uint64_t*)(s_curMgr + OFF_MGR_LOCAL_GUID);
+    uintptr_t currentObj = *(uintptr_t*)(s_curMgr + OFF_MGR_FIRST_OBJ);
 
-    if (botActive) {
-        uintptr_t playerPtr = GetPlayerPtr();
-        if (playerPtr) {
-            // ПРИМЕР: Бежим в определенную точку (координаты для теста)
-            // В реальном боте здесь будет выбор цели из ObjectManager
-            Vector3 targetPos = { 100.0f, 150.0f, 50.0f }; 
-            uint64_t targetGuid = 0;
-
-            // Вызываем CTM (4 - движение, 6 - взаимодействие)
-            // Это безопасно, так как мы в главном потоке (EndScene)
-            // ClickToMove(playerPtr, 4, &targetGuid, &targetPos, 0.5f);
-        }
+    while (currentObj && (currentObj & 1) == 0) {
+        if (*(uint64_t*)(currentObj + OFF_OBJ_GUID) == localGuid) return currentObj;
+        currentObj = *(uintptr_t*)(currentObj + OFF_OBJ_NEXT);
     }
-
-    return oEndScene(pDevice); // Обязательно возвращаем управление игре
+    return 0;
 }
 
-// Поток инициализации хука
-DWORD WINAPI InitHook(LPVOID lpParam) {
-    // Ждем инициализации d3d9.dll в игре
-    while (GetModuleHandleA("d3d9.dll") == NULL) Sleep(100);
+// Главная логика
+void RunBotLogic() {
+    uintptr_t playerBase = GetPlayerPtr();
+    if (!playerBase) return;
 
-    // Инициализация MinHook
-    if (MH_Initialize() != MH_OK) return 1;
+    uintptr_t s_curMgr = *(uintptr_t*)ADDR_CUR_MGR;
+    uintptr_t currentObj = *(uintptr_t*)(s_curMgr + OFF_MGR_FIRST_OBJ);
 
-    // Находим адрес EndScene (через создание временного девайса или поиск паттерна)
-    // Для 3.3.5а можно использовать смещение от vtable
-    // Ниже — упрощенный пример получения адреса через фиктивный девайс
-    IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
-    if (!pD3D) return 1;
+    uintptr_t bestTarget = 0;
+    float minDist = 9999.0f;
+    Vector3 myPos = *(Vector3*)(playerBase + OFF_UNIT_POS);
 
-    D3DPRESENT_PARAMETERS d3dpp = { 0 };
-    d3dpp.Windowed = TRUE;
-    d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    while (currentObj && (currentObj & 1) == 0) {
+        int type = *(int*)(currentObj + OFF_OBJ_TYPE);
+        uint64_t guid = *(uint64_t*)(currentObj + OFF_OBJ_GUID);
 
-    IDirect3DDevice9* pDummyDevice = NULL;
-    if (pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, GetDesktopWindow(), D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDummyDevice) == S_OK) {
-        uintptr_t* vtable = *(uintptr_t**)pDummyDevice;
-        uintptr_t endSceneAddr = vtable[42]; // 42 - индекс EndScene в DX9
+        if (type == 3 && guid != *(uint64_t*)(playerBase + OFF_OBJ_GUID)) {
+            Vector3 objPos = *(Vector3*)(currentObj + OFF_UNIT_POS);
+            float dist = sqrt(pow(objPos.x - myPos.x, 2) + pow(objPos.y - myPos.y, 2));
 
-        // Ставим хук
-        MH_CreateHook((LPVOID)endSceneAddr, &hkEndScene, (LPVOID*)&oEndScene);
-        MH_EnableHook((LPVOID)endSceneAddr);
-
-        pDummyDevice->Release();
+            if (dist < minDist) {
+                minDist = dist;
+                bestTarget = currentObj;
+            }
+        }
+        currentObj = *(uintptr_t*)(currentObj + OFF_OBJ_NEXT);
     }
-    pD3D->Release();
+
+    if (bestTarget && minDist < 40.0f) {
+        uint64_t targetGuid = *(uint64_t*)(bestTarget + OFF_OBJ_GUID);
+        Vector3 targetPos = *(Vector3*)(bestTarget + OFF_UNIT_POS);
+        ClickToMove(playerBase, 6, &targetGuid, &targetPos, 2.0f);
+    }
+}
+
+// Наш хук
+HRESULT STDMETHODCALLTYPE hkEndScene(LPDIRECT3DDEVICE9 pDevice) {
+    RunBotLogic();
+    return oEndScene(pDevice);
+}
+
+// Инициализация VMT хука (Безопаснее для Warden)
+DWORD WINAPI MainThread(LPVOID lpParam) {
+    while (!GetModuleHandleA("d3d9.dll")) Sleep(100);
+
+    // Ищем девайс в памяти игры (чтобы не создавать свой)
+    // В WoW 3.3.5 адрес устройства DX9 лежит тут:
+    uintptr_t d3d9_device_ptr = *(uintptr_t*)0x00C5DF88; 
+    while (!d3d9_device_ptr) {
+        d3d9_device_ptr = *(uintptr_t*)0x00C5DF88;
+        Sleep(100);
+    }
+
+    vtable = *(uintptr_t**)d3d9_device_ptr;
+    oEndScene = (tEndScene)vtable[42]; // 42 - индекс EndScene
+
+    // Подменяем адрес в таблице (VMT Hook)
+    DWORD oldProtect;
+    VirtualProtect(&vtable[42], sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &oldProtect);
+    vtable[42] = (uintptr_t)hkEndScene;
+    VirtualProtect(&vtable[42], sizeof(uintptr_t), oldProtect, &oldProtect);
 
     return 0;
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
-    if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
-        // Создаем поток для инициализации, чтобы не вешать DllMain
-        CreateThread(NULL, 0, InitHook, NULL, 0, NULL);
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        CreateThread(0, 0, MainThread, 0, 0, 0);
     }
     return TRUE;
 }
