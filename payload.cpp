@@ -5,14 +5,14 @@
 #include <vector>
 #include <algorithm>
 
-// --- ПРАВИЛЬНЫЕ АДРЕСА 3.3.5a (12340) ---
 #define ADDR_S_CUR_MGR          0x00C79CE0
 #define OFFSET_OBJECT_MANAGER   0x2ED0
 #define ADDR_CLICK_TO_MOVE      0x00727400 
 #define ADDR_TARGET_GUID        0x00BD07B8 
 
+// Используем тип "Взаимодействие" (как клик правой кнопкой мыши)
+// Движок игры сам поймет: враг -> бить, труп -> лутать.
 #define CTM_INTERACT            5  
-#define CTM_ATTACK              11 
 
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
@@ -25,23 +25,30 @@ WNDPROC oWndProc = nullptr;
 std::vector<uint64_t> g_Blacklist; 
 
 uint64_t g_BotTarget = 0; 
-uint64_t g_LastCTMGuid = 0; // Глобальная память для защиты от спама
-int g_LastCTMType = 0;
 
 float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) {
     return sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2) + pow(z2 - z1, 2));
 }
 
-// Теперь бот отдает приказ ТОЛЬКО ОДИН РАЗ, чтобы не прерывать анимацию замаха!
+// Умный авто-преследователь
 void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, float z) {
-    if (guid != g_LastCTMGuid || type != g_LastCTMType) {
+    static uint64_t lastGuid = 0;
+    static int lastType = 0;
+    static float lastX = 0, lastY = 0, lastZ = 0;
+
+    // Считаем, насколько сдвинулся моб с нашего прошлого приказа
+    float diff = sqrt(pow(x - lastX, 2) + pow(y - lastY, 2) + pow(z - lastZ, 2));
+
+    // Обновляем маршрут ТОЛЬКО если сменилась цель, тип действия, или моб отбежал > 2 метров
+    if (guid != lastGuid || type != lastType || diff > 2.0f) {
         uint64_t ctmGuid = guid;
         float ctmPos[3] = { x, y, z };
         
         ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, type, &ctmGuid, ctmPos, 0.5f);
         
-        g_LastCTMGuid = guid;
-        g_LastCTMType = type;
+        lastGuid = guid;
+        lastType = type;
+        lastX = x; lastY = y; lastZ = z;
     }
 }
 
@@ -96,27 +103,24 @@ void BotPulse() {
     }
 
     if (hasTarget) {
-        // [!] ЖЕСТКАЯ ЗАПИСЬ ТАРГЕТА В ИГРУ[!]
-        *(uint64_t*)ADDR_TARGET_GUID = g_BotTarget; // Для интерфейса (портрет)
+        // Прописываем таргет в интерфейс игры
+        *(uint64_t*)ADDR_TARGET_GUID = g_BotTarget; 
         uintptr_t pDesc = *(uintptr_t*)(pLocal + 0x8);
-        if (pDesc) {
-            *(uint64_t*)(pDesc + 0x48) = g_BotTarget; // Для внутреннего состояния перса (важно для автоатаки)
-        }
+        if (pDesc) *(uint64_t*)(pDesc + 0x48) = g_BotTarget; 
 
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
 
         if (targetHp > 0) {
-            // Игра сама добежит и будет бить (команда отдастся 1 раз)
-            ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
+            // Эмуляция клика правой кнопкой по врагу (бежит и бьет)
+            ActionCTM(pLocal, CTM_INTERACT, g_BotTarget, tX, tY, tZ);
             printf("Attacking Target... Dist: %.1f      \r", dist);
         } 
         else if (targetHp <= 0 && (targetFlags & 1)) {
-            // Сбор лута
+            // Эмуляция клика правой кнопкой по трупу (бежит и лутает)
             ActionCTM(pLocal, CTM_INTERACT, g_BotTarget, tX, tY, tZ);
             printf("Looting Corpse... Dist: %.1f        \r", dist);
         } 
         else {
-            // Труп облутан - сброс
             g_Blacklist.push_back(g_BotTarget);
             g_BotTarget = 0; 
             *(uint64_t*)ADDR_TARGET_GUID = 0; 
@@ -177,27 +181,9 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
                 g_Active = !g_Active;
                 Beep(g_Active ? 800 : 400, 100);
                 printf("\n[!] BOT STATUS: %s                                \n", g_Active ? "ACTIVE" : "PAUSED");
-                
-                // Полный сброс состояний при паузе
                 if (!g_Active) { 
                     g_BotTarget = 0; 
                     *(uint64_t*)ADDR_TARGET_GUID = 0; 
-                    uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
-                    uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
-                    if (mgr) {
-                        uint64_t localGuid = *(uint64_t*)(mgr + 0xC0);
-                        uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
-                        while (cur && (cur & 1) == 0) {
-                            if (*(uint64_t*)(cur + 0x30) == localGuid) {
-                                uintptr_t pDesc = *(uintptr_t*)(cur + 0x8);
-                                if (pDesc) *(uint64_t*)(pDesc + 0x48) = 0;
-                                break;
-                            }
-                            cur = *(uintptr_t*)(cur + 0x3C);
-                        }
-                    }
-                    g_LastCTMGuid = 0; 
-                    g_LastCTMType = 0;
                     g_Blacklist.clear(); 
                 }
             }
@@ -222,7 +208,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v10.0: Swing Timer Fixed (No more dancing) ---\n");
+    printf("--- Bot v11.0: Real Combat Engine ---\n");
 
     HWND hwnd = FindWindowA(NULL, "World of Warcraft");
     if (!hwnd) {
@@ -233,7 +219,7 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(hwnd, 1337, 50, NULL); 
 
-    printf("[+] Memory Target Injection Active.\n");
+    printf("[+] Smart Pathfinding + Interact Active.\n");
     printf("[!] Make sure 'Click-to-Move' and 'Auto Loot' are ON.\n");
     printf("[+] Press [INSERT] to start/stop the bot.\n");
     return 0;
