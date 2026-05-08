@@ -4,6 +4,7 @@
 #include <tlhelp32.h>
 #include <vector>
 
+// Структура данных для шеллкода
 struct MANUAL_MAPPING_DATA {
     typedef HMODULE(WINAPI* pLoadLibraryA)(LPCSTR);
     typedef FARPROC(WINAPI* pGetProcAddress)(HMODULE, LPCSTR);
@@ -12,6 +13,7 @@ struct MANUAL_MAPPING_DATA {
     BYTE* pbase;
 };
 
+// Функция поиска ID процесса
 DWORD GetProcessId(const char* procName) {
     DWORD procId = 0;
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -30,15 +32,18 @@ DWORD GetProcessId(const char* procName) {
     return procId;
 }
 
-// Отключаем оптимизацию, чтобы компилятор не вырезал заглушку и не менял порядок функций
+// Запрещаем оптимизацию для шеллкода, чтобы функции не перемешивались
 #pragma optimize("", off)
 void __stdcall ShellCode(MANUAL_MAPPING_DATA* pData) {
     if (!pData) return;
     BYTE* pBase = pData->pbase;
-    auto* pOpt = &reinterpret_cast<IMAGE_NT_HEADERS*>(pBase + reinterpret_cast<IMAGE_DOS_HEADER*>(pBase)->e_lfanew)->OptionalHeader;
+    auto* pOldHeader = reinterpret_cast<IMAGE_NT_HEADERS*>(pBase + reinterpret_cast<IMAGE_DOS_HEADER*>(pBase)->e_lfanew);
+    auto* pOpt = &pOldHeader->OptionalHeader;
+
     auto _LoadLibraryA = pData->fnLoadLibraryA;
     auto _GetProcAddress = pData->fnGetProcAddress;
 
+    // 1. Релокации
     auto* pRelocDir = &pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
     if (pRelocDir->Size) {
         auto* pReloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>(pBase + pRelocDir->VirtualAddress);
@@ -55,94 +60,100 @@ void __stdcall ShellCode(MANUAL_MAPPING_DATA* pData) {
         }
     }
 
+    // 2. Импорты
     auto* pImportDir = &pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (pImportDir->Size) {
         auto* pImportDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(pBase + pImportDir->VirtualAddress);
         while (pImportDesc->Name) {
-            HMODULE hMod = _LoadLibraryA(reinterpret_cast<char*>(pBase + pImportDesc->Name));
+            char* szMod = reinterpret_cast<char*>(pBase + pImportDesc->Name);
+            HMODULE hMod = _LoadLibraryA(szMod);
             auto* pThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(pBase + pImportDesc->FirstThunk);
             auto* pIAT = reinterpret_cast<IMAGE_THUNK_DATA*>(pBase + pImportDesc->FirstThunk);
             if (pImportDesc->OriginalFirstThunk) pThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(pBase + pImportDesc->OriginalFirstThunk);
+
             while (pThunk->u1.AddressOfData) {
-                if (IMAGE_SNAP_BY_ORDINAL(pThunk->u1.Ordinal)) pIAT->u1.Function = (DWORD)_GetProcAddress(hMod, (char*)(pThunk->u1.Ordinal & 0xFFFF));
-                else pIAT->u1.Function = (DWORD)_GetProcAddress(hMod, ((IMAGE_IMPORT_BY_NAME*)(pBase + pThunk->u1.AddressOfData))->Name);
+                if (IMAGE_SNAP_BY_ORDINAL(pThunk->u1.Ordinal)) {
+                    pIAT->u1.Function = (DWORD)_GetProcAddress(hMod, (char*)(pThunk->u1.Ordinal & 0xFFFF));
+                } else {
+                    auto* pImportName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(pBase + pThunk->u1.AddressOfData);
+                    pIAT->u1.Function = (DWORD)_GetProcAddress(hMod, pImportName->Name);
+                }
                 pThunk++; pIAT++;
             }
             pImportDesc++;
         }
     }
 
+    // 3. Вызов EntryPoint
     if (pOpt->AddressOfEntryPoint) {
         auto _DllMain = reinterpret_cast<BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID)>(pBase + pOpt->AddressOfEntryPoint);
         _DllMain((HINSTANCE)pBase, DLL_PROCESS_ATTACH, nullptr);
     }
 }
-
-void __stdcall ShellCodeEnd() {}
+void __stdcall ShellCodeEnd() {} 
 #pragma optimize("", on)
 
 int main() {
-    const char* dllFile = "bot_payload.dll";
+    const char* dllPath = "bot_payload.dll";
     const char* procName = "WoW.exe";
 
+    std::cout << "[*] Ищем процесс " << procName << "..." << std::endl;
     DWORD pid = GetProcessId(procName);
-    if (!pid) {
-        std::cout << "[-] Процесс не найден." << std::endl;
-        return 1;
-    }
+    if (!pid) { std::cout << "[-] Процесс не найден!" << std::endl; return 1; }
 
-    std::ifstream file(dllFile, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-        std::cout << "[-] Не удалось открыть " << dllFile << std::endl;
-        return 1;
-    }
-
-    auto fileSize = file.tellg();
-    std::vector<BYTE> buffer(fileSize);
+    std::ifstream file(dllPath, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) { std::cout << "[-] Не удалось открыть DLL!" << std::endl; return 1; }
+    
+    std::streamsize size = file.tellg();
+    std::vector<BYTE> buffer(size);
     file.seekg(0, std::ios::beg);
-    file.read((char*)buffer.data(), fileSize);
+    file.read(reinterpret_cast<char*>(buffer.data()), size);
     file.close();
 
+    auto* pDos = reinterpret_cast<IMAGE_DOS_HEADER*>(buffer.data());
+    auto* pNt = reinterpret_cast<IMAGE_NT_HEADERS*>(buffer.data() + pDos->e_lfanew);
+    
+    if (pNt->FileHeader.Machine != IMAGE_FILE_MACHINE_I386) {
+        std::cout << "[-] Ошибка: DLL должна быть x86 (32-бит)!" << std::endl;
+        return 1;
+    }
+
     HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-    if (!hProc) {
-        std::cout << "[-] Нет прав на открытие процесса." << std::endl;
-        return 1;
+    if (!hProc) { std::cout << "[-] Ошибка OpenProcess: " << GetLastError() << std::endl; return 1; }
+
+    // Выделяем память под саму DLL
+    BYTE* pTargetBase = (BYTE*)VirtualAllocEx(hProc, nullptr, pNt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!pTargetBase) { std::cout << "[-] Ошибка VirtualAllocEx (DLL)" << std::endl; CloseHandle(hProc); return 1; }
+
+    // Копируем заголовки и секции
+    WriteProcessMemory(hProc, pTargetBase, buffer.data(), pNt->OptionalHeader.SizeOfHeaders, nullptr);
+    auto* pSection = IMAGE_FIRST_SECTION(pNt);
+    for (int i = 0; i < pNt->FileHeader.NumberOfSections; i++, pSection++) {
+        WriteProcessMemory(hProc, pTargetBase + pSection->VirtualAddress, buffer.data() + pSection->PointerToRawData, pSection->SizeOfRawData, nullptr);
     }
 
-    auto* pOldHeader = reinterpret_cast<IMAGE_NT_HEADERS*>(buffer.data() + reinterpret_cast<IMAGE_DOS_HEADER*>(buffer.data())->e_lfanew);
-    BYTE* pTargetBase = (BYTE*)VirtualAllocEx(hProc, nullptr, pOldHeader->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    
-    if (!pTargetBase) {
-        std::cout << "[-] Ошибка выделения памяти в целевом процессе." << std::endl;
-        CloseHandle(hProc);
-        return 1;
-    }
-    
-    WriteProcessMemory(hProc, pTargetBase, buffer.data(), pOldHeader->OptionalHeader.SizeOfHeaders, nullptr);
-    auto* pSectionHeader = IMAGE_FIRST_SECTION(pOldHeader);
-    for (UINT i = 0; i != pOldHeader->FileHeader.NumberOfSections; ++i, ++pSectionHeader) {
-        WriteProcessMemory(hProc, pTargetBase + pSectionHeader->VirtualAddress, buffer.data() + pSectionHeader->PointerToRawData, pSectionHeader->SizeOfRawData, nullptr);
-    }
-
+    // Подготовка данных
     MANUAL_MAPPING_DATA data;
     data.fnLoadLibraryA = LoadLibraryA;
     data.fnGetProcAddress = GetProcAddress;
     data.pbase = pTargetBase;
 
-    BYTE* pDataLoc = (BYTE*)VirtualAllocEx(hProc, nullptr, sizeof(MANUAL_MAPPING_DATA), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    WriteProcessMemory(hProc, pDataLoc, &data, sizeof(MANUAL_MAPPING_DATA), nullptr);
+    BYTE* pRemoteData = (BYTE*)VirtualAllocEx(hProc, nullptr, sizeof(MANUAL_MAPPING_DATA), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    WriteProcessMemory(hProc, pRemoteData, &data, sizeof(MANUAL_MAPPING_DATA), nullptr);
 
-    DWORD shellSize = (DWORD)ShellCodeEnd - (DWORD)ShellCode;
-    BYTE* pCodeLoc = (BYTE*)VirtualAllocEx(hProc, nullptr, shellSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    WriteProcessMemory(hProc, pCodeLoc, ShellCode, shellSize, nullptr);
+    // Копируем шеллкод (берем с запасом 1КБ, чтобы точно не обрезать из-за оптимизаций)
+    DWORD shellSize = 1024; 
+    BYTE* pRemoteCode = (BYTE*)VirtualAllocEx(hProc, nullptr, shellSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    WriteProcessMemory(hProc, pRemoteCode, ShellCode, shellSize, nullptr);
 
-    HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0, (LPTHREAD_START_ROUTINE)pCodeLoc, pDataLoc, 0, nullptr);
+    std::cout << "[*] Запуск удаленного потока..." << std::endl;
+    HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0, (LPTHREAD_START_ROUTINE)pRemoteCode, pRemoteData, 0, nullptr);
     
     if (hThread) {
-        std::cout << "[+] Стелс-инжект прошел успешно!" << std::endl;
+        std::cout << "[+] Инъекция завершена. Если игра упала — проверь логику DLL." << std::endl;
         CloseHandle(hThread);
     } else {
-        std::cout << "[-] Ошибка создания удаленного потока." << std::endl;
+        std::cout << "[-] Ошибка CreateRemoteThread: " << GetLastError() << std::endl;
     }
 
     CloseHandle(hProc);
