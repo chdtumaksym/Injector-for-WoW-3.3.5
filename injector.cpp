@@ -92,9 +92,17 @@ void __stdcall ShellCodeEnd() {}
 int main() {
     const char* dllName = "bot_payload.dll";
     DWORD pid = GetProcessId("WoW.exe");
-    if (!pid) return 1;
+    if (!pid) {
+        std::cout << "[-] WoW.exe не запущен!" << std::endl;
+        return 1;
+    }
 
     std::ifstream f(dllName, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) {
+        std::cout << "[-] Файл " << dllName << " не найден!" << std::endl;
+        return 1;
+    }
+    
     auto sz = f.tellg();
     std::vector<BYTE> buf(sz);
     f.seekg(0, std::ios::beg);
@@ -102,8 +110,20 @@ int main() {
     f.close();
 
     HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-    auto* pNt = reinterpret_cast<IMAGE_NT_HEADERS*>(buf.data() + reinterpret_cast<IMAGE_DOS_HEADER*>(buf.data())->e_lfanew);
+    if (!hProc) {
+        std::cout << "[-] Ошибка OpenProcess: " << GetLastError() << std::endl;
+        return 1;
+    }
+
+    auto* pDos = reinterpret_cast<IMAGE_DOS_HEADER*>(buf.data());
+    auto* pNt = reinterpret_cast<IMAGE_NT_HEADERS*>(buf.data() + pDos->e_lfanew);
+    
     BYTE* pTarget = (BYTE*)VirtualAllocEx(hProc, nullptr, pNt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!pTarget) {
+        std::cout << "[-] Ошибка VirtualAllocEx" << std::endl;
+        CloseHandle(hProc);
+        return 1;
+    }
 
     WriteProcessMemory(hProc, pTarget, buf.data(), pNt->OptionalHeader.SizeOfHeaders, nullptr);
     auto* pSec = IMAGE_FIRST_SECTION(pNt);
@@ -112,8 +132,6 @@ int main() {
     }
 
     MANUAL_MAPPING_DATA data;
-    // Берем адреса из нашей памяти, так как kernel32 мапится по одним адресам почти всегда, 
-    // но для 100% надежности в Manual Map лучше резолвить их через перебор модулей процесса.
     data.fnLoadLibraryA = LoadLibraryA;
     data.fnGetProcAddress = GetProcAddress;
     data.pbase = pTarget;
@@ -121,14 +139,16 @@ int main() {
     BYTE* pRemData = (BYTE*)VirtualAllocEx(hProc, nullptr, sizeof(data), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     WriteProcessMemory(hProc, pRemData, &data, sizeof(data), nullptr);
 
-    // Копируем 2КБ шеллкода для гарантии
-    BYTE* pRemCode = (BYTE*)VirtualAllocEx(hProc, nullptr, 2048, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    WriteProcessMemory(hProc, pRemCode, ShellCode, 2048, nullptr);
+    // Копируем 4КБ шеллкода для надежности
+    BYTE* pRemCode = (BYTE*)VirtualAllocEx(hProc, nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    WriteProcessMemory(hProc, pRemCode, ShellCode, 4096, nullptr);
 
     HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0, (LPTHREAD_START_ROUTINE)pRemCode, pRemData, 0, nullptr);
     if (hThread) {
         std::cout << "[+] Инжект выполнен. Жди MessageBox в игре." << std::endl;
         CloseHandle(hThread);
+    } else {
+        std::cout << "[-] Ошибка CreateRemoteThread: " << GetLastError() << std::endl;
     }
 
     CloseHandle(hProc);
