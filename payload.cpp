@@ -1,18 +1,24 @@
 #include <windows.h>
-#include <iostream>
 
-// Эта DLL не делает НИЧЕГО, кроме открытия консоли.
-// Если игра упадет с этой либой — значит твой инжектор детектится или ломает память.
+// Отключаем проверку стека на уровне кода, чтобы Manual Map не крашился
+#pragma runtime_checks("", off)
+#pragma check_stack(off)
+#pragma strict_gs_check(off)
+
+// Функция-заглушка, чтобы проверить жизнь
 void Setup() {
-    // Используем MessageBox вместо консоли для теста — это еще надежнее
-    MessageBoxA(NULL, "Инжект прошел успешно! Игра жива.", "Debug", MB_OK | MB_ICONINFORMATION);
+    // MessageBoxA — самая стабильная штука. Если она не вылезет, значит DLL даже не запустилась.
+    MessageBoxA(NULL, "Стерильный тест: DLL внутри процесса!", "Бот-Дебаг", MB_OK | MB_ICONTOPMOST);
 }
 
-BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
-    if (r == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(h);
-        // Создаем поток, чтобы не вешать DllMain
-        CreateThread(nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(Setup), nullptr, 0, nullptr);
+// Кастомный EntryPoint без CRT (C Runtime), чтобы не зависеть от инициализации кук безопасности
+extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
+    if (fdwReason == DLL_PROCESS_ATTACH) {
+        // Не используем DisableThreadLibraryCalls, чтобы не трогать лишний раз импорты в момент загрузки
+        
+        // Создаем поток через нативный WinAPI
+        HANDLE hThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)Setup, NULL, 0, NULL);
+        if (hThread) CloseHandle(hThread);
     }
     return TRUE;
 }
