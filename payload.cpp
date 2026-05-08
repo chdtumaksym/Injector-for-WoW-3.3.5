@@ -5,7 +5,7 @@
 #include <vector>
 #include <algorithm>
 
-// --- АДРЕСА И ОФФСЕТЫ 3.3.5a (12340) ---
+// --- АДРЕСА 3.3.5a (12340) ---
 #define ADDR_S_CUR_MGR          0x00C79CE0
 #define OFFSET_OBJECT_MANAGER   0x2ED0
 #define ADDR_CLICK_TO_MOVE      0x00611130
@@ -22,6 +22,7 @@
 typedef void(__thiscall* tClickToMove)(uintptr_t pThis, int type, uint64_t* guid, float* pos, float prec);
 
 bool g_Active = false;
+WNDPROC oWndProc = nullptr;
 std::vector<uint64_t> g_Blacklist; 
 
 struct CTM_BUFFER { uint64_t guid; float pos[3]; };
@@ -159,19 +160,12 @@ void BotPulse() {
     }
 }
 
-DWORD WINAPI BotThread(LPVOID) {
-    AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v2.1: Native Memory Grinder ---\n");
-    printf("[+] Background Thread Active.\n");
-    printf("[!] Make sure 'Click-to-Move' and 'Auto Loot' are ON.\n");
-    printf("[+] Press [INSERT] to start/stop the bot.\n");
-
-    DWORD lastTick = 0;
-    bool isPressed = false;
-
-    // Главный цикл бота в отдельном потоке
-    while (true) {
-        // Читаем нажатие аппаратно
+// Теперь этот хук обрабатывает всё, оставаясь в безопасном ГЛАВНОМ потоке
+LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (uMsg == WM_TIMER && wParam == 1337) {
+        
+        // 1. Асинхронная проверка кнопки (выполняется глобально каждые 50мс)
+        static bool isPressed = false;
         if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
             if (!isPressed) {
                 isPressed = true;
@@ -187,25 +181,45 @@ DWORD WINAPI BotThread(LPVOID) {
             isPressed = false;
         }
 
-        // Запуск логики каждые 400мс
+        // 2. Логика бота (срабатывает только 1 раз в 400мс, чтобы не грузить игру)
+        static DWORD lastTick = 0;
         if (g_Active && (GetTickCount() - lastTick > 400)) {
             __try {
                 BotPulse();
             } __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Защита от крашей (если игра выгружает память)
+                // Блокируем любые попытки краша при чтении памяти
             }
             lastTick = GetTickCount();
         }
-        
-        Sleep(50); // Спать 50 мс для мгновенного отклика на кнопки и экономии CPU
     }
+    
+    return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
+}
+
+DWORD WINAPI Setup(LPVOID) {
+    AllocConsole(); freopen("CONOUT$", "w", stdout);
+    printf("--- Bot v2.2: Ultimate Stable Grinder ---\n");
+
+    HWND hwnd = FindWindowA(NULL, "World of Warcraft");
+    if (!hwnd) {
+        printf("[-] ERROR: WoW window not found!\n");
+        return 0;
+    }
+
+    oWndProc = (WNDPROC)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)HookedWndProc);
+    // Таймер тикает каждые 50мс (для мгновенного отклика клавиш)
+    SetTimer(hwnd, 1337, 50, NULL); 
+
+    printf("[+] Main Thread Injection Active. Crash Guard ON.\n");
+    printf("[!] Make sure 'Click-to-Move' and 'Auto Loot' are ON.\n");
+    printf("[+] Press [INSERT] to start/stop the bot (Anywhere).\n");
     return 0;
 }
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
     if (r == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(h);
-        CreateThread(0, 0, BotThread, 0, 0, 0);
+        CreateThread(0, 0, Setup, 0, 0, 0);
     }
     return TRUE;
 }
