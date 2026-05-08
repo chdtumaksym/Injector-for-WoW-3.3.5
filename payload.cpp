@@ -11,10 +11,9 @@
 #define ADDR_CLICK_TO_MOVE      0x00611130
 #define ADDR_TARGET_GUID        0x00BD07B8
 
-// Типы Click-To-Move (Встроенный ИИ игры)
-#define CTM_MOVE                4 // Просто бежать
-#define CTM_INTERACT            5 // Взаимодействовать (в т.ч. Лут)
-#define CTM_ATTACK              7 // Бежать к цели и атаковать
+#define CTM_MOVE                4 
+#define CTM_INTERACT            5 
+#define CTM_ATTACK              7 
 
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
@@ -23,29 +22,24 @@
 typedef void(__thiscall* tClickToMove)(uintptr_t pThis, int type, uint64_t* guid, float* pos, float prec);
 
 bool g_Active = false;
-WNDPROC oWndProc = nullptr;
-std::vector<uint64_t> g_Blacklist; // Черный список пустых/багнутых мобов
+std::vector<uint64_t> g_Blacklist; 
 
 struct CTM_BUFFER { uint64_t guid; float pos[3]; };
 static CTM_BUFFER g_ctm;
 
-// 1. Честная 3D дистанция
 float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) {
     return sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2) + pow(z2 - z1, 2));
 }
 
-// 2. Безопасная смена таргета напрямую в памяти (Без Lua!)
 void SetTarget(uint64_t guid) {
     *(uint64_t*)ADDR_TARGET_GUID = guid;
 }
 
-// 3. Умный Click-To-Move с защитой от спама
 void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, float z) {
     static uint64_t lastGuid = 0;
     static int lastType = 0;
     static DWORD lastTime = 0;
 
-    // Не спамим движок игры каждые 500мс, обновляем приказ раз в 3 сек или при смене цели
     if (guid != lastGuid || type != lastType || (GetTickCount() - lastTime > 3000)) {
         g_ctm.guid = guid;
         g_ctm.pos[0] = x; g_ctm.pos[1] = y; g_ctm.pos[2] = z;
@@ -58,8 +52,6 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
 }
 
 void BotPulse() {
-    if (!g_Active) return;
-
     uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
     uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
     if (!mgr) return;
@@ -68,7 +60,6 @@ void BotPulse() {
     uintptr_t pLocal = 0;
     float myX = 0, myY = 0, myZ = 0;
 
-    // Ищем своего персонажа
     uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
     while (cur && (cur & 1) == 0) {
         if (*(uint64_t*)(cur + 0x30) == localGuid) {
@@ -88,7 +79,6 @@ void BotPulse() {
     uint32_t targetFlags = 0;
     float tX = 0, tY = 0, tZ = 0;
 
-    // Читаем инфу о текущем таргете
     if (targetGuid) {
         cur = *(uintptr_t*)(mgr + 0xAC);
         while (cur && (cur & 1) == 0) {
@@ -113,44 +103,36 @@ void BotPulse() {
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
 
         if (targetHp > 0) {
-            // Цель жива -> Используем встроенный механизм игры "Атаковать"
-            // Игра сама добежит до цели и начнет бить!
             ActionCTM(pLocal, CTM_ATTACK, targetGuid, tX, tY, tZ);
             printf("Attacking Target... Dist: %.1f      \r", dist);
         } 
         else if (targetHp <= 0 && (targetFlags & 1)) {
-            // Цель мертва и есть лут -> Используем механизм "Взаимодействовать"
-            // (В настройках игры ДОЛЖЕН быть включен "Автоматический сбор добычи")
             ActionCTM(pLocal, CTM_INTERACT, targetGuid, tX, tY, tZ);
             printf("Looting Corpse... Dist: %.1f        \r", dist);
         } 
         else {
-            // Цель мертва и пуста -> Заносим в ЧС и сбрасываем таргет
             g_Blacklist.push_back(targetGuid);
             SetTarget(0);
             printf("Target Empty. Blacklisted.          \r");
         }
     } 
     else {
-        // --- 4. УМНЫЙ ПОИСК ЦЕЛИ ЧЕРЕЗ ПАМЯТЬ ---
         uint64_t bestTarget = 0;
-        float bestDist = 40.0f; // Максимальный радиус агра 40 метров
+        float bestDist = 40.0f; 
 
         cur = *(uintptr_t*)(mgr + 0xAC);
         while (cur && (cur & 1) == 0) {
             int type = *(int*)(cur + 0x14);
             
-            if (type == 3) { // Ищем ТОЛЬКО NPC/Монстров (Type = 3)
+            if (type == 3) { 
                 uint64_t guid = *(uint64_t*)(cur + 0x30);
                 
-                // Проверяем, нет ли моба в черном списке
                 if (std::find(g_Blacklist.begin(), g_Blacklist.end(), guid) == g_Blacklist.end()) {
                     uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                     if (desc) {
                         int hp = *(int*)(desc + 0x60);
                         int maxHp = *(int*)(desc + 0x70);
                         
-                        // Если моб живой
                         if (hp > 0 && maxHp > 0) {
                             float mX = *(float*)(cur + 0x798);
                             float mY = *(float*)(cur + 0x79C);
@@ -177,43 +159,53 @@ void BotPulse() {
     }
 }
 
-LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    if (uMsg == WM_KEYDOWN && wParam == VK_INSERT) {
-        g_Active = !g_Active;
-        Beep(g_Active ? 800 : 400, 100);
-        printf("\n[!] BOT STATUS: %s\n", g_Active ? "ACTIVE" : "PAUSED");
-        if (!g_Active) { SetTarget(0); g_Blacklist.clear(); } // Очищаем ЧС при паузе
-    }
-    if (uMsg == WM_TIMER && wParam == 1337) {
-        __try {
-            BotPulse();
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            // Перехватываем краши, если таймер выстрелил в момент выгрузки памяти игрой
-        }
-    }
-    return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
-}
-
-DWORD WINAPI Setup(LPVOID) {
+DWORD WINAPI BotThread(LPVOID) {
     AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v2.0: Native Memory Grinder ---\n");
-
-    HWND hwnd = FindWindowA(NULL, "World of Warcraft");
-    if (!hwnd) {
-        printf("[-] ERROR: WoW window not found!\n");
-        return 0;
-    }
-
-    oWndProc = (WNDPROC)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)HookedWndProc);
-    SetTimer(hwnd, 1337, 500, NULL);
-
-    printf("[+] Object Manager Scanner Active.\n");
+    printf("--- Bot v2.1: Native Memory Grinder ---\n");
+    printf("[+] Background Thread Active.\n");
     printf("[!] Make sure 'Click-to-Move' and 'Auto Loot' are ON.\n");
     printf("[+] Press [INSERT] to start/stop the bot.\n");
+
+    DWORD lastTick = 0;
+    bool isPressed = false;
+
+    // Главный цикл бота в отдельном потоке
+    while (true) {
+        // Читаем нажатие аппаратно
+        if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
+            if (!isPressed) {
+                isPressed = true;
+                g_Active = !g_Active;
+                Beep(g_Active ? 800 : 400, 100);
+                printf("\n[!] BOT STATUS: %s                                \n", g_Active ? "ACTIVE" : "PAUSED");
+                if (!g_Active) { 
+                    SetTarget(0); 
+                    g_Blacklist.clear(); 
+                }
+            }
+        } else {
+            isPressed = false;
+        }
+
+        // Запуск логики каждые 400мс
+        if (g_Active && (GetTickCount() - lastTick > 400)) {
+            __try {
+                BotPulse();
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                // Защита от крашей (если игра выгружает память)
+            }
+            lastTick = GetTickCount();
+        }
+        
+        Sleep(50); // Спать 50 мс для мгновенного отклика на кнопки и экономии CPU
+    }
     return 0;
 }
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
-    if (r == DLL_PROCESS_ATTACH) CreateThread(0, 0, Setup, 0, 0, 0);
+    if (r == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(h);
+        CreateThread(0, 0, BotThread, 0, 0, 0);
+    }
     return TRUE;
 }
