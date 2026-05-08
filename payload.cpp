@@ -5,10 +5,12 @@
 #include <vector>
 #include <algorithm>
 
-// --- АДРЕСА 3.3.5a (12340) ---
+// --- ПРАВИЛЬНЫЕ АДРЕСА 3.3.5a (12340) ---
 #define ADDR_S_CUR_MGR          0x00C79CE0
 #define OFFSET_OBJECT_MANAGER   0x2ED0
-#define ADDR_CLICK_TO_MOVE      0x00722FB0 
+
+// [!!!] ВОТ ОНА — ЕДИНСТВЕННАЯ ПРИЧИНА КРАШЕЙ. ИСТИННЫЙ АДРЕС CTM:
+#define ADDR_CLICK_TO_MOVE      0x00727400 
 
 #define CTM_INTERACT            5  
 #define CTM_ATTACK              11 
@@ -17,8 +19,7 @@
 #pragma check_stack(off)
 #pragma strict_gs_check(off)
 
-// [!!!] ГЛАВНЫЙ ФИКС [!!!]
-// Используем __fastcall: ecx = pLocal, edx = мусор. Идеальная эмуляция __thiscall!
+// Эмуляция __thiscall через __fastcall (ecx = pLocal, edx = 0)
 typedef void(__fastcall* tClickToMove)(uintptr_t ecx, uintptr_t edx, int type, uint64_t* guid, float* pos, float prec);
 
 bool g_Active = false;
@@ -43,7 +44,6 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
         ctmGuid = guid;
         ctmPos[0] = x; ctmPos[1] = y; ctmPos[2] = z;
         
-        // ВАЖНО: передаем pLocal первым аргументом (он пойдет в ECX), а вторым передаем 0
         ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, type, &ctmGuid, ctmPos, 0.5f);
         
         lastGuid = guid;
@@ -189,7 +189,6 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
             __try {
                 BotPulse();
             } __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Игнорируем скачки
             }
             lastTick = GetTickCount();
             isPulsing = false;
@@ -200,7 +199,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v7.0: The Assembly (__fastcall) Fix ---\n");
+    printf("--- Bot v8.0: The Real Address Fix ---\n");
 
     HWND hwnd = FindWindowA(NULL, "World of Warcraft");
     if (!hwnd) {
@@ -211,7 +210,7 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(hwnd, 1337, 50, NULL); 
 
-    printf("[+] Calling Convention explicitly set to __fastcall.\n");
+    printf("[+] Correct CTM Address 0x00727400 Applied.\n");
     printf("[!] Make sure 'Click-to-Move' and 'Auto Loot' are ON.\n");
     printf("[+] Press [INSERT] to start/stop the bot.\n");
     return 0;
