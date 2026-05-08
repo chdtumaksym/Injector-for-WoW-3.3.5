@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <clocale>
+#include <stdint.h>
 
 #pragma comment(lib, "user32.lib")
 
@@ -13,15 +14,13 @@
 
 #define ADDR_CLICK_TO_MOVE       0x00611130
 #define ADDR_GET_PLAYER          0x004038BE
-#define ADDR_INTERACT_WITH_GUID  0x005277B0 // Найдено тобой в Ghidra как FUN_005277b0
+#define ADDR_INTERACT_WITH_GUID  0x005277B0 
 
 enum BotState { STATE_SEARCH, STATE_MOVE, STATE_COMBAT, STATE_LOOT };
 const char* stateNames[] = { "SEARCHING", "MOVING", "COMBAT", "LOOTING" };
 
-// Сигнатуры функций движка
 typedef void(__thiscall* tClickToMove)(uintptr_t playerPtr, int clickType, uint64_t* interactGuid, float* pos, float precision);
 typedef uintptr_t(__cdecl* tGetActivePlayer)();
-// InteractWithGuid (FUN_005277b0) принимает 64-битный GUID (2x32 бита на стеке)
 typedef int(__cdecl* tInteractWithGuid)(uint32_t guidLow, uint32_t guidHigh);
 
 tClickToMove EngineClickToMove = (tClickToMove)ADDR_CLICK_TO_MOVE;
@@ -35,6 +34,7 @@ struct BotCommand {
     volatile float x, y, z;
 } g_Cmd;
 
+// --- УТИЛИТЫ ПАМЯТИ ---
 template <typename T>
 T SafeRead(uintptr_t address) {
     T buffer = T();
@@ -42,6 +42,13 @@ T SafeRead(uintptr_t address) {
     __try { buffer = *(T*)address; } 
     __except(EXCEPTION_EXECUTE_HANDLER) {}
     return buffer;
+}
+
+template <typename T>
+void SafeWrite(uintptr_t address, T value) {
+    if (address == 0) return;
+    __try { *(T*)address = value; } 
+    __except(EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 void SetConsoleCursor(int x, int y) {
@@ -57,7 +64,6 @@ BOOL WINAPI HookedPeekMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT 
     int cmd = g_Cmd.type;
     if (cmd != 0) {
         uintptr_t pLocal = GetPlayer();
-        // 0x14 == 4 означает, что игрок полностью загружен в мир
         if (pLocal && SafeRead<int>(pLocal + 0x14) == 4) {
             __try {
                 if (cmd == 1) { 
@@ -65,14 +71,11 @@ BOOL WINAPI HookedPeekMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT 
                     EngineClickToMove(pLocal, 4, (uint64_t*)&g_Cmd.guid, pos, 0.5f);
                 } 
                 else if (cmd == 2) { 
-                    // Вызываем InteractWithGuid напрямую, как это делает Lua
                     uint32_t low = (uint32_t)(g_Cmd.guid & 0xFFFFFFFF);
                     uint32_t high = (uint32_t)(g_Cmd.guid >> 32);
                     InteractWithGuid(low, high);
                 }
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                // Если даже здесь краш - значит Warden палит вызов не из .text секции
-            }
+            } __except(EXCEPTION_EXECUTE_HANDLER) {}
         }
         g_Cmd.type = 0; 
     }
@@ -89,7 +92,6 @@ bool InstallIATHook() {
         if (_stricmp((char*)((uintptr_t)hExe + importDesc->Name), "USER32.dll") == 0) {
             PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)((uintptr_t)hExe + importDesc->FirstThunk);
             PIMAGE_THUNK_DATA origThunk = (PIMAGE_THUNK_DATA)((uintptr_t)hExe + importDesc->OriginalFirstThunk);
-
             while (origThunk->u1.AddressOfData != 0) {
                 if (!(origThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG)) {
                     PIMAGE_IMPORT_BY_NAME importName = (PIMAGE_IMPORT_BY_NAME)((uintptr_t)hExe + origThunk->u1.AddressOfData);
@@ -120,27 +122,26 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f; freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Paladin Ghidra-Corrected v35.0 ---\n");
+    printf("--- Paladin Ghidra-Fixed v36.0 ---\n");
     if (InstallIATHook()) {
-        printf("[+] IAT Hook активен. Мы в контексте главного потока.\n");
+        printf("[+] IAT Hook активен. SafeWrite восстановлен.\n");
     } else {
-        printf("[-] ОШИБКА: Не удалось перехватить PeekMessageA.\n");
+        printf("[-] ОШИБКА: IAT Hook не удался.\n");
         return 0;
     }
-    printf("[+] Используем InteractWithGuid (0x%X).\n", ADDR_INTERACT_WITH_GUID);
+    printf("[+] Адрес Interact: 0x%X\n", ADDR_INTERACT_WITH_GUID);
     printf("--------------------------------------------------\n");
 
     uintptr_t connectionAddr = (uintptr_t)GetModuleHandleA(NULL) + OFFSET_S_CUR_MGR;
     BotState state = STATE_SEARCH;
     uint64_t activeTargetGuid = 0;
-    DWORD stateStartTime = GetTickCount();
 
     while (!GetAsyncKeyState(VK_END)) {
         uintptr_t clientConn = SafeRead<uintptr_t>(connectionAddr);
         SetConsoleCursor(0, 6);
 
         if (!clientConn) {
-            printf("[!] Ожидание входа в мир...                           \n");
+            printf("[!] Ждем вход в мир...                           \n");
             Sleep(500); continue;
         }
 
@@ -176,10 +177,11 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                         }
                         cur = SafeRead<uintptr_t>(cur + 0x3C);
                     }
-                    if (activeTargetGuid != 0) { state = STATE_MOVE; stateStartTime = GetTickCount(); }
+                    if (activeTargetGuid != 0) state = STATE_MOVE;
                 }
 
                 if (activeTargetGuid != 0) {
+                    // Используем SafeWrite, который ты потерял
                     SafeWrite<uint64_t>(pDesc + 0x48, activeTargetGuid);
                     SafeWrite<uint64_t>(ADDR_TARGET_GUID, activeTargetGuid);
 
@@ -199,12 +201,11 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                                 SendCommand(1, activeTargetGuid, tx, ty, tz);
                             } else {
                                 state = STATE_COMBAT;
-                                SendCommand(2, activeTargetGuid); // Взаимодействие (Атака)
+                                SendCommand(2, activeTargetGuid);
                                 Sleep(500);
                             }
                         } else {
                             state = STATE_LOOT;
-                            printf("[LOG] Цель мертва. Сбор лута...                   \n");
                             SendCommand(2, activeTargetGuid);
                             Sleep(2000); activeTargetGuid = 0; state = STATE_SEARCH;
                         }
