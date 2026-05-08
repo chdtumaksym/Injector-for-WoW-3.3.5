@@ -2,155 +2,57 @@
 #include <iostream>
 #include <cmath>
 #include <cstdio>
-#include <d3d9.h>
 
-#pragma comment(lib, "d3d9.lib")
 #pragma comment(lib, "user32.lib")
 
-// --- АДРЕСА 3.3.5a (12340) ---
-#define ADDR_LUA_EXECUTE      0x00819210
-#define ADDR_CLICK_TO_MOVE    0x00611130
-#define ADDR_GET_PLAYER       0x004038BE
-#define OFFSET_S_CUR_MGR      0x00879CE0 
-
-typedef void(__cdecl* tFrameScript_Execute)(const char* command, const char* filename, void* reserved);
-typedef void(__thiscall* tClickToMove)(uintptr_t playerPtr, int clickType, uint64_t* interactGuid, float* pos, float precision);
-typedef uintptr_t(__cdecl* tGetActivePlayer)();
-
-tFrameScript_Execute Lua_DoString = (tFrameScript_Execute)ADDR_LUA_EXECUTE;
-tClickToMove ClickToMove = (tClickToMove)ADDR_CLICK_TO_MOVE;
-tGetActivePlayer GetPlayer = (tGetActivePlayer)ADDR_GET_PLAYER;
-
-// --- СТРУКТУРА КОМАНД ДЛЯ ГЛАВНОГО ПОТОКА ---
-struct BotCommand {
-    volatile int type; // 0: None, 1: Move, 2: Combat, 3: Loot, 4: Target, 5: Interact
-    volatile uint64_t guid;
-    volatile float x, y, z;
-} g_Cmd;
+// --- ОФФСЕТЫ 3.3.5a (12340) ---
+#define OFFSET_S_CUR_MGR         0x00879CE0
+#define OFFSET_OBJECT_MANAGER    0x2ED0
+#define ADDR_TARGET_GUID         0x00BD07B0 // Адрес текущей цели в UI
 
 enum BotState { STATE_SEARCH, STATE_MOVE, STATE_COMBAT, STATE_LOOT };
 const char* stateNames[] = { "SEARCHING", "MOVING", "COMBAT", "LOOTING" };
-
-// --- VTABLE ХУК D3D9 ---
-typedef HRESULT(__stdcall* tEndScene)(IDirect3DDevice9*);
-tEndScene oEndScene = nullptr;
-
-HRESULT __stdcall HookedEndScene(IDirect3DDevice9* pDevice) {
-    if (!pDevice) return oEndScene(pDevice);
-
-    uintptr_t pLocal = GetPlayer();
-    // Жесткая проверка: указатель не пуст, память читаема, тип объекта = 4 (Игрок)
-    if (pLocal && !IsBadReadPtr((void*)pLocal, 0x100) && *(int*)(pLocal + 0x14) == 4) {
-        __try {
-            int cmdType = g_Cmd.type;
-            if (cmdType != 0) {
-                if (cmdType == 1) { // MOVE
-                    float pos[3] = { g_Cmd.x, g_Cmd.y, g_Cmd.z };
-                    uint64_t zero = 0;
-                    ClickToMove(pLocal, 4, &zero, pos, 0.5f);
-                } 
-                else if (cmdType == 2) { // COMBAT
-                    Lua_DoString("if UnitExists('target') and not IsCurrentSpell(6603) then StartAttack() end", "bot", 0);
-                    Lua_DoString("if not UnitBuff('player', 'Seal of Righteousness') then CastSpellByID(21084) end", "bot", 0);
-                    Lua_DoString("if not UnitBuff('player', 'Devotion Aura') then CastSpellByID(465) end", "bot", 0);
-                } 
-                else if (cmdType == 3) { // LOOT
-                    Lua_DoString("if LootFrame:IsVisible() then for i=1,GetNumLootItems() do LootSlot(i) end CloseLoot() end", "bot", 0);
-                }
-                else if (cmdType == 4) { // TARGET
-                    char cmd[128];
-                    sprintf_s(cmd, "TargetUnit('0x%llX')", g_Cmd.guid);
-                    Lua_DoString(cmd, "bot", 0);
-                }
-                else if (cmdType == 5) { // INTERACT
-                    Lua_DoString("if UnitExists('target') then InteractUnit('target') end", "bot", 0);
-                }
-                g_Cmd.type = 0; // Сбрасываем команду после выполнения
-            }
-        } __except(1) {} // Абсолютная защита от краша Lua
-    }
-
-    return oEndScene(pDevice);
-}
-
-// ВОТ ОН, ФИКС МГНОВЕННОГО КРАША! Использование невидимого окна для создания D3D.
-bool InstallVTableHook() {
-    IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
-    if (!pD3D) return false;
-
-    // Создаем фиктивное окно, чтобы не трогать рабочий стол
-    HWND dummyWindow = CreateWindowA("STATIC", "DummyDx", WS_OVERLAPPED, 0, 0, 100, 100, NULL, NULL, NULL, NULL);
-    
-    D3DPRESENT_PARAMETERS d3dpp = {0}; 
-    d3dpp.Windowed = TRUE; 
-    d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    d3dpp.hDeviceWindow = dummyWindow;
-
-    IDirect3DDevice9* pDev = nullptr;
-    if (FAILED(pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, dummyWindow, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDev))) {
-        pD3D->Release(); 
-        DestroyWindow(dummyWindow);
-        return false;
-    }
-
-    uintptr_t* pVTable = *(uintptr_t**)pDev;
-    oEndScene = (tEndScene)pVTable[42];
-
-    DWORD old;
-    VirtualProtect(&pVTable[42], sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &old);
-    pVTable[42] = (uintptr_t)HookedEndScene;
-    VirtualProtect(&pVTable[42], sizeof(uintptr_t), old, &old);
-
-    pDev->Release(); 
-    pD3D->Release();
-    DestroyWindow(dummyWindow);
-    return true;
-}
-
-void UnhookVTable() {
-    if (!oEndScene) return;
-    IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
-    if (!pD3D) return;
-    HWND dummyWindow = CreateWindowA("STATIC", "DummyDx", WS_OVERLAPPED, 0, 0, 100, 100, NULL, NULL, NULL, NULL);
-    D3DPRESENT_PARAMETERS d3dpp = {0}; d3dpp.Windowed = TRUE; d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD; d3dpp.hDeviceWindow = dummyWindow;
-    
-    IDirect3DDevice9* pDev = nullptr;
-    if (SUCCEEDED(pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, dummyWindow, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDev))) {
-        uintptr_t* pVTable = *(uintptr_t**)pDev;
-        DWORD old;
-        VirtualProtect(&pVTable[42], sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &old);
-        pVTable[42] = (uintptr_t)oEndScene;
-        VirtualProtect(&pVTable[42], sizeof(uintptr_t), old, &old);
-        pDev->Release();
-    }
-    pD3D->Release();
-    DestroyWindow(dummyWindow);
-}
 
 void SetConsoleCursor(int x, int y) {
     COORD c = {(SHORT)x, (SHORT)y};
     SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), c);
 }
 
-// --- ОСНОВНОЙ ПОТОК ЛОГИКИ ---
+// --- АППАРАТНАЯ ЭМУЛЯЦИЯ НАЖАТИЙ ---
+void SetKey(WORD vKey, bool down) {
+    INPUT ip = {0}; 
+    ip.type = INPUT_KEYBOARD; 
+    ip.ki.wVk = vKey;
+    ip.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+    SendInput(1, &ip, sizeof(INPUT));
+}
+
+void TapKey(WORD vKey) {
+    SetKey(vKey, true);
+    Sleep(40);
+    SetKey(vKey, false);
+}
+
 DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f; freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Paladin Mastermind v12.0 (Zero-Crash Edition) ---\n");
-    if (InstallVTableHook()) {
-        printf("[+] D3D9 Hooked successfully via Dummy Window.\n");
-    } else {
-        printf("[-] Failed to install VTable hook! Check drivers.\n");
-        return 0;
-    }
-    printf("[*] Lua Engine connected. Pure Internal execution.\n");
-    printf("[*] To stop safely, press END.\n");
+    printf("--- Paladin Ultimate Hardware v14.0 (Timeout Edition) ---\n");
+    printf("[!] BIND REQUIRES: '1' - Attack, 'G' - Interact, '9' - Heal.\n");
+    printf("[!] AUTO-LOOT MUST BE ENABLED IN GAME SETTINGS.\n");
+    printf("[!] GAME WINDOW MUST BE FOCUSED TO RUN AND ATTACK.\n");
     printf("--------------------------------------------------\n");
 
     uintptr_t connectionAddr = (uintptr_t)GetModuleHandleA(NULL) + OFFSET_S_CUR_MGR;
+    HWND wowWnd = FindWindowA(NULL, "World of Warcraft");
+    
     BotState state = STATE_SEARCH;
     uint64_t activeTargetGuid = 0;
+    bool isMoving = false;
+    int moveTimer = 0;
+    
+    // Переменные для отслеживания зависаний (спасибо Копайлоту за идею)
+    DWORD stateStartTime = GetTickCount();
 
     while (!GetAsyncKeyState(VK_END)) {
         uintptr_t clientConn = 0;
@@ -159,7 +61,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
         SetConsoleCursor(0, 6);
 
         if (clientConn) {
-            uintptr_t mgr = *(uintptr_t*)(clientConn + 0x2ED0);
+            uintptr_t mgr = *(uintptr_t*)(clientConn + OFFSET_OBJECT_MANAGER);
             if (mgr) {
                 uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
                 uint64_t myGuid = *(uint64_t*)(mgr + 0xC0);
@@ -179,6 +81,16 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                         printf("[PLAYER] HP: %d/%d | LVL: %d | POS: %.1f, %.1f      \n", hp, maxHp, lvl, myX, myY);
                         printf("--------------------------------------------------\n");
 
+                        if (hp > 0 && (hp * 100 / maxHp) < 40) {
+                            if (GetForegroundWindow() == wowWnd) {
+                                if (isMoving) { SetKey('W', false); isMoving = false; }
+                                TapKey('9'); 
+                                Sleep(1500); 
+                            }
+                        }
+
+                        DWORD elapsed = GetTickCount() - stateStartTime;
+
                         // --- FSM ---
                         if (state == STATE_SEARCH) {
                             float bestDist = 45.0f; activeTargetGuid = 0;
@@ -195,60 +107,110 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                             }
                             if (activeTargetGuid) { 
                                 state = STATE_MOVE; 
-                                g_Cmd.guid = activeTargetGuid; 
-                                g_Cmd.type = 4; // TARGET
+                                stateStartTime = GetTickCount(); // Обновляем таймер
+                                *(uint64_t*)(pDesc + 0x48) = activeTargetGuid; 
+                                *(uint64_t*)ADDR_TARGET_GUID = activeTargetGuid; 
                             }
                         }
 
                         if (activeTargetGuid != 0) {
+                            *(uint64_t*)(pDesc + 0x48) = activeTargetGuid;
+                            *(uint64_t*)ADDR_TARGET_GUID = activeTargetGuid;
+
                             uintptr_t tObj = 0; cur = *(uintptr_t*)(mgr + 0xAC);
                             while (cur != 0 && (cur & 1) == 0) { if(*(uint64_t*)(cur+0x30) == activeTargetGuid) { tObj = cur; break; } cur = *(uintptr_t*)(cur+0x3C); }
                             
                             if (tObj) {
                                 uintptr_t td = *(uintptr_t*)(tObj + 0x8);
                                 int thp = *(int*)(td + 0x60);
-                                float tx = *(float*)(tObj + 0x798), ty = *(float*)(tObj + 0x79C), tz = *(float*)(tObj + 0x7A0);
-                                float dist = sqrt(pow(tx-myX, 2) + pow(ty-myY, 2));
+                                float tx = *(float*)(tObj + 0x798), ty = *(float*)(tObj + 0x79C);
+                                float dx = tx - myX, dy = ty - myY;
+                                float dist = sqrt(dx*dx + dy*dy);
+                                float cYaw = atan2(dy, dx); if (cYaw < 0) cYaw += 6.283185f;
 
                                 printf("[TARGET] HP: %-5d | DIST: %.2f yds                  \n", thp, dist);
                                 
                                 if (thp > 0) {
-                                    if (dist > 4.2f) {
-                                        state = STATE_MOVE;
-                                        g_Cmd.x = tx; g_Cmd.y = ty; g_Cmd.z = tz;
-                                        g_Cmd.type = 1; // MOVE
+                                    if (GetForegroundWindow() == wowWnd) {
+                                        *(float*)(pLocal + 0x7A8) = cYaw; 
+                                        
+                                        if (dist > 4.2f) {
+                                            // Если бежим дольше 12 секунд - застряли. Откат.
+                                            if (state == STATE_MOVE && elapsed > 12000) {
+                                                printf("[!] ЗАСТРЯЛ! Отменяю цель...                 \n");
+                                                if (isMoving) { SetKey('W', false); isMoving = false; }
+                                                activeTargetGuid = 0; state = STATE_SEARCH; stateStartTime = GetTickCount();
+                                                continue;
+                                            }
+
+                                            if (state != STATE_MOVE) { state = STATE_MOVE; stateStartTime = GetTickCount(); }
+                                            
+                                            if (!isMoving || ++moveTimer > 15) { 
+                                                SetKey('W', true); 
+                                                isMoving = true; 
+                                                moveTimer = 0;
+                                            }
+                                        } else {
+                                            // Если бой длится дольше 25 секунд - что-то сломалось. Откат.
+                                            if (state == STATE_COMBAT && elapsed > 25000) {
+                                                printf("[!] БОЙ ЗАБАГАЛСЯ! Ищу новую цель...         \n");
+                                                if (isMoving) { SetKey('W', false); isMoving = false; }
+                                                activeTargetGuid = 0; state = STATE_SEARCH; stateStartTime = GetTickCount();
+                                                continue;
+                                            }
+
+                                            if (state != STATE_COMBAT) { state = STATE_COMBAT; stateStartTime = GetTickCount(); }
+
+                                            if (isMoving) { SetKey('W', false); isMoving = false; }
+                                            TapKey('1'); 
+                                            Sleep(100); 
+                                        }
                                     } else {
-                                        state = STATE_COMBAT;
-                                        g_Cmd.type = 2; // ATTACK
+                                        printf("[!] ОКНО НЕ В ФОКУСЕ! Пауза...                  \n");
+                                        if (isMoving) { SetKey('W', false); isMoving = false; }
                                     }
                                 } else {
-                                    state = STATE_LOOT;
-                                    printf("[STATE] WAITING FOR LOOT GENERATION...           \n");
-                                    // ДУМАЙ: Серверу нужно время, чтобы сделать труп лутабельным
+                                    if (state != STATE_LOOT) { state = STATE_LOOT; stateStartTime = GetTickCount(); }
+                                    
+                                    if (isMoving) { SetKey('W', false); isMoving = false; }
+                                    
+                                    printf("[STATE] ОЖИДАНИЕ СЕРВЕРА...                      \n");
                                     Sleep(1200); 
                                     
-                                    printf("[STATE] INTERACTING...                           \n");
-                                    g_Cmd.type = 5; // INTERACT
-                                    Sleep(800); // Даем окну время открыться
+                                    if (GetForegroundWindow() == wowWnd) {
+                                        printf("[STATE] СБОР ЛУТА (НАЖАТИЕ G)...                 \n");
+                                        TapKey('G'); 
+                                        Sleep(200);
+                                        TapKey('G'); 
+                                        
+                                        Sleep(2000); 
+                                    }
                                     
-                                    printf("[STATE] LOOTING...                               \n");
-                                    g_Cmd.type = 3; // LOOT
-                                    Sleep(1500); // Ждем автосбор
-                                    
-                                    activeTargetGuid = 0; state = STATE_SEARCH;
+                                    *(uint64_t*)(pDesc + 0x48) = 0; 
+                                    *(uint64_t*)ADDR_TARGET_GUID = 0; 
+                                    activeTargetGuid = 0; 
+                                    state = STATE_SEARCH;
+                                    stateStartTime = GetTickCount();
                                 }
-                            } else { activeTargetGuid = 0; state = STATE_SEARCH; }
-                        } else { printf("[TARGET] SEARCHING FOR TARGET...                  \n"); }
+                            } else { 
+                                activeTargetGuid = 0; state = STATE_SEARCH; stateStartTime = GetTickCount();
+                                if (isMoving) { SetKey('W', false); isMoving = false; }
+                            }
+                        } else { 
+                            printf("[TARGET] ПОИСК ЦЕЛИ...                            \n");
+                            if (isMoving) { SetKey('W', false); isMoving = false; }
+                            stateStartTime = GetTickCount(); // Сброс таймера в поиске
+                        }
                         
-                        printf("[FSM] %-15s                                  \n", stateNames[state]);
+                        printf("[FSM] %-15s | RUN KEY: %s          \n", stateNames[state], isMoving ? "PRESSED" : "RELEASED");
                     }
                 } __except(1) {}
             }
         }
-        Sleep(150);
+        Sleep(100);
     }
 
-    UnhookVTable();
+    if (isMoving) SetKey('W', false);
     fclose(f); FreeConsole(); FreeLibraryAndExitThread((HMODULE)lpParam, 0); return 0;
 }
 
