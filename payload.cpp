@@ -10,8 +10,9 @@
 #define OFFSET_OBJECT_MANAGER   0x2ED0
 #define ADDR_CLICK_TO_MOVE      0x00611130
 
-#define CTM_INTERACT            5 
-#define CTM_ATTACK              7 
+// ИСПРАВЛЕННЫЕ КОНСТАНТЫ CTM ДЛЯ 3.3.5a
+#define CTM_INTERACT            5  // Разговор / Сбор лута (NpcInteract)
+#define CTM_ATTACK              11 // Атака цели (AttackGuid) - Ранее было 7, что означало "Сундук", и вызывало краш!
 
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
@@ -23,7 +24,6 @@ bool g_Active = false;
 WNDPROC oWndProc = nullptr;
 std::vector<uint64_t> g_Blacklist; 
 
-// Виртуальный таргет бота 
 uint64_t g_BotTarget = 0; 
 
 float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) {
@@ -35,9 +35,13 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
     static int lastType = 0;
     static DWORD lastTime = 0;
 
+    // ВАЖНО: Делаем переменные static, чтобы WoW не читал мертвую память стека в следующем кадре
+    static uint64_t ctmGuid = 0;
+    static float ctmPos[3] = { 0, 0, 0 };
+
     if (guid != lastGuid || type != lastType || (GetTickCount() - lastTime > 3000)) {
-        uint64_t ctmGuid = guid;
-        float ctmPos[3] = { x, y, z };
+        ctmGuid = guid;
+        ctmPos[0] = x; ctmPos[1] = y; ctmPos[2] = z;
         
         ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, type, &ctmGuid, ctmPos, 0.5f);
         
@@ -84,7 +88,7 @@ void BotPulse() {
                 if (objType == 3 || objType == 4) { 
                     uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                     if (desc) {
-                        targetHp = *(int*)(desc + 0x60); // Читаем только текущее ХП
+                        targetHp = *(int*)(desc + 0x60); 
                         targetFlags = *(uint32_t*)(desc + 0x114);
                         tX = *(float*)(cur + 0x798);
                         tY = *(float*)(cur + 0x79C);
@@ -96,7 +100,7 @@ void BotPulse() {
             }
             cur = *(uintptr_t*)(cur + 0x3C);
         }
-        if (!hasTarget) g_BotTarget = 0; // Цель исчезла из памяти
+        if (!hasTarget) g_BotTarget = 0; 
     }
 
     // 3. Выполняем действия
@@ -114,10 +118,10 @@ void BotPulse() {
         else {
             g_Blacklist.push_back(g_BotTarget);
             g_BotTarget = 0; 
-            printf("Target Empty. Blacklisted.          \n"); // \n чтобы видеть историю лута
+            printf("Target Empty. Blacklisted.          \n");
         }
     } 
-    // 4. Поиск новой цели
+    // 4. Умный поиск новой цели
     else {
         uint64_t bestGuid = 0;
         float bestDist = 40.0f; 
@@ -126,23 +130,24 @@ void BotPulse() {
         while (cur && (cur & 1) == 0) {
             int type = *(int*)(cur + 0x14);
             
-            if (type == 3) { // ТОЛЬКО NPC
+            if (type == 3) { 
                 uint64_t guid = *(uint64_t*)(cur + 0x30);
                 
                 if (std::find(g_Blacklist.begin(), g_Blacklist.end(), guid) == g_Blacklist.end()) {
                     uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                     if (desc) {
-                        // ФАТАЛЬНАЯ ОШИБКА БЫЛА ЗДЕСЬ: читаем ТОЛЬКО текущее ХП. 
                         int hp = *(int*)(desc + 0x60); 
+                        int maxHp = *(int*)(desc + 0x80); // Правильное смещение Макс ХП (+0x80)
                         
-                        // Если ХП больше нуля - моб живой, берем его!
-                        if (hp > 0) {
+                        // Игнорируем невидимые триггеры с MaxHP = 0 и мертвых мобов
+                        if (hp > 0 && maxHp > 1) {
                             float mX = *(float*)(cur + 0x798);
                             float mY = *(float*)(cur + 0x79C);
                             float mZ = *(float*)(cur + 0x7A0);
                             float dist = GetDistance3D(myX, myY, myZ, mX, mY, mZ);
 
-                            if (dist < bestDist) {
+                            // Не берем цели ближе 0.1м (это багнутые объекты под текстурами)
+                            if (dist < bestDist && dist > 0.1f) {
                                 bestDist = dist;
                                 bestGuid = guid;
                             }
@@ -189,7 +194,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
             __try {
                 BotPulse();
             } __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Ignore memory fluctuations
+                // Игнорируем скачки памяти при загрузке
             }
             lastTick = GetTickCount();
             isPulsing = false;
@@ -200,7 +205,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v4.1: Bugfix Edition ---\n");
+    printf("--- Bot v5.0: The Final Fix ---\n");
 
     HWND hwnd = FindWindowA(NULL, "World of Warcraft");
     if (!hwnd) {
@@ -211,9 +216,9 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(hwnd, 1337, 50, NULL); 
 
-    printf("[+] Object Manager logic fixed.\n");
+    printf("[+] CTM Attack Types correctly initialized.\n");
     printf("[!] Make sure 'Click-to-Move' and 'Auto Loot' are ON.\n");
-    printf("[+] Press [INSERT] to start/stop the bot.\n");
+    printf("[+] Press[INSERT] to start/stop the bot.\n");
     return 0;
 }
 
