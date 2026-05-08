@@ -13,7 +13,7 @@
 #define ADDR_LUA_EXECUTE         0x00819210
 #define ADDR_CLICK_TO_MOVE       0x00611130
 #define ADDR_GET_PLAYER          0x004038BE
-#define ADDR_CGGAMEUI_UPDATE     0x007CDE10 // Обновление UI, идеальное место для хука
+#define ADDR_CGGAMEUI_UPDATE     0x007CDE10 
 
 enum BotState { STATE_SEARCH, STATE_MOVE, STATE_COMBAT, STATE_LOOT };
 const char* stateNames[] = { "SEARCHING", "MOVING", "COMBAT", "LOOTING" };
@@ -27,9 +27,9 @@ tFrameScript_Execute Lua_DoString = (tFrameScript_Execute)ADDR_LUA_EXECUTE;
 tClickToMove ClickToMove = (tClickToMove)ADDR_CLICK_TO_MOVE;
 tGetActivePlayer GetPlayer = (tGetActivePlayer)ADDR_GET_PLAYER;
 
-// --- СИНХРОННЫЕ КОМАНДЫ ---
+// --- СИНХРОННАЯ ОЧЕРЕДЬ (Для Копайлота) ---
 struct BotCommand {
-    volatile int type; // 1: Move, 2: Attack, 3: Interact, 4: Loot
+    volatile int type; // 1: Move, 2: Attack, 3: Interact, 4: Loot, 5: Init Settings
     volatile uint64_t guid;
     volatile float x, y, z;
 } g_Cmd;
@@ -61,14 +61,16 @@ void TapKey(WORD vKey) {
 
 // --- ЛОГИКА БОТА ДЛЯ MAIN THREAD ---
 void __stdcall DoBotLogic() {
+    int cmd = g_Cmd.type;
+    if (cmd == 0) return;
+
     uintptr_t pLocal = GetPlayer();
     if (pLocal && SafeRead<int>(pLocal + 0x14) == 4) {
         __try {
-            int cmd = g_Cmd.type;
             if (cmd == 1) { 
                 float pos[3] = { g_Cmd.x, g_Cmd.y, g_Cmd.z };
-                uint64_t zero = 0;
-                ClickToMove(pLocal, 4, &zero, pos, 0.5f);
+                // Передаем GUID цели в CTM, чтобы движок понял, куда мы бежим
+                ClickToMove(pLocal, 4, (uint64_t*)&g_Cmd.guid, pos, 0.5f);
             } else if (cmd == 2) { 
                 Lua_DoString("if not IsCurrentSpell(6603) then StartAttack() end", "bot", 0);
             } else if (cmd == 3) { 
@@ -77,45 +79,47 @@ void __stdcall DoBotLogic() {
                 Lua_DoString(cmdBuf, "bot", 0);
             } else if (cmd == 4) { 
                 Lua_DoString("if LootFrame:IsVisible() then for i=1,GetNumLootItems() do LootSlot(i) end CloseLoot() end", "bot", 0);
+            } else if (cmd == 5) {
+                // Принудительно включаем Click-To-Move и AutoLoot
+                Lua_DoString("SetCVar('autoInteract', '1') SetCVar('autoLootDefault', '1')", "bot", 0);
             }
-            g_Cmd.type = 0;
         } __except(1) {}
     }
+    // ЖЕЛЕЗОБЕТОННЫЙ СБРОС КОМАНДЫ, чтобы внешний поток никогда не зависал
+    g_Cmd.type = 0;
 }
 
 // --- ГОЛЫЙ ХУК (NAKED) ---
 __declspec(naked) void Hook_CGGameUI_Update() {
     __asm {
-        pushad                  // Сохраняем все регистры общего назначения
-        pushfd                  // Сохраняем флаги
-        call DoBotLogic         // Вызываем нашу логику (теперь мы в безопасности стека Main Thread)
-        popfd                   // Восстанавливаем флаги
-        popad                   // Восстанавливаем регистры
-        jmp dword ptr [g_Trampoline] // Прыгаем на оригинальные инструкции
+        pushad
+        pushfd
+        call DoBotLogic
+        popfd
+        popad
+        mov eax, g_Trampoline // Безопасный прыжок
+        jmp eax
     }
 }
 
 // --- УСТАНОВКА DETOUR ХУКА ---
 bool InstallDetourHook() {
     void* target = (void*)ADDR_CGGAMEUI_UPDATE;
-    int len = 6; // Пролог функции CGGameUI::Update в 3.3.5a занимает ровно 6 байт (55 8B EC 83 EC 14)
+    int len = 6; 
     
     g_Trampoline = VirtualAlloc(NULL, len + 5, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!g_Trampoline) return false;
     
-    // Копируем оригинальные байты в трамплин
     memcpy(g_Trampoline, target, len);
     
-    // Пишем прыжок из трамплина обратно в оригинальную функцию (после хука)
     uintptr_t gate = (uintptr_t)target + len;
-    *(BYTE*)((uintptr_t)g_Trampoline + len) = 0xE9; // Опкод JMP
+    *(BYTE*)((uintptr_t)g_Trampoline + len) = 0xE9; 
     *(uintptr_t*)((uintptr_t)g_Trampoline + len + 1) = gate - ((uintptr_t)g_Trampoline + len) - 5;
     
-    // Заменяем оригинальную функцию прыжком на наш Hook_CGGameUI_Update
     DWORD old;
     VirtualProtect(target, len, PAGE_EXECUTE_READWRITE, &old);
-    memset(target, 0x90, len); // Забиваем NOP-ами
-    *(BYTE*)target = 0xE9; // Опкод JMP
+    memset(target, 0x90, len); 
+    *(BYTE*)target = 0xE9; 
     *(uintptr_t*)((uintptr_t)target + 1) = (uintptr_t)Hook_CGGameUI_Update - (uintptr_t)target - 5;
     VirtualProtect(target, len, old, &old);
     
@@ -127,7 +131,7 @@ void RemoveDetourHook() {
         void* target = (void*)ADDR_CGGAMEUI_UPDATE;
         DWORD old;
         VirtualProtect(target, 6, PAGE_EXECUTE_READWRITE, &old);
-        memcpy(target, g_Trampoline, 6); // Возвращаем оригинальные байты
+        memcpy(target, g_Trampoline, 6); 
         VirtualProtect(target, 6, old, &old);
         VirtualFree(g_Trampoline, 0, MEM_RELEASE);
     }
@@ -138,14 +142,14 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f; freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Paladin Detour Master v18.0 (No Crashes!) ---\n");
+    printf("--- Paladin GodMode v19.0 (Anti-Idiot Settings) ---\n");
     if (InstallDetourHook()) {
-        printf("[+] CGGameUI::Update Detoured! Pure Main Thread context achieved.\n");
+        printf("[+] CGGameUI::Update Hooked! FSM Sync verified.\n");
     } else {
-        printf("[-] Failed to install hook. Run as Administrator!\n");
+        printf("[-] Hook failed. Run as Administrator!\n");
         return 0;
     }
-    printf("[!] BIND REQUIRES: '9' - Heal ONLY. Auto-Loot must be ON.\n");
+    printf("[!] CTM & AutoLoot will be forced via Lua.\n");
     printf("--------------------------------------------------\n");
 
     uintptr_t connectionAddr = (uintptr_t)GetModuleHandleA(NULL) + OFFSET_S_CUR_MGR;
@@ -153,6 +157,10 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
     BotState state = STATE_SEARCH;
     uint64_t activeTargetGuid = 0;
     DWORD stateStartTime = GetTickCount();
+
+    // Запускаем инициализацию настроек игры
+    g_Cmd.type = 5;
+    while(g_Cmd.type != 0) Sleep(10);
 
     while (!GetAsyncKeyState(VK_END)) {
         uintptr_t clientConn = SafeRead<uintptr_t>(connectionAddr);
@@ -178,6 +186,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                     printf("[PLAYER] HP: %-5d/%-5d | LVL: %d | POS: %.1f, %.1f      \n", hp, maxHp, lvl, myX, myY);
                     printf("--------------------------------------------------\n");
 
+                    // Единственный безопасный хардверный каст (Хил)
                     if (hp > 0 && maxHp > 0 && (hp * 100 / maxHp) < 40) {
                         if (GetForegroundWindow() == g_WowWnd) {
                             TapKey('9'); 
@@ -241,7 +250,9 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                                     }
                                     if (state != STATE_MOVE) { state = STATE_MOVE; stateStartTime = GetTickCount(); }
                                     
-                                    g_Cmd.x = tx; g_Cmd.y = ty; g_Cmd.z = tz; g_Cmd.type = 1;
+                                    g_Cmd.guid = activeTargetGuid;
+                                    g_Cmd.x = tx; g_Cmd.y = ty; g_Cmd.z = tz; 
+                                    g_Cmd.type = 1;
                                     while(g_Cmd.type != 0) Sleep(10);
                                 } else {
                                     if (state == STATE_COMBAT && elapsed > 25000) {
