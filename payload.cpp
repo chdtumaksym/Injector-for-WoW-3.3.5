@@ -6,14 +6,14 @@
 
 #pragma comment(lib, "d3d9.lib")
 
-// --- ОФФСЕТЫ 3.3.5a (12340) ---
-#define OFFSET_S_CUR_MGR         0x00879CE0
-#define OFFSET_OBJECT_MANAGER    0x2ED0
-#define ADDR_CLICK_TO_MOVE       0x00611130
-#define ADDR_GET_PLAYER          0x004038BE
-#define ADDR_D3D9_DEVICE         0x00C5DF88
+// --- СТАТИЧНЫЕ АДРЕСА 3.3.5a (12340) ---
+// ВНИМАНИЕ: Эти адреса уже включают базу 0x400000.
+#define ADDR_S_CUR_MGR          0x00879CE0
+#define OFFSET_OBJECT_MANAGER   0x2ED0
+#define ADDR_CLICK_TO_MOVE      0x00611130
+#define ADDR_GET_PLAYER         0x004038BE
+#define ADDR_D3D9_DEVICE        0x00C5DF88
 
-// Отключаем проверки компилятора для стабильности Manual Map
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
 #pragma strict_gs_check(off)
@@ -26,17 +26,24 @@ tEndScene oEndScene = nullptr;
 bool g_BotActive = false;
 uintptr_t g_Base = 0;
 
-// Безопасная обертка для ClickToMove
+// Корректно вычисляем адрес, учитывая возможную разницу в базе модуля
+uintptr_t FixAddr(uintptr_t staticAddr) {
+    return g_Base + (staticAddr - 0x400000);
+}
+
+struct CTM_DATA {
+    uint64_t guid;
+    float pos[3];
+};
+static CTM_DATA g_ctmData;
+
 void SafeCTM(uintptr_t pLocal, int clickType, uint64_t guid, float x, float y, float z) {
-    static uint64_t s_guid;
-    static float s_pos[3];
     if (!pLocal) return;
+    g_ctmData.guid = guid;
+    g_ctmData.pos[0] = x; g_ctmData.pos[1] = y; g_ctmData.pos[2] = z;
     
-    s_guid = guid;
-    s_pos[0] = x; s_pos[1] = y; s_pos[2] = z;
-    
-    // Вызов через __fastcall: pLocal идет в ECX, nullptr в EDX
-    ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, nullptr, clickType, &s_guid, s_pos, 0.5f);
+    auto fnCTM = (tClickToMove)FixAddr(ADDR_CLICK_TO_MOVE);
+    fnCTM(pLocal, nullptr, clickType, &g_ctmData.guid, g_ctmData.pos, 0.5f);
 }
 
 HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
@@ -46,27 +53,38 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
             g_BotActive = !g_BotActive;
             keyState = true;
             Beep(g_BotActive ? 800 : 400, 100);
+            printf("\n[!] Bot Status: %s\n", g_BotActive ? "ACTIVE" : "DISABLED");
         }
     } else keyState = false;
 
     if (g_BotActive) {
-        uintptr_t conn = *(uintptr_t*)(g_Base + OFFSET_S_CUR_MGR);
+        // Исправлено: Читаем указатель по скорректированному адресу
+        uintptr_t connAddr = FixAddr(ADDR_S_CUR_MGR);
+        uintptr_t conn = (connAddr) ? *(uintptr_t*)connAddr : 0;
         uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
-        uintptr_t pLocal = ((tGetPlayer)ADDR_GET_PLAYER)();
+        
+        auto fnGetPlayer = (tGetPlayer)FixAddr(ADDR_GET_PLAYER);
+        uintptr_t pLocal = fnGetPlayer();
 
         if (mgr && pLocal) {
-            float myX = *(float*)(pLocal + 0x798), myY = *(float*)(pLocal + 0x79C);
+            float myX = *(float*)(pLocal + 0x798);
+            float myY = *(float*)(pLocal + 0x79C);
+            
             uint64_t bestGuid = 0; 
-            float bestDist = 40.0f; 
-            float tPos[3] = {0};
+            float bestDist = 35.0f; 
+            float tPos[3] = {0, 0, 0};
             
             uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
+            // Безопасный обход списка объектов
             while (cur && (cur & 1) == 0) {
                 if (*(int*)(cur + 0x14) == 3) { // Unit
                     uintptr_t desc = *(uintptr_t*)(cur + 0x8);
-                    if (desc && *(int*)(desc + 0x60) > 0) { // Alive
-                        float dx = *(float*)(cur + 0x798) - myX, dy = *(float*)(cur + 0x79C) - myY;
+                    // Проверка здоровья и того, что это не наш GUID
+                    if (desc && *(int*)(desc + 0x60) > 0) { 
+                        float dx = *(float*)(cur + 0x798) - myX;
+                        float dy = *(float*)(cur + 0x79C) - myY;
                         float dist = sqrt(dx*dx + dy*dy);
+                        
                         if (dist < bestDist) {
                             bestDist = dist;
                             bestGuid = *(uint64_t*)(cur + 0x30);
@@ -80,8 +98,8 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
             }
 
             static DWORD lastAction = 0;
-            if (bestGuid && GetTickCount() - lastAction > 1000) {
-                // Тип 4 — это нативное взаимодействие. Персонаж сам побежит и выберет цель.
+            if (bestGuid && GetTickCount() - lastAction > 800) {
+                printf("Target: %llu | Distance: %.2f\r", bestGuid, bestDist);
                 SafeCTM(pLocal, 4, bestGuid, tPos[0], tPos[1], tPos[2]);
                 lastAction = GetTickCount();
             }
@@ -93,10 +111,13 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
 void Setup() {
     AllocConsole();
     freopen("CONOUT$", "w", stdout);
-    printf("[+] Bot Core Loaded. Base: 0x%p\n", (void*)g_Base);
+    printf("--- Final Bot Core (FixAddr Edition) ---\n");
+    printf("[+] Module Base: 0x%p\n", (void*)g_Base);
     
     uintptr_t deviceAddr = 0;
-    while (!(deviceAddr = *(uintptr_t*)ADDR_D3D9_DEVICE)) Sleep(100);
+    uintptr_t staticDevicePtr = FixAddr(ADDR_D3D9_DEVICE);
+    
+    while (!(deviceAddr = *(uintptr_t*)staticDevicePtr)) Sleep(100);
     
     uintptr_t* vTable = *(uintptr_t**)deviceAddr;
     if (vTable) {
@@ -105,14 +126,15 @@ void Setup() {
         oEndScene = (tEndScene)vTable[42];
         vTable[42] = (uintptr_t)HookedEndScene;
         VirtualProtect(&vTable[42], 4, old, &old);
-        printf("[+] Hooked EndScene successfully.\n");
+        printf("[+] D3D9 Hook Success. Bot is ready.\n");
     }
 }
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
     if (r == DLL_PROCESS_ATTACH) {
         g_Base = (uintptr_t)GetModuleHandle(NULL);
-        CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)Setup, NULL, 0, NULL);
+        HANDLE hThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)Setup, NULL, 0, NULL);
+        if (hThread) CloseHandle(hThread);
     }
     return TRUE;
 }
