@@ -3,27 +3,29 @@
 #include <cmath>
 #include <cstdio>
 #include <d3d9.h>
-#include <vector>
 
 #pragma comment(lib, "d3d9.lib")
 #pragma comment(lib, "user32.lib")
 
-// --- СТАТИЧНЫЕ ОФФСЕТЫ ДАННЫХ (Они работают, их не трогаем) ---
+// --- СТАТИЧНЫЕ ОФФСЕТЫ 3.3.5a (12340) ---
 #define OFFSET_S_CUR_MGR         0x00879CE0
 #define OFFSET_OBJECT_MANAGER    0x2ED0
 #define ADDR_TARGET_GUID         0x00BD07B0 
 
+#define ADDR_CLICK_TO_MOVE       0x00611130
+#define ADDR_INTERACT            0x00609390
+
 enum BotState { STATE_SEARCH, STATE_MOVE, STATE_COMBAT, STATE_LOOT };
 const char* stateNames[] = { "SEARCHING", "MOVING", "COMBAT", "LOOTING" };
 
-// --- ДИНАМИЧЕСКИЕ ФУНКЦИИ (Будут найдены сканером) ---
+// --- ФУНКЦИИ ДВИЖКА ---
 typedef void(__thiscall* tClickToMove)(uintptr_t playerPtr, int clickType, uint64_t* interactGuid, float* pos, float precision);
-typedef void(__thiscall* tInteract)(uintptr_t playerPtr, uintptr_t unitPtr); // В 3.3.5a Interact принимает player как this
+typedef void(__thiscall* tInteract)(uintptr_t playerPtr, uintptr_t unitPtr);
 
-tClickToMove DynClickToMove = nullptr;
-tInteract DynInteractUnit = nullptr;
+tClickToMove EngineClickToMove = (tClickToMove)ADDR_CLICK_TO_MOVE;
+tInteract EngineInteractUnit = (tInteract)ADDR_INTERACT;
 
-// --- ОЧЕРЕДЬ ДЛЯ ИНТЕРНАЛА ---
+// --- СИНХРОННАЯ ОЧЕРЕДЬ КОМАНД ---
 struct BotCommand {
     volatile int type; // 0: None, 1: Move, 2: Interact (Attack/Loot)
     volatile uintptr_t pLocal;
@@ -31,6 +33,9 @@ struct BotCommand {
     volatile uint64_t guid;
     volatile float x, y, z;
 } g_Cmd;
+
+void* g_EndSceneTrampoline = nullptr;
+uintptr_t g_EndSceneAddr = 0;
 
 template <typename T>
 T SafeRead(uintptr_t address) {
@@ -46,138 +51,93 @@ void SetConsoleCursor(int x, int y) {
     SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), c);
 }
 
-// --- СИГНАТУРНЫЙ СКАНЕР ПАМЯТИ ---
-bool CompareByteArray(BYTE* data, const char* signature, const char* mask) {
-    for (; *mask; ++mask, ++data, ++signature) {
-        if (*mask == 'x' && *data != (BYTE)*signature) return false;
-    }
-    return (*mask) == NULL;
-}
-
-uintptr_t FindPattern(uintptr_t startAddress, DWORD size, const char* signature, const char* mask) {
-    BYTE* data = (BYTE*)startAddress;
-    for (DWORD i = 0; i < size; i++) {
-        if (CompareByteArray(&data[i], signature, mask)) {
-            return (uintptr_t)&data[i];
-        }
-    }
-    return 0;
-}
-
-void InitializeDynamicOffsets() {
-    HMODULE hModule = GetModuleHandleA(NULL);
-    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)hModule;
-    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((uintptr_t)hModule + dosHeader->e_lfanew);
-    DWORD sizeOfImage = ntHeaders->OptionalHeader.SizeOfImage;
-
-    // Сигнатура ClickToMove: 55 8B EC 81 EC ? ? ? ? 53 56 57 8B F1 8B
-    uintptr_t ctmAddr = FindPattern((uintptr_t)hModule, sizeOfImage, 
-        "\x55\x8B\xEC\x81\xEC\x00\x00\x00\x00\x53\x56\x57\x8B\xF1\x8B", 
-        "xxxxx????xxxxxx");
-
-    // Сигнатура Interact: 55 8B EC 83 EC ? 53 56 8B F1 57 83 BE
-    uintptr_t interactAddr = FindPattern((uintptr_t)hModule, sizeOfImage, 
-        "\x55\x8B\xEC\x83\xEC\x00\x53\x56\x8B\xF1\x57\x83\xBE", 
-        "xxxxx?xxxxxxx");
-
-    if (ctmAddr) DynClickToMove = (tClickToMove)ctmAddr;
-    else DynClickToMove = (tClickToMove)0x00611130; // Fallback на дефолт
-
-    // В 3.3.5a правильный Interact использует локального игрока как ECX (this)
-    if (interactAddr) DynInteractUnit = (tInteract)interactAddr;
-    else DynInteractUnit = (tInteract)0x00609390; // Fallback
-
-    printf("[PATTERN] ClickToMove найден по адресу: 0x%X\n", (unsigned int)ctmAddr);
-    printf("[PATTERN] Interact найден по адресу: 0x%X\n", (unsigned int)interactAddr);
-}
-
-// --- VTABLE ХУК D3D9 ---
+// --- ГЛОБАЛЬНЫЙ ХУК D3D9.DLL ЧЕРЕЗ ТРАМПЛИН ---
 typedef HRESULT(__stdcall* tEndScene)(IDirect3DDevice9*);
-tEndScene oEndScene = nullptr;
 
 HRESULT __stdcall HookedEndScene(IDirect3DDevice9* pDevice) {
-    if (!pDevice) return oEndScene(pDevice);
-
     int cmd = g_Cmd.type;
     if (cmd != 0 && g_Cmd.pLocal != 0) {
         __try {
-            if (cmd == 1 && DynClickToMove) { 
+            if (cmd == 1) { 
                 float pos[3] = { g_Cmd.x, g_Cmd.y, g_Cmd.z };
-                DynClickToMove(g_Cmd.pLocal, 4, (uint64_t*)&g_Cmd.guid, pos, 0.5f);
+                EngineClickToMove(g_Cmd.pLocal, 4, (uint64_t*)&g_Cmd.guid, pos, 0.5f);
             } 
-            else if (cmd == 2 && DynInteractUnit && g_Cmd.pTarget != 0) { 
-                // Вызываем Interact от лица локального игрока к цели
-                DynInteractUnit(g_Cmd.pLocal, g_Cmd.pTarget); 
+            else if (cmd == 2 && g_Cmd.pTarget != 0) { 
+                EngineInteractUnit(g_Cmd.pLocal, g_Cmd.pTarget); 
             }
         } __except(1) {}
         g_Cmd.type = 0; 
     }
-
-    return oEndScene(pDevice);
+    // Вызываем оригинальный EndScene через трамплин (стек остается целым)
+    return ((tEndScene)g_EndSceneTrampoline)(pDevice);
 }
 
-bool InstallVTableHook() {
+bool InstallGlobalTrampoline() {
     IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
     if (!pD3D) return false;
     HWND dummyWindow = CreateWindowA("STATIC", "Dummy", WS_OVERLAPPED, 0, 0, 100, 100, NULL, NULL, NULL, NULL);
     D3DPRESENT_PARAMETERS d3dpp = {0}; d3dpp.Windowed = TRUE; d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD; d3dpp.hDeviceWindow = dummyWindow;
     IDirect3DDevice9* pDev = nullptr;
+    
     if (FAILED(pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, dummyWindow, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDev))) {
         pD3D->Release(); DestroyWindow(dummyWindow); return false;
     }
+    
     uintptr_t* pVTable = *(uintptr_t**)pDev;
-    oEndScene = (tEndScene)pVTable[42];
+    g_EndSceneAddr = pVTable[42]; // Получаем реальный адрес d3d9.dll!EndScene
+    
+    // Создаем трамплин
+    g_EndSceneTrampoline = VirtualAlloc(NULL, 10, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!g_EndSceneTrampoline) { pDev->Release(); pD3D->Release(); DestroyWindow(dummyWindow); return false; }
+    
+    memcpy(g_EndSceneTrampoline, (void*)g_EndSceneAddr, 5); // Копируем 5 оригинальных байт
+    *(BYTE*)((uintptr_t)g_EndSceneTrampoline + 5) = 0xE9; // JMP обратно
+    *(uintptr_t*)((uintptr_t)g_EndSceneTrampoline + 6) = (g_EndSceneAddr + 5) - ((uintptr_t)g_EndSceneTrampoline + 5) - 5;
+    
+    // Ставим хук
     DWORD old;
-    VirtualProtect(&pVTable[42], sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &old);
-    pVTable[42] = (uintptr_t)HookedEndScene;
-    VirtualProtect(&pVTable[42], sizeof(uintptr_t), old, &old);
+    VirtualProtect((void*)g_EndSceneAddr, 5, PAGE_EXECUTE_READWRITE, &old);
+    *(BYTE*)g_EndSceneAddr = 0xE9; // JMP на наш хук
+    *(uintptr_t*)(g_EndSceneAddr + 1) = (uintptr_t)HookedEndScene - g_EndSceneAddr - 5;
+    VirtualProtect((void*)g_EndSceneAddr, 5, old, &old);
+    
     pDev->Release(); pD3D->Release(); DestroyWindow(dummyWindow);
     return true;
+}
+
+void RemoveGlobalTrampoline() {
+    if (g_EndSceneTrampoline && g_EndSceneAddr) {
+        DWORD old;
+        VirtualProtect((void*)g_EndSceneAddr, 5, PAGE_EXECUTE_READWRITE, &old);
+        memcpy((void*)g_EndSceneAddr, g_EndSceneTrampoline, 5); // Возвращаем байты на место
+        VirtualProtect((void*)g_EndSceneAddr, 5, old, &old);
+        VirtualFree(g_EndSceneTrampoline, 0, MEM_RELEASE);
+    }
 }
 
 void SendCommandAndWait(int type, uintptr_t pLocal, uint64_t guid = 0, float x = 0, float y = 0, float z = 0, uintptr_t pTarget = 0) {
     g_Cmd.pLocal = pLocal; g_Cmd.guid = guid; g_Cmd.x = x; g_Cmd.y = y; g_Cmd.z = z; g_Cmd.pTarget = pTarget; g_Cmd.type = type;
     int timeout = 0;
-    while (g_Cmd.type != 0 && timeout < 50) { 
+    while (g_Cmd.type != 0 && timeout < 50) { // 500мс таймаут
         Sleep(10);
         timeout++;
     }
     if (g_Cmd.type != 0) g_Cmd.type = 0; 
 }
 
-void UnhookVTable() {
-    if (!oEndScene) return;
-    IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
-    if (!pD3D) return;
-    HWND dummyWindow = CreateWindowA("STATIC", "Dummy", WS_OVERLAPPED, 0, 0, 100, 100, NULL, NULL, NULL, NULL);
-    D3DPRESENT_PARAMETERS d3dpp = {0}; d3dpp.Windowed = TRUE; d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD; d3dpp.hDeviceWindow = dummyWindow;
-    IDirect3DDevice9* pDev = nullptr;
-    if (SUCCEEDED(pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, dummyWindow, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDev))) {
-        uintptr_t* pVTable = *(uintptr_t**)pDev;
-        DWORD old;
-        VirtualProtect(&pVTable[42], sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &old);
-        pVTable[42] = (uintptr_t)oEndScene;
-        VirtualProtect(&pVTable[42], sizeof(uintptr_t), old, &old);
-        pDev->Release();
-    }
-    pD3D->Release(); DestroyWindow(dummyWindow);
-}
-
 DWORD WINAPI MainThread(LPVOID lpParam) {
     AllocConsole();
     FILE* f; freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Paladin Pattern Scanner v27.0 (No Binds) ---\n");
-    InitializeDynamicOffsets();
-    
-    if (InstallVTableHook()) {
-        printf("[+] D3D9 Hooked successfully.\n");
+    printf("--- Paladin Global Detour v28.0 (No Binds) ---\n");
+    if (InstallGlobalTrampoline()) {
+        printf("[+] D3D9.dll Global Hooked! Команды дойдут 100%%.\n");
     } else {
         printf("[-] Hook failed. Run as Administrator!\n");
         return 0;
     }
     printf("[!] ГАЛОЧКИ 'Перемещение по щелчку' И 'Автосбор' ДОЛЖНЫ БЫТЬ ВКЛЮЧЕНЫ!\n");
-    printf("[!] БИНДЫ БОЛЬШЕ НЕ НУЖНЫ. ВСЕ ДЕЙСТВИЯ ЧЕРЕЗ ПАМЯТЬ.\n");
+    printf("[!] Иначе движок игры заблокирует выполнение команд.\n");
     printf("--------------------------------------------------\n");
 
     uintptr_t connectionAddr = (uintptr_t)GetModuleHandleA(NULL) + OFFSET_S_CUR_MGR;
@@ -188,7 +148,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
 
     while (!GetAsyncKeyState(VK_END)) {
         uintptr_t clientConn = SafeRead<uintptr_t>(connectionAddr);
-        SetConsoleCursor(0, 8);
+        SetConsoleCursor(0, 7);
 
         if (!clientConn) {
             printf("[!] Ожидание подключения к миру...                           \n");
@@ -273,8 +233,8 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                                 }
                                 if (state != STATE_MOVE) { state = STATE_MOVE; stateStartTime = GetTickCount(); }
                                 
-                                // Отправляем команду бега напрямую в движок
-                                SendCommandAndWait(1, pLocal, activeTargetGuid, tx, ty, tz);
+                                // Внутренний бег
+                                SendCommandAndWait(1, pLocal, activeTargetGuid, tx, ty, tz, 0);
                             } else {
                                 if (state == STATE_COMBAT && elapsed > 25000) {
                                     printf("[!] БОЙ ЗАБАГАЛСЯ! Сбрасываю...               \n");
@@ -283,7 +243,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                                 }
                                 if (state != STATE_COMBAT) { state = STATE_COMBAT; stateStartTime = GetTickCount(); }
 
-                                // Правый клик по цели каждые 2 секунды запускает/поддерживает автоатаку
+                                // Внутренняя автоатака каждые 2 сек
                                 if (GetTickCount() - lastActionTime > 2000) {
                                     SendCommandAndWait(2, pLocal, activeTargetGuid, 0, 0, 0, tObj);
                                     lastActionTime = GetTickCount();
@@ -295,8 +255,7 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                             printf("[STATE] ЖДЕМ ГЕНЕРАЦИЮ ТРУПА СЕРВЕРОМ...         \n");
                             Sleep(1200); 
                             
-                            printf("[STATE] NATIVE ВЗАИМОДЕЙСТВИЕ (ЛУТ)...           \n");
-                            // Нативный правый клик по трупу. При включенном AutoLoot соберет всё.
+                            printf("[STATE] NATIVE ЛУТ (АВТОСБОР)...                 \n");
                             SendCommandAndWait(2, pLocal, activeTargetGuid, 0, 0, 0, tObj);
                             
                             Sleep(2000); 
@@ -314,13 +273,13 @@ DWORD WINAPI MainThread(LPVOID lpParam) {
                     printf("[TARGET] ПОИСК НОВОЙ ЦЕЛИ...                      \n");
                     stateStartTime = GetTickCount();
                 }
-                printf("[FSM] %-15s | PATTERN SCAN: ACTIVE       \n", stateNames[state]);
+                printf("[FSM] %-15s | GLOBAL DETOUR: ACTIVE    \n", stateNames[state]);
             }
         }
         Sleep(100);
     }
 
-    UnhookVTable();
+    RemoveGlobalTrampoline();
     fclose(f); FreeConsole(); FreeLibraryAndExitThread((HMODULE)lpParam, 0); return 0;
 }
 
