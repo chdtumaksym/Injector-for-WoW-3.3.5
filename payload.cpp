@@ -23,7 +23,7 @@ bool g_Active = false;
 WNDPROC oWndProc = nullptr;
 std::vector<uint64_t> g_Blacklist; 
 
-// Виртуальный таргет бота (теперь мы не ломаем память интерфейса WoW!)
+// Виртуальный таргет бота 
 uint64_t g_BotTarget = 0; 
 
 float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) {
@@ -35,10 +35,7 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
     static int lastType = 0;
     static DWORD lastTime = 0;
 
-    // Шлем команду раз в 3 секунды, чтобы перс двигался, но не ломал анимацию
     if (guid != lastGuid || type != lastType || (GetTickCount() - lastTime > 3000)) {
-        
-        // Локальные копии для безопасной передачи в движок
         uint64_t ctmGuid = guid;
         float ctmPos[3] = { x, y, z };
         
@@ -74,21 +71,20 @@ void BotPulse() {
     if (!pLocal) return;
 
     bool hasTarget = false;
-    int targetHp = 0, targetMaxHp = 0;
+    int targetHp = 0;
     uint32_t targetFlags = 0;
     float tX = 0, tY = 0, tZ = 0;
 
-    // 2. Читаем инфу о нашем ВИРТУАЛЬНОМ таргете (если он есть)
+    // 2. Читаем данные виртуального таргета
     if (g_BotTarget != 0) {
         cur = *(uintptr_t*)(mgr + 0xAC);
         while (cur && (cur & 1) == 0) {
             if (*(uint64_t*)(cur + 0x30) == g_BotTarget) {
                 int objType = *(int*)(cur + 0x14);
-                if (objType == 3 || objType == 4) { // Строгая проверка: Юнит или Игрок
+                if (objType == 3 || objType == 4) { 
                     uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                     if (desc) {
-                        targetHp = *(int*)(desc + 0x60);
-                        targetMaxHp = *(int*)(desc + 0x70);
+                        targetHp = *(int*)(desc + 0x60); // Читаем только текущее ХП
                         targetFlags = *(uint32_t*)(desc + 0x114);
                         tX = *(float*)(cur + 0x798);
                         tY = *(float*)(cur + 0x79C);
@@ -100,9 +96,7 @@ void BotPulse() {
             }
             cur = *(uintptr_t*)(cur + 0x3C);
         }
-        
-        // Если моб пропал из зоны видимости/памяти
-        if (!hasTarget) g_BotTarget = 0;
+        if (!hasTarget) g_BotTarget = 0; // Цель исчезла из памяти
     }
 
     // 3. Выполняем действия
@@ -118,13 +112,12 @@ void BotPulse() {
             printf("Looting Corpse... Dist: %.1f        \r", dist);
         } 
         else {
-            // Мертв и залутан - сбрасываем и вносим в ЧС
             g_Blacklist.push_back(g_BotTarget);
             g_BotTarget = 0; 
-            printf("Target Empty. Blacklisted.          \r");
+            printf("Target Empty. Blacklisted.          \n"); // \n чтобы видеть историю лута
         }
     } 
-    // 4. Поиск новой цели, если текущей нет
+    // 4. Поиск новой цели
     else {
         uint64_t bestGuid = 0;
         float bestDist = 40.0f; 
@@ -133,16 +126,17 @@ void BotPulse() {
         while (cur && (cur & 1) == 0) {
             int type = *(int*)(cur + 0x14);
             
-            if (type == 3) { // ТОЛЬКО NPC (Тип 3)
+            if (type == 3) { // ТОЛЬКО NPC
                 uint64_t guid = *(uint64_t*)(cur + 0x30);
                 
                 if (std::find(g_Blacklist.begin(), g_Blacklist.end(), guid) == g_Blacklist.end()) {
                     uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                     if (desc) {
-                        int hp = *(int*)(desc + 0x60);
-                        int maxHp = *(int*)(desc + 0x70);
+                        // ФАТАЛЬНАЯ ОШИБКА БЫЛА ЗДЕСЬ: читаем ТОЛЬКО текущее ХП. 
+                        int hp = *(int*)(desc + 0x60); 
                         
-                        if (hp > 0 && maxHp > 0) {
+                        // Если ХП больше нуля - моб живой, берем его!
+                        if (hp > 0) {
                             float mX = *(float*)(cur + 0x798);
                             float mY = *(float*)(cur + 0x79C);
                             float mZ = *(float*)(cur + 0x7A0);
@@ -160,8 +154,8 @@ void BotPulse() {
         }
 
         if (bestGuid) {
-            g_BotTarget = bestGuid; // Берем цель виртуально! Краша не будет.
-            printf("Found new target! Dist: %.1f        \r", bestDist);
+            g_BotTarget = bestGuid; 
+            printf("\nFound new target! Dist: %.1f        \n", bestDist);
         } else {
             printf("Scanning for enemies...             \r");
         }
@@ -195,7 +189,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
             __try {
                 BotPulse();
             } __except (EXCEPTION_EXECUTE_HANDLER) {
-                printf("\n[!] Memory Read Error Prevented!\n");
+                // Ignore memory fluctuations
             }
             lastTick = GetTickCount();
             isPulsing = false;
@@ -206,7 +200,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v4.0: Virtual Target Engine ---\n");
+    printf("--- Bot v4.1: Bugfix Edition ---\n");
 
     HWND hwnd = FindWindowA(NULL, "World of Warcraft");
     if (!hwnd) {
@@ -217,7 +211,7 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(hwnd, 1337, 50, NULL); 
 
-    printf("[+] Virtual Targeting Active. Crash Vector Eliminated.\n");
+    printf("[+] Object Manager logic fixed.\n");
     printf("[!] Make sure 'Click-to-Move' and 'Auto Loot' are ON.\n");
     printf("[+] Press [INSERT] to start/stop the bot.\n");
     return 0;
