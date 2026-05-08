@@ -1,24 +1,23 @@
 #include <windows.h>
 
-// Отключаем проверку стека на уровне кода, чтобы Manual Map не крашился
+// Максимально отключаем все проверки, чтобы Manual Map не спотыкался
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
-#pragma strict_gs_check(off)
 
-// Функция-заглушка, чтобы проверить жизнь
 void Setup() {
-    // MessageBoxA — самая стабильная штука. Если она не вылезет, значит DLL даже не запустилась.
-    MessageBoxA(NULL, "Стерильный тест: DLL внутри процесса!", "Бот-Дебаг", MB_OK | MB_ICONTOPMOST);
+    // Используем стандартные флаги: MB_OK (окно) и MB_TOPMOST (поверх всех окон)
+    // Четвертый аргумент ОБЯЗАТЕЛЕН.
+    MessageBoxA(NULL, "Стерильный тест: DLL внутри процесса!", "Бот-Дебаг", MB_OK | MB_TOPMOST | MB_ICONINFORMATION);
 }
 
-// Кастомный EntryPoint без CRT (C Runtime), чтобы не зависеть от инициализации кук безопасности
+// Кастомная точка входа, чтобы не тащить за собой CRT и ошибки инициализации кук
 extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
-        // Не используем DisableThreadLibraryCalls, чтобы не трогать лишний раз импорты в момент загрузки
-        
-        // Создаем поток через нативный WinAPI
+        // Создаем поток, чтобы не вешать загрузчик
         HANDLE hThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)Setup, NULL, 0, NULL);
-        if (hThread) CloseHandle(hThread);
+        if (hThread) {
+            CloseHandle(hThread);
+        }
     }
     return TRUE;
 }
