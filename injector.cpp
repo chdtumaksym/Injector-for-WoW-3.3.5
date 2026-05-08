@@ -19,10 +19,7 @@ DWORD GetProcessId(const char* procName) {
         PROCESSENTRY32 pe; pe.dwSize = sizeof(pe);
         if (Process32First(hSnap, &pe)) {
             do {
-                if (!_stricmp(pe.szExeFile, procName)) {
-                    procId = pe.th32ProcessID;
-                    break;
-                }
+                if (!_stricmp(pe.szExeFile, procName)) { procId = pe.th32ProcessID; break; }
             } while (Process32Next(hSnap, &pe));
         }
     }
@@ -30,16 +27,13 @@ DWORD GetProcessId(const char* procName) {
     return procId;
 }
 
+// Запрещаем оптимизацию, чтобы ShellCode не превратился в кашу в Release-сборке
 #pragma optimize("", off)
 void __stdcall ShellCode(MANUAL_MAPPING_DATA* pData) {
     if (!pData) return;
     BYTE* pBase = pData->pbase;
-    auto* pDos = reinterpret_cast<IMAGE_DOS_HEADER*>(pBase);
-    auto* pNt = reinterpret_cast<IMAGE_NT_HEADERS*>(pBase + pDos->e_lfanew);
+    auto* pNt = reinterpret_cast<IMAGE_NT_HEADERS*>(pBase + reinterpret_cast<IMAGE_DOS_HEADER*>(pBase)->e_lfanew);
     auto* pOpt = &pNt->OptionalHeader;
-
-    auto _LoadLibraryA = pData->fnLoadLibraryA;
-    auto _GetProcAddress = pData->fnGetProcAddress;
 
     auto* pRelocDir = &pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
     if (pRelocDir->Size) {
@@ -50,10 +44,10 @@ void __stdcall ShellCode(MANUAL_MAPPING_DATA* pData) {
             for (UINT i = 0; i < entries; ++i, ++pInfo) {
                 if ((*pInfo >> 12) == IMAGE_REL_BASED_HIGHLOW) {
                     DWORD* pPatch = reinterpret_cast<DWORD*>(pBase + pReloc->VirtualAddress + ((*pInfo) & 0xFFF));
-                    *pPatch += reinterpret_cast<DWORD>(pBase) - pOpt->ImageBase;
+                    *pPatch += (DWORD)pBase - pOpt->ImageBase;
                 }
             }
-            pReloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<BYTE*>(pReloc) + pReloc->SizeOfBlock);
+            pReloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>((BYTE*)pReloc + pReloc->SizeOfBlock);
         }
     }
 
@@ -61,18 +55,13 @@ void __stdcall ShellCode(MANUAL_MAPPING_DATA* pData) {
     if (pImportDir->Size) {
         auto* pImportDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(pBase + pImportDir->VirtualAddress);
         while (pImportDesc->Name) {
-            HMODULE hMod = _LoadLibraryA(reinterpret_cast<char*>(pBase + pImportDesc->Name));
-            auto* pThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(pBase + pImportDesc->FirstThunk);
-            auto* pIAT = reinterpret_cast<IMAGE_THUNK_DATA*>(pBase + pImportDesc->FirstThunk);
-            if (pImportDesc->OriginalFirstThunk) pThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(pBase + pImportDesc->OriginalFirstThunk);
-
+            HMODULE hMod = pData->fnLoadLibraryA((char*)(pBase + pImportDesc->Name));
+            auto* pThunk = (IMAGE_THUNK_DATA*)(pBase + pImportDesc->FirstThunk);
+            auto* pIAT = (IMAGE_THUNK_DATA*)(pBase + pImportDesc->FirstThunk);
+            if (pImportDesc->OriginalFirstThunk) pThunk = (IMAGE_THUNK_DATA*)(pBase + pImportDesc->OriginalFirstThunk);
             while (pThunk->u1.AddressOfData) {
-                if (IMAGE_SNAP_BY_ORDINAL(pThunk->u1.Ordinal)) {
-                    pIAT->u1.Function = (DWORD)_GetProcAddress(hMod, (char*)(pThunk->u1.Ordinal & 0xFFFF));
-                } else {
-                    auto* pImportName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(pBase + pThunk->u1.AddressOfData);
-                    pIAT->u1.Function = (DWORD)_GetProcAddress(hMod, pImportName->Name);
-                }
+                if (IMAGE_SNAP_BY_ORDINAL(pThunk->u1.Ordinal)) pIAT->u1.Function = (DWORD)pData->fnGetProcAddress(hMod, (char*)(pThunk->u1.Ordinal & 0xFFFF));
+                else pIAT->u1.Function = (DWORD)pData->fnGetProcAddress(hMod, ((IMAGE_IMPORT_BY_NAME*)(pBase + pThunk->u1.AddressOfData))->Name);
                 pThunk++; pIAT++;
             }
             pImportDesc++;
@@ -80,7 +69,7 @@ void __stdcall ShellCode(MANUAL_MAPPING_DATA* pData) {
     }
 
     if (pOpt->AddressOfEntryPoint) {
-        auto _DllMain = reinterpret_cast<BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID)>(pBase + pOpt->AddressOfEntryPoint);
+        auto _DllMain = (BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID))(pBase + pOpt->AddressOfEntryPoint);
         _DllMain((HINSTANCE)pBase, DLL_PROCESS_ATTACH, nullptr);
     }
 }
@@ -90,15 +79,13 @@ void __stdcall ShellCodeEnd() {}
 int main() {
     const char* dllName = "bot_payload.dll";
     DWORD pid = GetProcessId("WoW.exe");
-    if (!pid) return 1;
+    if (!pid) { std::cout << "[-] WoW.exe not found" << std::endl; return 1; }
 
     std::ifstream f(dllName, std::ios::binary | std::ios::ate);
-    if (!f.is_open()) return 1;
     auto sz = f.tellg();
     std::vector<BYTE> buf(sz);
     f.seekg(0, std::ios::beg);
     f.read((char*)buf.data(), sz);
-    f.close();
 
     HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     auto* pNt = reinterpret_cast<IMAGE_NT_HEADERS*>(buf.data() + reinterpret_cast<IMAGE_DOS_HEADER*>(buf.data())->e_lfanew);
@@ -118,12 +105,13 @@ int main() {
     BYTE* pRemData = (BYTE*)VirtualAllocEx(hProc, nullptr, sizeof(data), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     WriteProcessMemory(hProc, pRemData, &data, sizeof(data), nullptr);
 
+    // Выделяем фиксированные 4КБ под шеллкод, чтобы избежать ошибок с расчетом размера
     BYTE* pRemCode = (BYTE*)VirtualAllocEx(hProc, nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     WriteProcessMemory(hProc, pRemCode, ShellCode, 4096, nullptr);
 
     HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0, (LPTHREAD_START_ROUTINE)pRemCode, pRemData, 0, nullptr);
     if (hThread) {
-        std::cout << "[+] Инжект выполнен." << std::endl;
+        std::cout << "[+] Manual Map Successful!" << std::endl;
         CloseHandle(hThread);
     }
     CloseHandle(hProc);
