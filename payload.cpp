@@ -97,20 +97,45 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
     return oEndScene(pDevice);
 }
 
+DWORD WINAPI InitThread(LPVOID lpParam) {
+    // Ждем 10 секунд, пока игра полностью прогрузится и инициализирует DirectX
+    Sleep(10000);
+    Beep(500, 200); // Сигнал, что попытка хука началась
+
+    uintptr_t* pDevicePtr = (uintptr_t*)ADDR_D3D9_DEVICE;
+    if (IsValidRead((uintptr_t)pDevicePtr) && *pDevicePtr) {
+        uintptr_t* vTable = *(uintptr_t**)*pDevicePtr;
+        if (IsValidRead((uintptr_t)vTable)) {
+            
+            // Дополнительная проверка: убеждаемся, что адрес EndScene действительно находится в модуле d3d9.dll
+            HMODULE hD3D9 = GetModuleHandleA("d3d9.dll");
+            if (hD3D9) {
+                MODULEINFO mi;
+                GetModuleInformation(GetCurrentProcess(), hD3D9, &mi, sizeof(mi));
+                uintptr_t endSceneAddr = vTable[42];
+                
+                if (endSceneAddr >= (uintptr_t)mi.lpBaseOfDll && endSceneAddr <= ((uintptr_t)mi.lpBaseOfDll + mi.SizeOfImage)) {
+                    DWORD old;
+                    if (VirtualProtect(&vTable[42], 4, PAGE_EXECUTE_READWRITE, &old)) {
+                        oEndScene = (tEndScene)vTable[42];
+                        vTable[42] = (uintptr_t)HookedEndScene;
+                        VirtualProtect(&vTable[42], 4, old, &old);
+                        Beep(1000, 300); // Успешный хук
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
+    Beep(200, 500); // Ошибка хука
+    return 0;
+}
+
 BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hInst);
-        uintptr_t* pDevicePtr = (uintptr_t*)ADDR_D3D9_DEVICE;
-        if (IsValidRead((uintptr_t)pDevicePtr) && *pDevicePtr) {
-            uintptr_t* vTable = *(uintptr_t**)*pDevicePtr;
-            if (IsValidRead((uintptr_t)vTable)) {
-                DWORD old;
-                VirtualProtect(&vTable[42], 4, PAGE_EXECUTE_READWRITE, &old);
-                oEndScene = (tEndScene)vTable[42];
-                vTable[42] = (uintptr_t)HookedEndScene;
-                VirtualProtect(&vTable[42], 4, old, &old);
-            }
-        }
+        // Запускаем инициализацию в отдельном потоке, чтобы не вешать DllMain
+        CreateThread(0, 0, InitThread, hInst, 0, 0);
     }
     return TRUE;
 }
