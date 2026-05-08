@@ -2,6 +2,7 @@
 #include <iostream>
 #include <cmath>
 #include <cstdio>
+#include <clocale>
 
 #pragma comment(lib, "user32.lib")
 
@@ -17,7 +18,7 @@
 enum BotState { STATE_SEARCH, STATE_MOVE, STATE_COMBAT, STATE_LOOT };
 const char* stateNames[] = { "SEARCHING", "MOVING", "COMBAT", "LOOTING" };
 
-// --- ФУНКЦИИ ДВИЖКА ---
+// --- ФУНКЦИИ ДВИЖКА (БЕЗ LUA) ---
 typedef void(__thiscall* tClickToMove)(uintptr_t playerPtr, int clickType, uint64_t* interactGuid, float* pos, float precision);
 typedef void(__thiscall* tInteract)(uintptr_t playerPtr, uintptr_t unitPtr);
 typedef uintptr_t(__cdecl* tGetActivePlayer)();
@@ -48,11 +49,11 @@ void SetConsoleCursor(int x, int y) {
 }
 
 // --- IAT HOOKING (ПЕРЕХВАТ ТАБЛИЦЫ ИМПОРТА) ---
-typedef BOOL(WINAPI* tPeekMessageW)(LPMSG, HWND, UINT, UINT, UINT);
-tPeekMessageW oPeekMessageW = nullptr;
+// WoW 3.3.5a использует ASCII версию функции - PeekMessageA
+typedef BOOL(WINAPI* tPeekMessageA)(LPMSG, HWND, UINT, UINT, UINT);
+tPeekMessageA oPeekMessageA = nullptr;
 
-// Эта функция теперь вызывается игрой каждый раз, когда она обращается к Windows
-BOOL WINAPI HookedPeekMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
+BOOL WINAPI HookedPeekMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
     int cmd = g_Cmd.type;
     if (cmd != 0) {
         uintptr_t pLocal = GetPlayer();
@@ -63,13 +64,14 @@ BOOL WINAPI HookedPeekMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT 
                     EngineClickToMove(pLocal, 4, (uint64_t*)&g_Cmd.guid, pos, 0.5f);
                 } 
                 else if (cmd == 2 && g_Cmd.pTarget != 0) { 
+                    // InteractUnit автоматически начинает атаку или лутает труп
                     EngineInteractUnit(pLocal, g_Cmd.pTarget); 
                 }
             } __except(1) {}
         }
-        g_Cmd.type = 0; // Команда выполнена в 100% безопасном контексте главного потока
+        g_Cmd.type = 0; 
     }
-    return oPeekMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
+    return oPeekMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
 }
 
 bool InstallIATHook() {
@@ -92,11 +94,12 @@ bool InstallIATHook() {
             while (origFirstThunk->u1.AddressOfData != 0) {
                 if (!(origFirstThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG)) {
                     PIMAGE_IMPORT_BY_NAME importByName = (PIMAGE_IMPORT_BY_NAME)((uintptr_t)hExe + origFirstThunk->u1.AddressOfData);
-                    if (strcmp((char*)importByName->Name, "PeekMessageW") == 0) {
+                    // ИЩЕМ PeekMessageA ВМЕСТО PeekMessageW
+                    if (strcmp((char*)importByName->Name, "PeekMessageA") == 0) {
                         DWORD oldProtect;
                         VirtualProtect(&firstThunk->u1.Function, sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &oldProtect);
-                        oPeekMessageW = (tPeekMessageW)firstThunk->u1.Function; // Сохраняем оригинал
-                        firstThunk->u1.Function = (uintptr_t)HookedPeekMessageW; // Пишем наш хук
+                        oPeekMessageA = (tPeekMessageA)firstThunk->u1.Function; 
+                        firstThunk->u1.Function = (uintptr_t)HookedPeekMessageA; 
                         VirtualProtect(&firstThunk->u1.Function, sizeof(uintptr_t), oldProtect, &oldProtect);
                         return true;
                     }
@@ -111,7 +114,7 @@ bool InstallIATHook() {
 }
 
 void RemoveIATHook() {
-    if (!oPeekMessageW) return;
+    if (!oPeekMessageA) return;
     HMODULE hExe = GetModuleHandleA(NULL);
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)hExe;
     PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((uintptr_t)hExe + dosHeader->e_lfanew);
@@ -125,10 +128,10 @@ void RemoveIATHook() {
             while (origFirstThunk->u1.AddressOfData != 0) {
                 if (!(origFirstThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG)) {
                     PIMAGE_IMPORT_BY_NAME importByName = (PIMAGE_IMPORT_BY_NAME)((uintptr_t)hExe + origFirstThunk->u1.AddressOfData);
-                    if (strcmp((char*)importByName->Name, "PeekMessageW") == 0) {
+                    if (strcmp((char*)importByName->Name, "PeekMessageA") == 0) {
                         DWORD oldProtect;
                         VirtualProtect(&firstThunk->u1.Function, sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &oldProtect);
-                        firstThunk->u1.Function = (uintptr_t)oPeekMessageW; // Восстанавливаем
+                        firstThunk->u1.Function = (uintptr_t)oPeekMessageA; // Восстанавливаем оригинал
                         VirtualProtect(&firstThunk->u1.Function, sizeof(uintptr_t), oldProtect, &oldProtect);
                         return;
                     }
@@ -151,18 +154,19 @@ void SendCommandAndWait(int type, uint64_t guid = 0, float x = 0, float y = 0, f
 }
 
 DWORD WINAPI MainThread(LPVOID lpParam) {
+    setlocale(LC_ALL, "Russian"); // Чиним кракозябры в консоли
     AllocConsole();
     FILE* f; freopen_s(&f, "CONOUT$", "w", stdout);
 
-    printf("--- Paladin IAT Ghost v31.0 (Bypass Warden) ---\n");
+    printf("--- Paladin IAT Ghost v32.0 (PeekMessageA Bypass) ---\n");
     if (InstallIATHook()) {
-        printf("[+] Таблица импорта перехвачена. Код скрыт от Warden.\n");
+        printf("[+] Таблица импорта перехвачена. Мы внутри Main Thread.\n");
     } else {
-        printf("[-] Ошибка перехвата IAT. Перезапусти клиент!\n");
+        printf("[-] ОШИБКА: Функция PeekMessageA не найдена в IAT.\n");
         return 0;
     }
     printf("[!] ГАЛОЧКИ 'Перемещение по щелчку' И 'Автосбор' ДОЛЖНЫ БЫТЬ ВКЛЮЧЕНЫ!\n");
-    printf("[!] БИНДЫ НЕ НУЖНЫ. КНОПКИ НЕ НАЖИМАЮТСЯ. РАБОТАЕТ В СВЕРНУТОМ ВИДЕ.\n");
+    printf("[!] БИНДЫ НЕ НУЖНЫ. КНОПКИ НЕ НАЖИМАЮТСЯ. РАБОТАЕТ ПРОГРАММНО.\n");
     printf("--------------------------------------------------\n");
 
     uintptr_t connectionAddr = (uintptr_t)GetModuleHandleA(NULL) + OFFSET_S_CUR_MGR;
