@@ -5,16 +5,14 @@
 
 #define ADDR_ON_UPDATE          0x0047E7B0
 #define ADDR_CLICK_TO_MOVE      0x00611130
-#define ADDR_GET_PLAYER         0x004038BE
-#define ADDR_S_CUR_MGR          0x00C79CE0 // ИСПРАВЛЕНО: добавлена база 0x400000
+#define ADDR_PLAYER_BASE        0x00BD07E0 // ТВОЙ рабочий адрес
+#define ADDR_S_CUR_MGR          0x00C79CE0
 #define OFFSET_OBJECT_MANAGER   0x2ED0
-#define ADDR_IS_IN_GAME         0x00BD0792
 
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
 
 typedef void(__fastcall* tClickToMove)(uintptr_t ecx, void* edx, int type, uint64_t* guid, float* pos, float prec);
-typedef uintptr_t(__cdecl* tGetPlayer)();
 
 bool g_Active = false;
 static uint64_t s_guid;
@@ -27,16 +25,26 @@ void SafeAction(uintptr_t p, int t, uint64_t g, float x, float y, float z) {
 }
 
 void BotPulse() {
+    static bool keyState = false;
     if (GetAsyncKeyState(VK_END) & 0x8000) {
-        static bool ks = false;
-        if (!ks) { g_Active = !g_Active; ks = true; Beep(g_Active ? 800 : 400, 100); }
-    } else { static bool ks = false; ks = false; }
+        if (!keyState) { 
+            g_Active = !g_Active; 
+            keyState = true; 
+            Beep(g_Active ? 800 : 400, 100); 
+            printf("\n[!] BOT TICKER: %s\n", g_Active ? "ONLINE" : "OFFLINE");
+        }
+    } else { 
+        keyState = false; 
+    }
 
-    if (g_Active && *(BYTE*)ADDR_IS_IN_GAME) {
-        uintptr_t pLocal = ((tGetPlayer)ADDR_GET_PLAYER)();
+    if (g_Active) {
+        // Получаем базу игрока напрямую из статики
+        uintptr_t pLocal = *(uintptr_t*)ADDR_PLAYER_BASE;
+        if (!pLocal) return; // Защита от работы в меню
+
         uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
         uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
-        if (!pLocal || !mgr) return;
+        if (!mgr) return;
 
         float myX = *(float*)(pLocal + 0x798), myY = *(float*)(pLocal + 0x79C);
         uint64_t target = 0; float dist = 40.0f; float tPos[3];
@@ -66,6 +74,7 @@ void BotPulse() {
 
         static DWORD last = 0;
         if (target && GetTickCount() - last > 800) {
+            printf("Targeting: %llu | Dist: %.2f\r", target, dist);
             SafeAction(pLocal, 4, target, tPos[0], tPos[1], tPos[2]);
             last = GetTickCount();
         }
@@ -87,7 +96,7 @@ void __declspec(naked) Hook() {
 
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("[+] Bot v111: Memory Addr Fixed. Ready to crush.\n");
+    printf("[+] Bot v112: Logic Fixed. Press END to start.\n");
     DWORD o; VirtualProtect((void*)ADDR_ON_UPDATE, 5, PAGE_EXECUTE_READWRITE, &o);
     *(BYTE*)ADDR_ON_UPDATE = 0xE9; *(DWORD*)(ADDR_ON_UPDATE + 1) = (DWORD)Hook - ADDR_ON_UPDATE - 5;
     VirtualProtect((void*)ADDR_ON_UPDATE, 5, o, &o);
