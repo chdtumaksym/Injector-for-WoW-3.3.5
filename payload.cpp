@@ -4,12 +4,11 @@
 #include <iostream>
 
 // --- АДРЕСА 3.3.5a (12340) ---
-#define ADDR_PLAYER_BASE        0x00BD07E0
+// Убрали статический ADDR_PLAYER_BASE, он нам больше не нужен!
 #define ADDR_S_CUR_MGR          0x00C79CE0
 #define OFFSET_OBJECT_MANAGER   0x2ED0
 #define ADDR_CLICK_TO_MOVE      0x00611130
 
-// Отключаем проверки компилятора для Manual Map
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
 #pragma strict_gs_check(off)
@@ -18,7 +17,6 @@ typedef void(__fastcall* tClickToMove)(uintptr_t ecx, void* edx, int type, uint6
 
 bool g_Active = false;
 
-// Статика для безопасной передачи параметров
 struct CTM_BUFFER {
     uint64_t guid;
     float pos[3];
@@ -36,60 +34,87 @@ DWORD WINAPI BackgroundBotThread(LPVOID) {
     AllocConsole();
     freopen("CONOUT$", "w", stdout);
     
-    // Перешли на английский, чтобы не было кракозябр в консоли
-    printf("--- Background Thread Bot v115 ---\n");
-    printf("[+] NO HOOKS. 100%% safe from Render Thread crashes.\n");
+    printf("--- Background Thread Bot v116 ---\n");
+    printf("[+] FOOLPROOF Local Player detection loaded.\n");
     printf("[!] Press [INSERT] to toggle bot.\n");
 
     while (true) {
-        // Клавиша INSERT для активации
         if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
             g_Active = !g_Active;
             Beep(g_Active ? 800 : 400, 100);
             printf("\n[!] Bot Status: %s\n", g_Active ? "ACTIVE" : "PAUSED");
-            Sleep(300); // Защита от двойного клика
+            Sleep(300);
         }
 
         if (g_Active) {
-            uintptr_t pLocal = *(uintptr_t*)ADDR_PLAYER_BASE;
             uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
             uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
 
-            if (pLocal && mgr) {
-                float myX = *(float*)(pLocal + 0x798);
-                float myY = *(float*)(pLocal + 0x79C);
-                
-                uint64_t bestGuid = 0;
-                float bestDist = 40.0f;
-                float tPos[3] = {0};
+            if (!mgr) {
+                Sleep(500);
+                continue;
+            }
 
-                uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
-                while (cur && (cur & 1) == 0) {
-                    if (*(int*)(cur + 0x14) == 3) { // Unit
-                        uintptr_t desc = *(uintptr_t*)(cur + 0x8);
-                        if (desc && *(int*)(desc + 0x60) > 0) { // Alive
+            // 100% надежный способ найти себя: читаем свой GUID из Object Manager
+            uint64_t localGuid = *(uint64_t*)(mgr + 0xC0);
+            uintptr_t pLocal = 0;
+            float myX = 0, myY = 0, myZ = 0;
+
+            // Проход 1: Ищем себя в списке объектов
+            uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
+            while (cur && (cur & 1) == 0) {
+                if (*(uint64_t*)(cur + 0x30) == localGuid) {
+                    pLocal = cur;
+                    myX = *(float*)(cur + 0x798);
+                    myY = *(float*)(cur + 0x79C);
+                    myZ = *(float*)(cur + 0x7A0);
+                    break;
+                }
+                cur = *(uintptr_t*)(cur + 0x3C);
+            }
+
+            if (!pLocal) {
+                printf("Waiting for player to enter world...        \r");
+                Sleep(500);
+                continue;
+            }
+
+            // Проход 2: Ищем ближайшего моба
+            uint64_t bestGuid = 0;
+            float bestDist = 40.0f;
+            float tPos[3] = {0};
+
+            cur = *(uintptr_t*)(mgr + 0xAC);
+            while (cur && (cur & 1) == 0) {
+                int type = *(int*)(cur + 0x14);
+                if (type == 3) { // Unit
+                    uintptr_t desc = *(uintptr_t*)(cur + 0x8);
+                    if (desc && *(int*)(desc + 0x60) > 0) { // Живой
+                        uint64_t objGuid = *(uint64_t*)(cur + 0x30);
+                        if (objGuid != localGuid) { // Не берем в цель сами себя
                             float tX = *(float*)(cur + 0x798);
                             float tY = *(float*)(cur + 0x79C);
                             float dist = sqrt(pow(tX - myX, 2) + pow(tY - myY, 2));
 
                             if (dist < bestDist) {
                                 bestDist = dist;
-                                bestGuid = *(uint64_t*)(cur + 0x30);
+                                bestGuid = objGuid;
                                 tPos[0] = tX; tPos[1] = tY; tPos[2] = *(float*)(cur + 0x7A0);
                             }
                         }
                     }
-                    cur = *(uintptr_t*)(cur + 0x3C);
                 }
+                cur = *(uintptr_t*)(cur + 0x3C);
+            }
 
-                if (bestGuid) {
-                    printf("Target: %llu | Dist: %.1f\r", bestGuid, bestDist);
-                    // Тип 4 = Interact (Атака/Взаимодействие)
-                    SafeAction(pLocal, 4, bestGuid, tPos[0], tPos[1], tPos[2]);
-                }
+            if (bestGuid) {
+                printf("Target: %llu | Dist: %.1f            \r", bestGuid, bestDist);
+                // Экшен 4: Бежим и бьем
+                SafeAction(pLocal, 4, bestGuid, tPos[0], tPos[1], tPos[2]);
+            } else {
+                printf("Searching for targets...                 \r");
             }
         }
-        // Пауза 500мс (2 тика в секунду). Нельзя спамить движок чаще, иначе краш.
         Sleep(500); 
     }
     return 0;
