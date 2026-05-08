@@ -5,14 +5,13 @@
 #include <vector>
 #include <algorithm>
 
-// --- АДРЕСА 3.3.5a (12340) ---
+// --- ПРАВИЛЬНЫЕ АДРЕСА 3.3.5a (12340) ---
 #define ADDR_S_CUR_MGR          0x00C79CE0
 #define OFFSET_OBJECT_MANAGER   0x2ED0
-#define ADDR_CLICK_TO_MOVE      0x00611130
+#define ADDR_CLICK_TO_MOVE      0x00722FB0 // <--- ИСПРАВЛЕНО! (Было 0x00611130 от версии 1.12.1)
 
-// ИСПРАВЛЕННЫЕ КОНСТАНТЫ CTM ДЛЯ 3.3.5a
-#define CTM_INTERACT            5  // Разговор / Сбор лута (NpcInteract)
-#define CTM_ATTACK              11 // Атака цели (AttackGuid) - Ранее было 7, что означало "Сундук", и вызывало краш!
+#define CTM_INTERACT            5  
+#define CTM_ATTACK              11 
 
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
@@ -35,7 +34,6 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
     static int lastType = 0;
     static DWORD lastTime = 0;
 
-    // ВАЖНО: Делаем переменные static, чтобы WoW не читал мертвую память стека в следующем кадре
     static uint64_t ctmGuid = 0;
     static float ctmPos[3] = { 0, 0, 0 };
 
@@ -60,7 +58,6 @@ void BotPulse() {
     uintptr_t pLocal = 0;
     float myX = 0, myY = 0, myZ = 0;
 
-    // 1. Ищем себя
     uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
     while (cur && (cur & 1) == 0) {
         if (*(uint64_t*)(cur + 0x30) == localGuid) {
@@ -79,7 +76,6 @@ void BotPulse() {
     uint32_t targetFlags = 0;
     float tX = 0, tY = 0, tZ = 0;
 
-    // 2. Читаем данные виртуального таргета
     if (g_BotTarget != 0) {
         cur = *(uintptr_t*)(mgr + 0xAC);
         while (cur && (cur & 1) == 0) {
@@ -103,7 +99,6 @@ void BotPulse() {
         if (!hasTarget) g_BotTarget = 0; 
     }
 
-    // 3. Выполняем действия
     if (hasTarget) {
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
 
@@ -121,7 +116,6 @@ void BotPulse() {
             printf("Target Empty. Blacklisted.          \n");
         }
     } 
-    // 4. Умный поиск новой цели
     else {
         uint64_t bestGuid = 0;
         float bestDist = 40.0f; 
@@ -137,16 +131,14 @@ void BotPulse() {
                     uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                     if (desc) {
                         int hp = *(int*)(desc + 0x60); 
-                        int maxHp = *(int*)(desc + 0x80); // Правильное смещение Макс ХП (+0x80)
+                        int maxHp = *(int*)(desc + 0x80); 
                         
-                        // Игнорируем невидимые триггеры с MaxHP = 0 и мертвых мобов
                         if (hp > 0 && maxHp > 1) {
                             float mX = *(float*)(cur + 0x798);
                             float mY = *(float*)(cur + 0x79C);
                             float mZ = *(float*)(cur + 0x7A0);
                             float dist = GetDistance3D(myX, myY, myZ, mX, mY, mZ);
 
-                            // Не берем цели ближе 0.1м (это багнутые объекты под текстурами)
                             if (dist < bestDist && dist > 0.1f) {
                                 bestDist = dist;
                                 bestGuid = guid;
@@ -194,7 +186,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
             __try {
                 BotPulse();
             } __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Игнорируем скачки памяти при загрузке
+                // Игнорируем скачки памяти
             }
             lastTick = GetTickCount();
             isPulsing = false;
@@ -205,7 +197,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v5.0: The Final Fix ---\n");
+    printf("--- Bot v6.0: The Real Fix (Correct 3.3.5a CTM) ---\n");
 
     HWND hwnd = FindWindowA(NULL, "World of Warcraft");
     if (!hwnd) {
@@ -216,9 +208,9 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(hwnd, 1337, 50, NULL); 
 
-    printf("[+] CTM Attack Types correctly initialized.\n");
+    printf("[+] CTM Memory Pointer 0x00722FB0 Initialized.\n");
     printf("[!] Make sure 'Click-to-Move' and 'Auto Loot' are ON.\n");
-    printf("[+] Press[INSERT] to start/stop the bot.\n");
+    printf("[+] Press [INSERT] to start/stop the bot.\n");
     return 0;
 }
 
