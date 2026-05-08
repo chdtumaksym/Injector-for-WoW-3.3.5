@@ -5,40 +5,66 @@
 #include <vector>
 #include <algorithm>
 
+// ==========================================
+// --- АДРЕСА ПАМЯТИ WoW 3.3.5a (12340) ---
+// ==========================================
 #define ADDR_S_CUR_MGR          0x00C79CE0
 #define OFFSET_OBJECT_MANAGER   0x2ED0
-#define ADDR_CLICK_TO_MOVE      0x00727400
-#define ADDR_TARGET_GUID        0x00BD07B8
+#define ADDR_CLICK_TO_MOVE      0x00727400 // Настоящий адрес высокоуровневой функции
+#define ADDR_TARGET_GUID        0x00BD07B8 // UI-Таргет
+#define ADDR_MOUSEOVER_GUID     0x00BD07A0 // UI-Маусовер (для легального таргетинга)
+#define ADDR_LUA_EXECUTE        0x00819210 // Встроенный интерпретатор макросов
 
-// Три кита движка WoW
-#define CTM_MOVE                4  // Бежать в точку
-#define CTM_LOOT                6  // Собрать лут
-#define CTM_ATTACK              11 // Авто-атака
+// Боевые типы Click-To-Move
+#define CTM_LOOT                6 
+#define CTM_ATTACK              11 
 
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
 #pragma strict_gs_check(off)
 
+// Сигнатуры нативных функций
 typedef void(__fastcall* tClickToMove)(uintptr_t ecx, uintptr_t edx, int type, uint64_t* guid, float* pos, float prec);
+typedef void(__cdecl* tLuaExecute)(const char* code, const char* fileName, int state);
 
+// ==========================================
+// --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
+// ==========================================
 bool g_Active = false;
-std::vector<uint64_t> g_Blacklist;
-uint64_t g_BotTarget = 0;
+WNDPROC oWndProc = nullptr;
+std::vector<uint64_t> g_Blacklist; 
+uint64_t g_BotTarget = 0; 
+
+// ==========================================
+// --- УТИЛИТЫ И БЕЗОПАСНЫЕ ОБЕРТКИ ---
+// ==========================================
 
 float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) {
     return sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2) + pow(z2 - z1, 2));
 }
 
-// Умный контроллер движений
+// 100% безопасный программный вызов макросов
+void ExecuteLua(const char* command) {
+    ((tLuaExecute)ADDR_LUA_EXECUTE)(command, "bot_core", 0);
+}
+
+// Программный таргетинг. Заставляет сервер понять, кого мы выделили.
+void ProgrammaticTarget(uint64_t guid) {
+    if (*(uint64_t*)ADDR_TARGET_GUID != guid) {
+        *(uint64_t*)ADDR_MOUSEOVER_GUID = guid;
+        ExecuteLua("TargetUnit('mouseover')");
+    }
+}
+
+// Умный приказ на движение (Anti-Dance Logic)
 void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, float z) {
     static uint64_t lastGuid = 0;
     static int lastType = 0;
     static float lastX = 0, lastY = 0, lastZ = 0;
 
-    // Считаем, насколько сдвинулся моб
     float diff = sqrt(pow(x - lastX, 2) + pow(y - lastY, 2) + pow(z - lastZ, 2));
 
-    // Обновляем команду если: сменилась цель, сменилось действие (бег->атака), или моб отбежал > 1.5м
+    // Обновляем приказ ТОЛЬКО если сменилась цель, действие, или моб отбежал
     if (guid != lastGuid || type != lastType || diff > 1.5f) {
         uint64_t ctmGuid = guid;
         float ctmPos[3] = { x, y, z };
@@ -51,6 +77,9 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
     }
 }
 
+// ==========================================
+// --- ЯДРО БОТА (ВЫЗЫВАЕТСЯ КАЖДЫЙ ТИК) ---
+// ==========================================
 void BotPulse() {
     uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
     uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
@@ -60,13 +89,13 @@ void BotPulse() {
     uintptr_t pLocal = 0;
     float myX = 0, myY = 0, myZ = 0;
 
-    // Ищем своего перса
+    // 1. Ищем координаты своего персонажа
     uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
     while (cur && (cur & 1) == 0) {
         if (*(uint64_t*)(cur + 0x30) == localGuid) {
             pLocal = cur;
-            myX = *(float*)(cur + 0x798);
-            myY = *(float*)(cur + 0x79C);
+            myX = *(float*)(cur + 0x798); 
+            myY = *(float*)(cur + 0x79C); 
             myZ = *(float*)(cur + 0x7A0);
             break;
         }
@@ -79,16 +108,16 @@ void BotPulse() {
     uint32_t targetFlags = 0;
     float tX = 0, tY = 0, tZ = 0;
 
-    // Читаем инфу о цели
+    // 2. Читаем состояние текущей цели
     if (g_BotTarget != 0) {
         cur = *(uintptr_t*)(mgr + 0xAC);
         while (cur && (cur & 1) == 0) {
             if (*(uint64_t*)(cur + 0x30) == g_BotTarget) {
                 int objType = *(int*)(cur + 0x14);
-                if (objType == 3 || objType == 4) {
+                if (objType == 3 || objType == 4) { 
                     uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                     if (desc) {
-                        targetHp = *(int*)(desc + 0x60);
+                        targetHp = *(int*)(desc + 0x60); 
                         targetFlags = *(uint32_t*)(desc + 0x114);
                         tX = *(float*)(cur + 0x798);
                         tY = *(float*)(cur + 0x79C);
@@ -100,82 +129,74 @@ void BotPulse() {
             }
             cur = *(uintptr_t*)(cur + 0x3C);
         }
-        if (!hasTarget) g_BotTarget = 0;
+        if (!hasTarget) g_BotTarget = 0; 
     }
 
-    static bool isEngaged = false; // Блокиратор спама атак (чтобы не танцевал)
-
+    // 3. Выполнение действий (Бой / Лут)
     if (hasTarget) {
-        // [!] Жесткая установка таргета для игры [!]
-        *(uint64_t*)ADDR_TARGET_GUID = g_BotTarget; 
-        uintptr_t pDesc = *(uintptr_t*)(pLocal + 0x8);
-        if (pDesc) *(uint64_t*)(pDesc + 0x48) = g_BotTarget;
-
+        ProgrammaticTarget(g_BotTarget);
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
 
         if (targetHp > 0) {
-            // ФАЗА 1: Охота (если моб далеко - используем стабильный БЕГ)
-            if (dist > 4.0f) {
-                ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
-                isEngaged = false; // Мы вышли из мили-зоны, атаку нужно будет нажать заново
-                printf("Chasing Enemy... Dist: %.1f      \r", dist);
-            } 
-            // ФАЗА 2: Убийство (подошли вплотную - включаем АВТО-АТАКУ один раз!)
-            else {
-                if (!isEngaged) {
-                    ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
-                    isEngaged = true; // Заблокировали спам, перс бьет сам
-                    printf("Engaging Melee Combat!            \r");
+            // Бежим к врагу
+            ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
+            printf("Chasing Target... Dist: %.1f      \r", dist);
+            
+            // Если в мили-зоне - принудительно стартуем автоатаку через сервер
+            if (dist < 5.0f) {
+                static DWORD lastAtk = 0;
+                if (GetTickCount() - lastAtk > 1500) {
+                    ExecuteLua("StartAttack()");
+                    lastAtk = GetTickCount();
                 }
             }
-        }
+        } 
         else if (targetHp <= 0 && (targetFlags & 1)) {
-            // ФАЗА 3: Бежим к трупу
-            if (dist > 4.0f) {
-                ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
-                isEngaged = false;
-                printf("Moving to Loot... Dist: %.1f     \r", dist);
-            } 
-            // ФАЗА 4: Лутаем (один раз!)
-            else {
-                if (!isEngaged) {
-                    ActionCTM(pLocal, CTM_LOOT, g_BotTarget, tX, tY, tZ);
-                    isEngaged = true;
-                    printf("Looting Corpse!                   \r");
+            // Бежим лутать
+            ActionCTM(pLocal, CTM_LOOT, g_BotTarget, tX, tY, tZ);
+            printf("Looting Corpse... Dist: %.1f        \r", dist);
+            
+            // Если стоим на трупе - собираем вещи
+            if (dist < 5.0f) {
+                static DWORD lastLoot = 0;
+                if (GetTickCount() - lastLoot > 1500) {
+                    ExecuteLua("InteractUnit('target')");
+                    lastLoot = GetTickCount();
                 }
             }
-        }
+        } 
         else {
-            // Цель пуста - сброс
+            // Труп пустой - сбрасываем цель
             g_Blacklist.push_back(g_BotTarget);
-            g_BotTarget = 0;
-            isEngaged = false;
-            *(uint64_t*)ADDR_TARGET_GUID = 0;
-            if (pDesc) *(uint64_t*)(pDesc + 0x48) = 0;
-            printf("Target Dead & Empty. Blacklisted.\n");
+            g_BotTarget = 0; 
+            ExecuteLua("ClearTarget()"); 
+            printf("Target Empty. Blacklisted.          \n");
         }
-    }
+    } 
+    // 4. Поиск новой цели
     else {
-        // Поиск новой жертвы
         uint64_t bestGuid = 0;
-        float bestDist = 40.0f;
+        float bestDist = 40.0f; 
 
         cur = *(uintptr_t*)(mgr + 0xAC);
         while (cur && (cur & 1) == 0) {
             int type = *(int*)(cur + 0x14);
-            if (type == 3) {
+            if (type == 3) { 
                 uint64_t guid = *(uint64_t*)(cur + 0x30);
+                
                 if (std::find(g_Blacklist.begin(), g_Blacklist.end(), guid) == g_Blacklist.end()) {
                     uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                     if (desc) {
-                        int hp = *(int*)(desc + 0x60);
-                        int maxHp = *(int*)(desc + 0x80);
+                        int hp = *(int*)(desc + 0x60); 
+                        int maxHp = *(int*)(desc + 0x80); 
+                        
+                        // Игнорируем мертвых или багнутых мобов (MaxHP 0/1)
                         if (hp > 0 && maxHp > 1) {
                             float mX = *(float*)(cur + 0x798);
                             float mY = *(float*)(cur + 0x79C);
                             float mZ = *(float*)(cur + 0x7A0);
                             float dist = GetDistance3D(myX, myY, myZ, mX, mY, mZ);
-
+                            
                             if (dist < bestDist && dist > 0.1f) {
                                 bestDist = dist;
                                 bestGuid = guid;
@@ -188,58 +209,90 @@ void BotPulse() {
         }
 
         if (bestGuid) {
-            g_BotTarget = bestGuid;
-            printf("\nFound new target! Dist: %.1f\n", bestDist);
+            g_BotTarget = bestGuid; 
+            ProgrammaticTarget(g_BotTarget);
+            printf("\nFound new target! Dist: %.1f        \n", bestDist);
         } else {
             printf("Scanning for enemies...             \r");
         }
     }
 }
 
-// Защищенный независимый поток управления
-DWORD WINAPI BotThread(LPVOID) {
-    AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v18.0: Chaser & Striker Edition ---\n");
-    printf("[+] Dual-Phase Combat AI Activated.\n");
-    printf("[!] Make sure 'Click-to-Move' and 'Auto Loot' are ON.\n");
-    printf("[+] Press [INSERT] to unleash the bot.\n");
-
-    bool isPressed = false;
-    DWORD lastPulse = 0;
-
-    while (true) {
+// ==========================================
+// --- ОБРАБОТЧИК ОКОННЫХ СООБЩЕНИЙ ---
+// ==========================================
+LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (uMsg == WM_TIMER && wParam == 1337) {
+        
+        // Обработка кнопки INSERT (ВКЛ/ВЫКЛ)
+        static bool isPressed = false;
         if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
             if (!isPressed) {
                 isPressed = true;
                 g_Active = !g_Active;
                 Beep(g_Active ? 800 : 400, 100);
-                printf("\n[!] BOT STATUS: %s\n", g_Active ? "ACTIVE" : "PAUSED");
-                if (!g_Active) {
-                    g_BotTarget = 0;
-                    *(uint64_t*)ADDR_TARGET_GUID = 0;
-                    g_Blacklist.clear();
+                printf("\n[!] BOT STATUS: %s                                \n", g_Active ? "ACTIVE" : "PAUSED");
+                
+                // При выключении сбрасываем состояние
+                if (!g_Active) { 
+                    g_BotTarget = 0; 
+                    ExecuteLua("ClearTarget()");
+                    g_Blacklist.clear(); 
                 }
             }
         } else {
             isPressed = false;
         }
 
-        if (g_Active && (GetTickCount() - lastPulse > 400)) {
+        // Вызов логики (Тикает раз в 400мс, чтобы не вешать клиент)
+        static DWORD lastTick = 0;
+        static bool isPulsing = false; 
+
+        if (g_Active && !isPulsing && (GetTickCount() - lastTick > 400)) {
+            isPulsing = true;
             __try {
                 BotPulse();
-            } __except (EXCEPTION_EXECUTE_HANDLER) {}
-            lastPulse = GetTickCount();
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                // Блокируем любые ошибки доступа к памяти, защищая процесс от падения
+            }
+            lastTick = GetTickCount();
+            isPulsing = false;
         }
-
-        Sleep(50);
     }
+    
+    // Передаем управление оригинальной игре
+    return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
+}
+
+// ==========================================
+// --- ТОЧКА ИНЖЕКТА ---
+// ==========================================
+DWORD WINAPI Setup(LPVOID) {
+    AllocConsole(); 
+    freopen("CONOUT$", "w", stdout);
+    printf("--- Bot v129: Flawless Logic ---\n");
+
+    HWND hwnd = FindWindowA(NULL, "World of Warcraft");
+    if (!hwnd) {
+        printf("[-] ERROR: WoW window not found!\n");
+        return 0;
+    }
+
+    // Хукаем главное окно игры для безопасной синхронизации потоков
+    oWndProc = (WNDPROC)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)HookedWndProc);
+    SetTimer(hwnd, 1337, 50, NULL); 
+
+    printf("[+] Anti-Dance Logic: INTEGRATED.\n");
+    printf("[+] Safe WndProc Main Thread: INTEGRATED.\n");
+    printf("[+] Native Lua Server Sync: INTEGRATED.\n");
+    printf("[!] Focus WoW window and press [INSERT] to start.\n");
     return 0;
 }
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
     if (r == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(h);
-        CreateThread(0, 0, BotThread, 0, 0, 0);
+        CreateThread(0, 0, Setup, 0, 0, 0);
     }
     return TRUE;
 }
