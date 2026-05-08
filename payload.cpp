@@ -13,14 +13,11 @@
 #define ADDR_CLICK_TO_MOVE       0x00611130
 #define ADDR_GET_PLAYER          0x004038BE
 #define ADDR_D3D9_DEVICE         0x00C5DF88
-#define ADDR_LUA_EXECUTE         0x00819210
-#define ADDR_SET_TARGET          0x00493540 // Правильная функция движка для выбора цели
 
-typedef void(__thiscall* tClickToMove)(uintptr_t playerPtr, int clickType, uint64_t* interactGuid, float* pos, float precision);
+// __fastcall с фейковым EDX — единственный способ 100% безопасно вызвать __thiscall из своей DLL
+typedef void(__fastcall* tClickToMove)(uintptr_t ecx, void* edx, int clickType, uint64_t* interactGuid, float* pos, float precision);
 typedef uintptr_t(__cdecl* tGetPlayer)();
 typedef HRESULT(__stdcall* tEndScene)(LPDIRECT3DDEVICE9 pDevice);
-typedef void(__cdecl* tFrameScript_Execute)(const char* script, const char* name, void* state);
-typedef void(__cdecl* tSetTarget)(uint64_t targetGuid);
 
 tEndScene oEndScene = nullptr;
 bool g_BotActive = false;
@@ -31,8 +28,13 @@ template<typename T> T Read(uintptr_t addr) {
     return *(T*)addr;
 }
 
-template<typename T> void Write(uintptr_t addr, T val) {
-    if (addr) *(T*)addr = val;
+// БЕЗОПАСНЫЙ ВЫЗОВ CTM: Статические переменные спасают от висячих указателей на стеке!
+void SafeCTM(uintptr_t pLocal, int clickType, uint64_t guid, float x, float y, float z) {
+    static uint64_t s_guid = 0;
+    static float s_pos[3] = { 0, 0, 0 };
+    s_guid = guid;
+    s_pos[0] = x; s_pos[1] = y; s_pos[2] = z;
+    ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, nullptr, clickType, &s_guid, s_pos, 0.5f);
 }
 
 HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
@@ -67,10 +69,9 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
             float x = Read<float>(pLocal + 0x798);
             float y = Read<float>(pLocal + 0x79C);
             float z = Read<float>(pLocal + 0x7A0);
-            float pos[3] = { x + 5.0f, y, z };
-            uint64_t zeroGuid = 0;
-            std::cout << "\n[!] Движение по тестовым координатам..." << std::endl;
-            ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 4, &zeroGuid, pos, 0.5f);
+            std::cout << "\n[!] Движение по тестовым координатам (CTM 3)..." << std::endl;
+            // Экшен 3 = Просто движение в точку. Безопасно вызывается с нулевым GUID.
+            SafeCTM(pLocal, 3, 0, x + 5.0f, y, z);
             keyStateF1 = true;
         }
     } else {
@@ -106,25 +107,10 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
         if (bestGuid && bestObj) {
             float tx = Read<float>(bestObj + 0x798), ty = Read<float>(bestObj + 0x79C), tz = Read<float>(bestObj + 0x7A0);
             
-            // Используем нативную функцию установки цели вместо крашащей записи в память
-            ((tSetTarget)ADDR_SET_TARGET)(bestGuid);
-
-            if (bestDist > 4.5f) {
-                if (GetTickCount() - lastAction > 300) {
-                    float pos[3] = { tx, ty, tz };
-                    ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 4, &bestGuid, pos, 0.5f);
-                    lastAction = GetTickCount();
-                }
-            } else {
-                if (GetTickCount() - lastAction > 1500) {
-                    float dy = ty - myY, dx = tx - myX;
-                    float angle = atan2(dy, dx);
-                    if (angle < 0) angle += 6.283185f;
-                    Write<float>(pLocal + 0x7A8, angle);
-                    
-                    ((tFrameScript_Execute)ADDR_LUA_EXECUTE)("InteractUnit('target')", "Bot", NULL);
-                    lastAction = GetTickCount();
-                }
+            if (GetTickCount() - lastAction > 500) {
+                // Экшен 4 = Взаимодействие (игра сама бежит и бьет врага, если он враждебен)
+                SafeCTM(pLocal, 4, bestGuid, tx, ty, tz);
+                lastAction = GetTickCount();
             }
         } else {
             if (GetTickCount() - lastAction > 2000) {
@@ -136,11 +122,10 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
                             float dx = Read<float>(cur + 0x798) - myX, dy = Read<float>(cur + 0x79C) - myY;
                             if (sqrt(dx*dx + dy*dy) < 5.0f) {
                                 uint64_t deadGuid = Read<uint64_t>(cur + 0x30);
+                                float tx = Read<float>(cur + 0x798), ty = Read<float>(cur + 0x79C), tz = Read<float>(cur + 0x7A0);
                                 
-                                // То же самое для лута - ставим таргет безопасно
-                                ((tSetTarget)ADDR_SET_TARGET)(deadGuid);
-                                ((tFrameScript_Execute)ADDR_LUA_EXECUTE)("InteractUnit('target')", "Loot", NULL);
-                                
+                                // Тот же Экшен 4 идеально работает для сбора лута с трупов
+                                SafeCTM(pLocal, 4, deadGuid, tx, ty, tz);
                                 lastAction = GetTickCount();
                                 break;
                             }
