@@ -30,18 +30,15 @@ float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) 
     return sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2) + pow(z2 - z1, 2));
 }
 
-// Умный приказ (не сбивает анимацию удара)
 void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, float z) {
     static uint64_t lastGuid = 0;
     static int lastType = 0;
     static float lastX = 0, lastY = 0, lastZ = 0;
 
-    // Считаем, насколько отбежал моб с момента прошлого приказа
     float diff = sqrt(pow(x - lastX, 2) + pow(y - lastY, 2) + pow(z - lastZ, 2));
 
-    // Обновляем команду ТОЛЬКО если: сменилась цель, сменилось действие (убит -> лут), 
-    // ИЛИ моб отбежал больше чем на 1.5 метра (чтобы персонаж гнался за ним)
-    if (guid != lastGuid || type != lastType || diff > 1.5f) {
+    // Обновляем команду ТОЛЬКО если моб сдвинулся, или мы поменяли цель/действие
+    if (guid != lastGuid || type != lastType || diff > 2.0f) {
         uint64_t ctmGuid = guid;
         float ctmPos[3] = { x, y, z };
         
@@ -62,7 +59,6 @@ void BotPulse() {
     uintptr_t pLocal = 0;
     float myX = 0, myY = 0, myZ = 0;
 
-    // 1. Ищем локального игрока
     uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
     while (cur && (cur & 1) == 0) {
         if (*(uint64_t*)(cur + 0x30) == localGuid) {
@@ -81,7 +77,6 @@ void BotPulse() {
     uint32_t targetFlags = 0;
     float tX = 0, tY = 0, tZ = 0;
 
-    // 2. Читаем статус текущей цели бота
     if (g_BotTarget != 0) {
         cur = *(uintptr_t*)(mgr + 0xAC);
         while (cur && (cur & 1) == 0) {
@@ -105,30 +100,25 @@ void BotPulse() {
         if (!hasTarget) g_BotTarget = 0; 
     }
 
-    // 3. Главная логика: Бой -> Лут
     if (hasTarget) {
-        // [!] ПРИНУДИТЕЛЬНО ПРОПИСЫВАЕМ ТАРГЕТ [!]
-        // Для интерфейса игры (Портрет сверху):
-        *(uint64_t*)ADDR_TARGET_GUID = g_BotTarget; 
-        
-        // Для внутреннего состояния персонажа (Чтобы он знал, кого бьет):
+        // [!] Жестко берем цель в таргет [!]
+        *(uint64_t*)ADDR_TARGET_GUID = g_BotTarget; // Рисует портрет в интерфейсе
         uintptr_t pDesc = *(uintptr_t*)(pLocal + 0x8);
-        if (pDesc) *(uint64_t*)(pDesc + 0x48) = g_BotTarget; 
+        if (pDesc) *(uint64_t*)(pDesc + 0x48) = g_BotTarget; // Сообщает серверу, что мы бьем
 
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
 
         if (targetHp > 0) {
-            // Цель жива - используем тип 11 (АТАКА)
+            // Тип 11 - БОЙ
             ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
             printf("Attacking Target... Dist: %.1f      \r", dist);
         } 
         else if (targetHp <= 0 && (targetFlags & 1)) {
-            // Цель мертва и есть лут - используем тип 6 (ЛУТ)
+            // Тип 6 - ЛУТ
             ActionCTM(pLocal, CTM_LOOT, g_BotTarget, tX, tY, tZ);
             printf("Looting Corpse... Dist: %.1f        \r", dist);
         } 
         else {
-            // Цель пуста. В черный список и сбрасываем таргет.
             g_Blacklist.push_back(g_BotTarget);
             g_BotTarget = 0; 
             *(uint64_t*)ADDR_TARGET_GUID = 0; 
@@ -136,7 +126,6 @@ void BotPulse() {
             printf("Target Empty. Blacklisted.          \n");
         }
     } 
-    // 4. Поиск новой цели
     else {
         uint64_t bestGuid = 0;
         float bestDist = 40.0f; 
@@ -217,7 +206,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v13.0: Blood & Loot Edition ---\n");
+    printf("--- Bot v14.0: The Re-Compile Edition ---\n");
 
     HWND hwnd = FindWindowA(NULL, "World of Warcraft");
     if (!hwnd) {
