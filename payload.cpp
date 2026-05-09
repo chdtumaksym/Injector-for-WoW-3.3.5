@@ -8,9 +8,6 @@
 #include <sstream>
 #include <string>
 
-// ==========================================
-// --- АДРЕСА ПАМЯТИ WoW 3.3.5a (12340) ---
-// ==========================================
 #define ADDR_S_CUR_MGR          0x00C79CE0
 #define OFFSET_OBJECT_MANAGER   0x2ED0
 #define ADDR_CLICK_TO_MOVE      0x00727400 
@@ -36,11 +33,7 @@ HINSTANCE g_hModule = NULL;
 
 std::vector<uint64_t> g_Blacklist; 
 uint64_t g_BotTarget = 0; 
-DWORD g_GCD = 0; 
 
-// ==========================================
-// --- СИСТЕМА ПРОФИЛЕЙ (ВНЕШНИЕ ФАЙЛЫ) ---
-// ==========================================
 enum TaskType { TASK_GOTO, TASK_ACCEPT_QUEST, TASK_TURN_IN_QUEST, TASK_GRIND };
 
 struct BotTask {
@@ -49,11 +42,28 @@ struct BotTask {
     int npcId;
     int questId;
     int count;
+    int killsDone; // ДОБАВЛЕНО: Счетчик убийств
 };
 
 std::vector<BotTask> g_Profile;
 int g_CurrentTaskIndex = 0;
 std::string g_CurrentProfileName = "";
+
+// Читаем настройки от GUI
+std::string GetProfilePathFromGUI() {
+    char path[MAX_PATH];
+    GetCurrentDirectoryA(MAX_PATH, path);
+    std::string settingsPath = std::string(path) + "\\settings.ini";
+    
+    std::ifstream config(settingsPath);
+    std::string profilePath;
+    if (config.is_open()) {
+        std::getline(config, profilePath);
+        config.close();
+        return profilePath;
+    }
+    return "";
+}
 
 void LoadProfile(const std::string& filename) {
     g_Profile.clear();
@@ -75,6 +85,7 @@ void LoadProfile(const std::string& filename) {
         iss >> command;
 
         BotTask task = {};
+        task.killsDone = 0;
         if (command == "GOTO") {
             task.type = TASK_GOTO;
             iss >> task.x >> task.y >> task.z;
@@ -85,13 +96,20 @@ void LoadProfile(const std::string& filename) {
             iss >> task.count;
             g_Profile.push_back(task);
         }
+        else if (command == "ACCEPT_QUEST") {
+            task.type = TASK_ACCEPT_QUEST;
+            iss >> task.npcId >> task.questId;
+            g_Profile.push_back(task);
+        }
+        else if (command == "TURN_IN_QUEST") {
+            task.type = TASK_TURN_IN_QUEST;
+            iss >> task.npcId >> task.questId;
+            g_Profile.push_back(task);
+        }
     }
-    printf("[+] Profile '%s' loaded! Total tasks: %d\n", filename.c_str(), g_Profile.size());
+    printf("[+] Profile loaded! Total tasks: %d\n", g_Profile.size());
 }
 
-// ==========================================
-// --- БАЗОВЫЕ ФУНКЦИИ ---
-// ==========================================
 float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) {
     return sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2) + pow(z2 - z1, 2));
 }
@@ -124,9 +142,6 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
     }
 }
 
-// ==========================================
-// --- ЯДРО БОТА ---
-// ==========================================
 void BotPulse() {
     uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
     uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
@@ -156,26 +171,8 @@ void BotPulse() {
     int myMaxHp = *(int*)(pLocalDesc + 0x80); 
     if (myMaxHp <= 0) myMaxHp = 1; 
     float myHpPercent = ((float)myHp / (float)myMaxHp) * 100.0f;
-    
-    uint32_t myFlags = *(uint32_t*)(pLocalDesc + 0xEC); 
-    bool inCombat = (myFlags & 0x80000) != 0; 
     int myFaction = *(int*)(pLocalDesc + 0xDC);
-    
-    int myLevel = *(int*)(pLocalDesc + 0xD8);
-    static int lastLevel = 0;
 
-    // --- АВТО-СМЕНА ПРОФИЛЕЙ ПО УРОВНЮ ---
-    if (myLevel != lastLevel) {
-        if (lastLevel != 0) printf("\n[LEVEL UP] Congratulations! You are now level %d!\n", myLevel);
-        lastLevel = myLevel;
-
-        if (myLevel >= 6 && g_CurrentProfileName != "C:\\Elwynn_6_10.txt") {
-            printf("[SYSTEM] Level 6 reached. Leaving Northshire...\n");
-            LoadProfile("C:\\Elwynn_6_10.txt");
-        }
-    }
-
-    // --- 1. ВЫЖИВАНИЕ ---
     if (myHpPercent < 40.0f) {
         ExecuteLua("MoveForwardStop(); MoveBackwardStop();"); 
         printf("[SURVIVAL] HP %.1f%%! Pausing tasks to heal...\n", myHpPercent);
@@ -214,9 +211,6 @@ void BotPulse() {
     static DWORD lootTimer = 0;
     static DWORD deathTime = 0;
 
-    // ==========================================
-    // РЕЖИМ БОЯ (ПРИОРИТЕТ)
-    // ==========================================
     if (hasTarget) {
         ProgrammaticTarget(g_BotTarget);
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
@@ -224,7 +218,6 @@ void BotPulse() {
         if (targetHp > 0) {
             isLooting = false; 
             deathTime = 0;
-
             ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
             printf("[COMBAT] Attacking... Dist: %.1f      \r", dist);
             
@@ -237,11 +230,9 @@ void BotPulse() {
             }
         } 
         else {
-            // ЛУТ
             if (targetDynFlags & 1) { 
                 if (dist > 4.5f && !isLooting) {
                     ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
-                    printf("[LOOT] Running to Corpse... Dist: %.1f        \r", dist);
                 } else {
                     if (!isLooting) {
                         uint64_t ctmGuid = g_BotTarget;
@@ -260,10 +251,22 @@ void BotPulse() {
 
                     if (GetTickCount() - lootTimer > 3000) {
                         g_Blacklist.push_back(g_BotTarget);
+                        
+                        // ЛОГИКА GRIND: Считаем убийства!
+                        if (!g_Profile.empty() && g_CurrentTaskIndex < g_Profile.size()) {
+                            if (g_Profile[g_CurrentTaskIndex].type == TASK_GRIND) {
+                                g_Profile[g_CurrentTaskIndex].killsDone++;
+                                printf("\n[GRIND] Kill %d / %d\n", g_Profile[g_CurrentTaskIndex].killsDone, g_Profile[g_CurrentTaskIndex].count);
+                                if (g_Profile[g_CurrentTaskIndex].killsDone >= g_Profile[g_CurrentTaskIndex].count) {
+                                    g_CurrentTaskIndex++;
+                                    printf("[TASK] Grind complete! Moving to next task.\n");
+                                }
+                            }
+                        }
+
                         g_BotTarget = 0; 
                         isLooting = false;
                         ExecuteLua("ClearTarget(); CloseLoot();"); 
-                        printf("\n[+] Corpse processed.\n");
                     }
                 }
             } else {
@@ -285,10 +288,6 @@ void BotPulse() {
         }
         return; 
     } 
-
-    // ==========================================
-    // РЕЖИМ ЗАДАЧ (КВЕСТИНГ / НАВИГАЦИЯ)
-    // ==========================================
     
     uint64_t bestGuid = 0;
     float bestDist = 25.0f; 
@@ -331,7 +330,6 @@ void BotPulse() {
     if (bestGuid) {
         g_BotTarget = bestGuid; 
         ProgrammaticTarget(g_BotTarget);
-        printf("\n[!] Enemy detected! Interrupting task to fight.\n");
         return;
     }
 
@@ -374,22 +372,14 @@ void BotPulse() {
         }
     }
     else if (task.type == TASK_GRIND) {
-        printf("[TASK] Grinding mode active. Looking for mobs...      \r");
+        printf("[TASK] Grinding mode active. Looking for mobs... (%d/%d)      \r", task.killsDone, task.count);
     }
 }
 
-// [!] БЕЗОПАСНАЯ ОБЕРТКА ДЛЯ ИСКЛЮЧЕНИЙ (ФИКС ОШИБКИ C2712) [!]
 void SafeBotPulse() {
-    __try {
-        BotPulse();
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Игнорируем ошибки чтения памяти
-    }
+    __try { BotPulse(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-// ==========================================
-// --- ПОТОК ВЫГРУЗКИ И КЛАВИАТУРЫ ---
-// ==========================================
 DWORD WINAPI EjectThread(LPVOID) {
     SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)oWndProc); 
     KillTimer(g_WoWHwnd, 1337);
@@ -401,45 +391,10 @@ DWORD WINAPI EjectThread(LPVOID) {
 
 LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     if (uMsg == WM_TIMER && wParam == 1337) {
-        
         if (GetAsyncKeyState(VK_END) & 0x8000) {
             g_Active = false;
-            printf("\n\n[!] EJECTING BOT... You can close this console.\n");
             CreateThread(0, 0, EjectThread, 0, 0, 0);
             return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
-        }
-
-        static bool f9Pressed = false;
-        if (GetAsyncKeyState(VK_F9) & 0x8000) {
-            if (!f9Pressed) {
-                f9Pressed = true;
-                
-                uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
-                uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
-                if (mgr) {
-                    uint64_t localGuid = *(uint64_t*)(mgr + 0xC0);
-                    uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
-                    while (cur && (cur & 1) == 0) {
-                        if (*(uint64_t*)(cur + 0x30) == localGuid) {
-                            float x = *(float*)(cur + 0x798);
-                            float y = *(float*)(cur + 0x79C);
-                            float z = *(float*)(cur + 0x7A0);
-                            
-                            std::ofstream outfile;
-                            outfile.open("C:\\RecordedProfile.txt", std::ios_base::app);
-                            outfile << "GOTO " << x << " " << y << " " << z << "\n";
-                            outfile.close();
-                            
-                            Beep(1000, 100);
-                            printf("\n[+] Waypoint Saved: %.2f %.2f %.2f\n", x, y, z);
-                            break;
-                        }
-                        cur = *(uintptr_t*)(cur + 0x3C);
-                    }
-                }
-            }
-        } else {
-            f9Pressed = false;
         }
 
         static bool isPressed = false;
@@ -451,8 +406,12 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
                 printf("\n\n[!] BOT STATUS: %s\n", g_Active ? "ACTIVE" : "PAUSED");
                 
                 if (g_Active) {
-                    // Укажи здесь правильный путь к файлу профиля!
-                    LoadProfile("C:\\Northshire_1_6.txt");
+                    std::string profileToLoad = GetProfilePathFromGUI();
+                    if (!profileToLoad.empty()) {
+                        LoadProfile(profileToLoad);
+                    } else {
+                        printf("[-] No profile selected in GUI!\n");
+                    }
                 } else { 
                     g_BotTarget = 0; 
                     ExecuteLua("ClearTarget(); CloseLoot();");
@@ -465,10 +424,9 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 
         static DWORD lastTick = 0;
         static bool isPulsing = false; 
-
         if (g_Active && !isPulsing && (GetTickCount() - lastTick > 150)) {
             isPulsing = true;
-            SafeBotPulse(); // Вызываем безопасную обертку
+            SafeBotPulse(); 
             lastTick = GetTickCount();
             isPulsing = false;
         }
@@ -479,20 +437,11 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v161: The Compiler Fix ---\n");
-
+    printf("--- Bot Core Loaded ---\n");
     g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
     if (!g_WoWHwnd) return 0;
-
     oWndProc = (WNDPROC)SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(g_WoWHwnd, 1337, 50, NULL); 
-
-    printf("[+] External Profile Engine: INTEGRATED.\n");
-    printf("[+] Auto-Level Profile Switcher: INTEGRATED.\n");
-    printf("[+] Waypoint Recorder (F9): INTEGRATED.\n");
-    printf("[!] Press[F9] in-game to save your current position to C:\\RecordedProfile.txt\n");
-    printf("[!] Press [INSERT] to Start/Pause.\n");
-    printf("[!] Press [END] to Unload the Bot.\n\n");
     return 0;
 }
 
