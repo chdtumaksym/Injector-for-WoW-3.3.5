@@ -15,7 +15,7 @@
 #define ADDR_MOUSEOVER_GUID     0x00BD07A0 
 #define ADDR_LUA_EXECUTE        0x00819210 
 
-#define CTM_MOVE                4 
+#define CTM_LOOT                6  
 #define CTM_ATTACK              11 
 
 #pragma runtime_checks("", off)
@@ -29,6 +29,7 @@ bool g_Active = false;
 WNDPROC oWndProc = nullptr;
 std::vector<uint64_t> g_Blacklist; 
 uint64_t g_BotTarget = 0; 
+DWORD g_DeathTime = 0; // Таймер для фикса задержки сервера при луте
 
 float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) {
     return sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2) + pow(z2 - z1, 2));
@@ -38,19 +39,11 @@ void ExecuteLua(const char* command) {
     ((tLuaExecute)ADDR_LUA_EXECUTE)(command, "bot_core", 0);
 }
 
-// [!] ФИКС ЛУТА: Мы ВСЕГДА обновляем mouseover, чтобы скрипт лута знал, кого лутать
 void ProgrammaticTarget(uint64_t guid) {
     *(uint64_t*)ADDR_MOUSEOVER_GUID = guid; 
     if (*(uint64_t*)ADDR_TARGET_GUID != guid) {
         ExecuteLua("TargetUnit('mouseover')");
     }
-}
-
-// [!] ФИКС ПОВОРОТА: Мгновенно разворачиваем персонажа лицом к координатам цели
-void FaceTarget(uintptr_t pLocal, float myX, float myY, float tX, float tY) {
-    float angle = atan2(tY - myY, tX - myX);
-    if (angle < 0.0f) angle += 6.283185307f; // 2 * PI
-    *(float*)(pLocal + 0x7A8) = angle; // 0x7A8 - смещение угла поворота (Facing) в 3.3.5a
 }
 
 void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, float z) {
@@ -127,41 +120,50 @@ void BotPulse() {
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
 
         if (targetHp > 0) {
+            g_DeathTime = 0; // Сбрасываем таймер смерти, пока моб жив
+
             ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
             printf("Chasing Target... Dist: %.1f      \r", dist);
             
             if (dist < 5.0f) {
-                FaceTarget(pLocal, myX, myY, tX, tY); // [!] ПРИНУДИТЕЛЬНЫЙ ПОВОРОТ ЛИЦОМ
                 static DWORD lastAtk = 0;
                 if (GetTickCount() - lastAtk > 1500) {
-                    ExecuteLua("StartAttack()");
+                    // InteractUnit легально поворачивает персонажа лицом к цели для сервера!
+                    ExecuteLua("InteractUnit('mouseover'); StartAttack();");
                     lastAtk = GetTickCount();
                 }
             }
         } 
-        else if (targetHp <= 0 && (targetFlags & 1)) {
-            if (dist > 4.5f) {
-                ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
-                printf("Running to Corpse... Dist: %.1f        \r", dist);
-            } else {
-                FaceTarget(pLocal, myX, myY, tX, tY); // [!] ПОВОРОТ К ТРУПУ
-                printf("Looting Corpse (Lua Bypass)... Dist: %.1f  \r", dist);
+        else {
+            // Моб мертв. Засекаем время смерти.
+            if (g_DeathTime == 0) g_DeathTime = GetTickCount();
+
+            if (targetFlags & 1) { 
+                // Сервер прислал флаг лута!
+                ActionCTM(pLocal, CTM_LOOT, g_BotTarget, tX, tY, tZ);
+                printf("Moving to Loot... Dist: %.1f        \r", dist);
                 
-                static DWORD lastLoot = 0;
-                if (GetTickCount() - lastLoot > 800) {
-                    // [!] ГЕНИАЛЬНЫЙ ОБХОД ЛУТА:
-                    // Если окно лута открыто - собираем вещи через незащищенную функцию LootSlot()
-                    // Если закрыто - открываем его через InteractUnit
-                    ExecuteLua("if GetNumLootItems() > 0 then for i=1, GetNumLootItems() do LootSlot(i) end else InteractUnit('mouseover') end");
-                    lastLoot = GetTickCount();
+                if (dist < 5.0f) {
+                    static DWORD lastLoot = 0;
+                    if (GetTickCount() - lastLoot > 1500) {
+                        // Открываем окно лута
+                        ExecuteLua("InteractUnit('mouseover')");
+                        lastLoot = GetTickCount();
+                    }
+                }
+            } 
+            else {
+                // Флага лута нет. Ждем 1.5 секунды ответа от сервера.
+                if (GetTickCount() - g_DeathTime > 1500) {
+                    // Прошло 1.5 сек, лута точно нет. Сбрасываем.
+                    g_Blacklist.push_back(g_BotTarget);
+                    g_BotTarget = 0; 
+                    ExecuteLua("ClearTarget()"); 
+                    printf("Target Empty. Blacklisted.             \n");
+                } else {
+                    printf("Waiting for server loot flag...        \r");
                 }
             }
-        } 
-        else {
-            g_Blacklist.push_back(g_BotTarget);
-            g_BotTarget = 0; 
-            ExecuteLua("ClearTarget()"); 
-            printf("Target Empty. Blacklisted.             \n");
         }
     } 
     else {
@@ -246,7 +248,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v132: Face & Loot Edition ---\n");
+    printf("--- Bot v133: Server Sync & Loot Fix ---\n");
 
     HWND hwnd = FindWindowA(NULL, "World of Warcraft");
     if (!hwnd) return 0;
@@ -254,8 +256,8 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(hwnd, 1337, 50, NULL); 
 
-    printf("[+] Memory Facing (atan2): INTEGRATED.\n");
-    printf("[+] Lua LootSlot() Bypasser: INTEGRATED.\n");
+    printf("[+] Server Desync (Facing) Fixed.\n");
+    printf("[+] Loot Race Condition Fixed (1.5s delay).\n");
     printf("[!] Focus WoW window and press [INSERT] to start.\n");
     return 0;
 }
