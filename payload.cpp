@@ -1,340 +1,501 @@
-#include "imgui.h"
-#include "imgui_impl_win32.h"
-#include "imgui_impl_dx11.h"
-#include <d3d11.h>
-#include <tchar.h>
 #include <windows.h>
-#include <tlhelp32.h>
+#include <cmath>
+#include <stdint.h>
 #include <iostream>
-#include <fstream>
 #include <vector>
+#include <algorithm>
+#include <fstream>
+#include <sstream>
 #include <string>
-#include <filesystem>
 
-// ==========================================
-// --- MANUAL MAPPING ---
-// ==========================================
-struct MANUAL_MAPPING_DATA {
-    typedef HMODULE(WINAPI* pLoadLibraryA)(LPCSTR);
-    typedef FARPROC(WINAPI* pGetProcAddress)(HMODULE, LPCSTR);
-    pLoadLibraryA fnLoadLibraryA;
-    pGetProcAddress fnGetProcAddress;
-    BYTE* pbase;
+#define ADDR_S_CUR_MGR          0x00C79CE0
+#define OFFSET_OBJECT_MANAGER   0x2ED0
+#define ADDR_CLICK_TO_MOVE      0x00727400 
+#define ADDR_TARGET_GUID        0x00BD07B8 
+#define ADDR_MOUSEOVER_GUID     0x00BD07A0 
+#define ADDR_LUA_EXECUTE        0x00819210 
+
+#define CTM_MOVE                4 
+#define CTM_LOOT                6
+#define CTM_ATTACK              11 
+
+#pragma runtime_checks("", off)
+#pragma check_stack(off)
+#pragma strict_gs_check(off)
+
+typedef void(__fastcall* tClickToMove)(uintptr_t ecx, uintptr_t edx, int type, uint64_t* guid, float* pos, float prec);
+typedef void(__cdecl* tLuaExecute)(const char* code, const char* fileName, int state);
+
+bool g_Active = false;
+WNDPROC oWndProc = nullptr;
+HWND g_WoWHwnd = NULL;
+HINSTANCE g_hModule = NULL; 
+
+std::vector<uint64_t> g_Blacklist; 
+uint64_t g_BotTarget = 0; 
+
+// ДОБАВЛЕН TASK_LOAD_PROFILE
+enum TaskType { TASK_GOTO, TASK_ACCEPT_QUEST, TASK_TURN_IN_QUEST, TASK_GRIND, TASK_LOAD_PROFILE };
+
+struct BotTask {
+    TaskType type;
+    float x, y, z;
+    int npcId;
+    int questId;
+    int count;
+    int killsDone;
+    char nextProfile[256]; // Для загрузки следующего файла
 };
 
-DWORD GetProcessId(const char* procName) {
-    DWORD procId = 0;
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap != INVALID_HANDLE_VALUE) {
-        PROCESSENTRY32 pe; pe.dwSize = sizeof(pe);
-        if (Process32First(hSnap, &pe)) {
-            do {
-                if (!_stricmp(pe.szExeFile, procName)) { procId = pe.th32ProcessID; break; }
-            } while (Process32Next(hSnap, &pe));
-        }
+std::vector<BotTask> g_Profile;
+int g_CurrentTaskIndex = 0;
+std::string g_CurrentProfileName = "";
+
+std::string GetProfilePathFromGUI() {
+    std::ifstream config("C:\\WoWBot\\settings.ini");
+    std::string profilePath;
+    if (config.is_open()) {
+        std::getline(config, profilePath);
+        config.close();
+        return profilePath;
     }
-    CloseHandle(hSnap);
-    return procId;
+    return "";
 }
 
-#pragma optimize("", off)
-void __stdcall ShellCode(MANUAL_MAPPING_DATA* pData) {
-    if (!pData) return;
-    BYTE* pBase = pData->pbase;
-    auto* pNt = reinterpret_cast<IMAGE_NT_HEADERS*>(pBase + reinterpret_cast<IMAGE_DOS_HEADER*>(pBase)->e_lfanew);
-    auto* pOpt = &pNt->OptionalHeader;
+void LoadProfile(const std::string& filename) {
+    g_Profile.clear();
+    g_CurrentTaskIndex = 0;
+    g_CurrentProfileName = filename;
+    
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        printf("[-] ERROR: Could not open profile %s\n", filename.c_str());
+        return;
+    }
 
-    auto* pRelocDir = &pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-    if (pRelocDir->Size) {
-        auto* pReloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>(pBase + pRelocDir->VirtualAddress);
-        while (pReloc->VirtualAddress) {
-            UINT entries = (pReloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
-            WORD* pInfo = reinterpret_cast<WORD*>(pReloc + 1);
-            for (UINT i = 0; i < entries; ++i, ++pInfo) {
-                if ((*pInfo >> 12) == IMAGE_REL_BASED_HIGHLOW) {
-                    DWORD* pPatch = reinterpret_cast<DWORD*>(pBase + pReloc->VirtualAddress + ((*pInfo) & 0xFFF));
-                    *pPatch += (DWORD)pBase - pOpt->ImageBase;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '/') continue; 
+
+        std::istringstream iss(line);
+        std::string command;
+        iss >> command;
+
+        BotTask task = {};
+        task.killsDone = 0;
+        if (command == "GOTO") {
+            task.type = TASK_GOTO;
+            iss >> task.x >> task.y >> task.z;
+            g_Profile.push_back(task);
+        } 
+        else if (command == "GRIND") {
+            task.type = TASK_GRIND;
+            iss >> task.count >> task.npcId; // ТЕПЕРЬ ЧИТАЕМ ID МОБА!
+            g_Profile.push_back(task);
+        }
+        else if (command == "ACCEPT_QUEST") {
+            task.type = TASK_ACCEPT_QUEST;
+            iss >> task.npcId >> task.questId;
+            g_Profile.push_back(task);
+        }
+        else if (command == "TURN_IN_QUEST") {
+            task.type = TASK_TURN_IN_QUEST;
+            iss >> task.npcId >> task.questId;
+            g_Profile.push_back(task);
+        }
+        else if (command == "LOAD_PROFILE") {
+            task.type = TASK_LOAD_PROFILE;
+            iss >> task.nextProfile;
+            g_Profile.push_back(task);
+        }
+    }
+    printf("[+] Profile loaded! Total tasks: %d\n", g_Profile.size());
+}
+
+float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) {
+    return sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2) + pow(z2 - z1, 2));
+}
+
+void ExecuteLua(const char* command) {
+    ((tLuaExecute)ADDR_LUA_EXECUTE)(command, "bot_core", 0);
+}
+
+void ProgrammaticTarget(uint64_t guid) {
+    if (*(uint64_t*)ADDR_TARGET_GUID != guid) {
+        *(uint64_t*)ADDR_MOUSEOVER_GUID = guid;
+        ExecuteLua("TargetUnit('mouseover')");
+    }
+}
+
+void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, float z) {
+    static uint64_t lastGuid = 0;
+    static int lastType = 0;
+    static float lastX = 0, lastY = 0, lastZ = 0;
+
+    float diff = sqrt(pow(x - lastX, 2) + pow(y - lastY, 2) + pow(z - lastZ, 2));
+
+    if (guid != lastGuid || type != lastType || diff > 1.5f) {
+        uint64_t ctmGuid = guid;
+        float ctmPos[3] = { x, y, z };
+        ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, type, &ctmGuid, ctmPos, 0.5f);
+        
+        lastGuid = guid; lastType = type;
+        lastX = x; lastY = y; lastZ = z;
+    }
+}
+
+void BotPulse() {
+    uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
+    uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
+    if (!mgr) return;
+
+    uint64_t localGuid = *(uint64_t*)(mgr + 0xC0);
+    uintptr_t pLocal = 0;
+    float myX = 0, myY = 0, myZ = 0;
+
+    uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
+    while (cur && (cur & 1) == 0) {
+        if (*(uint64_t*)(cur + 0x30) == localGuid) {
+            pLocal = cur;
+            myX = *(float*)(cur + 0x798); 
+            myY = *(float*)(cur + 0x79C); 
+            myZ = *(float*)(cur + 0x7A0);
+            break;
+        }
+        cur = *(uintptr_t*)(cur + 0x3C);
+    }
+    if (!pLocal) return;
+
+    uintptr_t pLocalDesc = *(uintptr_t*)(pLocal + 0x8);
+    if (!pLocalDesc) return;
+    
+    int myHp = *(int*)(pLocalDesc + 0x60);
+    int myMaxHp = *(int*)(pLocalDesc + 0x80); 
+    if (myMaxHp <= 0) myMaxHp = 1; 
+    float myHpPercent = ((float)myHp / (float)myMaxHp) * 100.0f;
+
+    if (myHpPercent < 40.0f) {
+        ExecuteLua("MoveForwardStop(); MoveBackwardStop();"); 
+        printf("[SURVIVAL] HP %.1f%%! Pausing tasks to heal...\n", myHpPercent);
+        return; 
+    }
+
+    bool hasTarget = false;
+    int targetHp = 0;
+    uint32_t targetDynFlags = 0;
+    float tX = 0, tY = 0, tZ = 0;
+
+    if (g_BotTarget != 0) {
+        cur = *(uintptr_t*)(mgr + 0xAC);
+        while (cur && (cur & 1) == 0) {
+            if (*(uint64_t*)(cur + 0x30) == g_BotTarget) {
+                int objType = *(int*)(cur + 0x14);
+                if (objType == 3 || objType == 4) { 
+                    uintptr_t desc = *(uintptr_t*)(cur + 0x8);
+                    if (desc) {
+                        targetHp = *(int*)(desc + 0x60); 
+                        targetDynFlags = *(uint32_t*)(desc + 0x13C); 
+                        tX = *(float*)(cur + 0x798);
+                        tY = *(float*)(cur + 0x79C);
+                        tZ = *(float*)(cur + 0x7A0);
+                        hasTarget = true;
+                    }
+                }
+                break;
+            }
+            cur = *(uintptr_t*)(cur + 0x3C);
+        }
+        if (!hasTarget) g_BotTarget = 0; 
+    }
+
+    static bool isLooting = false;
+    static DWORD lootTimer = 0;
+    static DWORD deathTime = 0;
+
+    if (hasTarget) {
+        ProgrammaticTarget(g_BotTarget);
+        float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
+
+        if (targetHp > 0) {
+            isLooting = false; 
+            deathTime = 0;
+            ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
+            printf("[COMBAT] Attacking... Dist: %.1f      \r", dist);
+            
+            if (dist < 5.0f) {
+                static DWORD lastAtk = 0;
+                if (GetTickCount() - lastAtk > 1500) {
+                    ExecuteLua("InteractUnit('mouseover'); StartAttack();");
+                    lastAtk = GetTickCount();
                 }
             }
-            pReloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>((BYTE*)pReloc + pReloc->SizeOfBlock);
-        }
-    }
-
-    auto* pImportDir = &pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (pImportDir->Size) {
-        auto* pImportDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(pBase + pImportDir->VirtualAddress);
-        while (pImportDesc->Name) {
-            HMODULE hMod = pData->fnLoadLibraryA((char*)(pBase + pImportDesc->Name));
-            auto* pThunk = (IMAGE_THUNK_DATA*)(pBase + pImportDesc->FirstThunk);
-            auto* pIAT = (IMAGE_THUNK_DATA*)(pBase + pImportDesc->FirstThunk);
-            if (pImportDesc->OriginalFirstThunk) pThunk = (IMAGE_THUNK_DATA*)(pBase + pImportDesc->OriginalFirstThunk);
-            while (pThunk->u1.AddressOfData) {
-                if (IMAGE_SNAP_BY_ORDINAL(pThunk->u1.Ordinal)) pIAT->u1.Function = (DWORD)pData->fnGetProcAddress(hMod, (char*)(pThunk->u1.Ordinal & 0xFFFF));
-                else pIAT->u1.Function = (DWORD)pData->fnGetProcAddress(hMod, ((IMAGE_IMPORT_BY_NAME*)(pBase + pThunk->u1.AddressOfData))->Name);
-                pThunk++; pIAT++;
-            }
-            pImportDesc++;
-        }
-    }
-
-    if (pOpt->AddressOfEntryPoint) {
-        auto _DllMain = (BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID))(pBase + pOpt->AddressOfEntryPoint);
-        _DllMain((HINSTANCE)pBase, DLL_PROCESS_ATTACH, nullptr);
-    }
-}
-void __stdcall ShellCodeEnd() {}
-#pragma optimize("", on)
-
-bool ManualMapInject(DWORD pid, const char* dllPath, char* logBuffer) {
-    std::ifstream f(dllPath, std::ios::binary | std::ios::ate);
-    if (!f.is_open()) {
-        strcpy(logBuffer, "[-] Error: bot_payload.dll not found in folder!\n");
-        return false;
-    }
-    auto sz = f.tellg();
-    std::vector<BYTE> buf(sz);
-    f.seekg(0, std::ios::beg);
-    f.read((char*)buf.data(), sz);
-    f.close();
-
-    HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-    if (!hProc) {
-        strcpy(logBuffer, "[-] Error: Cannot open WoW.exe process!\n");
-        return false;
-    }
-
-    auto* pNt = reinterpret_cast<IMAGE_NT_HEADERS*>(buf.data() + reinterpret_cast<IMAGE_DOS_HEADER*>(buf.data())->e_lfanew);
-    BYTE* pTarget = (BYTE*)VirtualAllocEx(hProc, nullptr, pNt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-
-    if (!pTarget) {
-        strcpy(logBuffer, "[-] Error: Memory allocation failed!\n");
-        CloseHandle(hProc);
-        return false;
-    }
-
-    WriteProcessMemory(hProc, pTarget, buf.data(), pNt->OptionalHeader.SizeOfHeaders, nullptr);
-    auto* pSec = IMAGE_FIRST_SECTION(pNt);
-    for (int i = 0; i < pNt->FileHeader.NumberOfSections; i++, pSec++) {
-        WriteProcessMemory(hProc, pTarget + pSec->VirtualAddress, buf.data() + pSec->PointerToRawData, pSec->SizeOfRawData, nullptr);
-    }
-
-    MANUAL_MAPPING_DATA data;
-    data.fnLoadLibraryA = LoadLibraryA;
-    data.fnGetProcAddress = GetProcAddress;
-    data.pbase = pTarget;
-
-    BYTE* pRemData = (BYTE*)VirtualAllocEx(hProc, nullptr, sizeof(data), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    WriteProcessMemory(hProc, pRemData, &data, sizeof(data), nullptr);
-
-    BYTE* pRemCode = (BYTE*)VirtualAllocEx(hProc, nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    WriteProcessMemory(hProc, pRemCode, ShellCode, 4096, nullptr);
-
-    HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0, (LPTHREAD_START_ROUTINE)pRemCode, pRemData, 0, nullptr);
-    if (hThread) {
-        strcpy(logBuffer, "[+] Manual Map Successful!\n[!] Go to game and press INSERT to start.");
-        CloseHandle(hThread);
-        CloseHandle(hProc);
-        return true;
-    }
-    
-    strcpy(logBuffer, "[-] Error: CreateRemoteThread failed!\n");
-    CloseHandle(hProc);
-    return false;
-}
-
-// ==========================================
-// --- DIRECTX 11 & GUI ---
-// ==========================================
-static ID3D11Device* g_pd3dDevice = nullptr;
-static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
-static IDXGISwapChain* g_pSwapChain = nullptr;
-static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
-
-bool CreateDeviceD3D(HWND hWnd) {
-    DXGI_SWAP_CHAIN_DESC sd;
-    ZeroMemory(&sd, sizeof(sd));
-    sd.BufferCount = 2;
-    sd.BufferDesc.Width = 0;
-    sd.BufferDesc.Height = 0;
-    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.BufferDesc.RefreshRate.Numerator = 60;
-    sd.BufferDesc.RefreshRate.Denominator = 1;
-    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow = hWnd;
-    sd.SampleDesc.Count = 1;
-    sd.SampleDesc.Quality = 0;
-    sd.Windowed = TRUE;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-
-    UINT createDeviceFlags = 0;
-    D3D_FEATURE_LEVEL featureLevel;
-    const D3D_FEATURE_LEVEL featureLevelArray[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0, };
-    if (D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext) != S_OK)
-        return false;
-
-    ID3D11Texture2D* pBackBuffer;
-    g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
-    g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
-    pBackBuffer->Release();
-    return true;
-}
-
-void CleanupDeviceD3D() {
-    if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = nullptr; }
-    if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
-    if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext = nullptr; }
-    if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
-}
-
-extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
-LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) return true;
-    switch (msg) {
-    case WM_SIZE:
-        if (g_pd3dDevice != nullptr && wParam != SIZE_MINIMIZED) {
-            if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = nullptr; }
-            g_pSwapChain->ResizeBuffers(0, (UINT)LOWORD(lParam), (UINT)HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
-            ID3D11Texture2D* pBackBuffer;
-            g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
-            g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
-            pBackBuffer->Release();
-        }
-        return 0;
-    case WM_SYSCOMMAND:
-        if ((wParam & 0xfff0) == SC_KEYMENU) return 0;
-        break;
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        return 0;
-    }
-    return DefWindowProc(hWnd, msg, wParam, lParam);
-}
-
-void SetupCS2Style() {
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding = 6.0f;
-    style.FrameRounding = 4.0f;
-    style.GrabRounding = 4.0f;
-    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.11f, 0.11f, 0.13f, 1.00f);
-    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.18f, 0.18f, 0.20f, 1.00f);
-    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.24f, 0.24f, 0.26f, 1.00f);
-    style.Colors[ImGuiCol_Button] = ImVec4(0.85f, 0.50f, 0.10f, 1.00f); 
-    style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.95f, 0.60f, 0.20f, 1.00f);
-    style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.75f, 0.40f, 0.05f, 1.00f);
-    style.Colors[ImGuiCol_Text] = ImVec4(0.95f, 0.95f, 0.95f, 1.00f);
-    style.Colors[ImGuiCol_Header] = ImVec4(0.85f, 0.50f, 0.10f, 0.50f);
-    style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.85f, 0.50f, 0.10f, 0.80f);
-}
-
-int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-    WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"WoWBotClass", nullptr };
-    RegisterClassExW(&wc);
-    HWND hwnd = CreateWindowW(wc.lpszClassName, L"WoW 3.3.5 Bot Launcher", WS_OVERLAPPEDWINDOW, 100, 100, 500, 350, nullptr, nullptr, wc.hInstance, nullptr);
-
-    if (!CreateDeviceD3D(hwnd)) { CleanupDeviceD3D(); UnregisterClassW(wc.lpszClassName, wc.hInstance); return 1; }
-    ShowWindow(hwnd, SW_SHOWDEFAULT); UpdateWindow(hwnd);
-
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO(); (void)io;
-    SetupCS2Style();
-
-    ImGui_ImplWin32_Init(hwnd);
-    ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
-
-    std::vector<std::string> profiles;
-    int selectedProfile = 0;
-    char logBuffer[512] = "Waiting for action...\n";
-
-    char currentDir[MAX_PATH];
-    GetCurrentDirectoryA(MAX_PATH, currentDir);
-    std::string profilesDir = std::string(currentDir) + "\\Profiles";
-    
-    if (std::filesystem::exists(profilesDir)) {
-        for (const auto& entry : std::filesystem::directory_iterator(profilesDir)) {
-            if (entry.path().extension() == ".txt") {
-                profiles.push_back(entry.path().filename().string());
-            }
-        }
-    }
-
-    bool done = false;
-    while (!done) {
-        MSG msg;
-        while (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
-            TranslateMessage(&msg); DispatchMessage(&msg);
-            if (msg.message == WM_QUIT) done = true;
-        }
-        if (done) break;
-
-        ImGui_ImplDX11_NewFrame();
-        ImGui_ImplWin32_NewFrame();
-        ImGui::NewFrame();
-
-        ImGui::SetNextWindowPos(ImVec2(0, 0));
-        ImGui::SetNextWindowSize(io.DisplaySize);
-        ImGui::Begin("Main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize);
-
-        ImGui::TextColored(ImVec4(0.85f, 0.50f, 0.10f, 1.0f), "WoW 3.3.5 Bot - CS2 Edition");
-        ImGui::Separator();
-        ImGui::Spacing();
-
-        ImGui::Text("Select Profile:");
-        if (ImGui::BeginCombo("##profilecombo", profiles.empty() ? "No profiles found" : profiles[selectedProfile].c_str())) {
-            for (int i = 0; i < profiles.size(); i++) {
-                bool is_selected = (selectedProfile == i);
-                if (ImGui::Selectable(profiles[i].c_str(), is_selected)) selectedProfile = i;
-                if (is_selected) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
-        }
-
-        ImGui::Spacing(); ImGui::Spacing();
-
-        if (ImGui::Button("INJECT BOT", ImVec2(-1, 40))) {
-            if (profiles.empty()) {
-                strcpy(logBuffer, "[-] Error: No profiles found in /Profiles folder!\n");
-            } else {
-                // 1. Создаем общую папку для связи с DLL
-                CreateDirectoryA("C:\\WoWBot", NULL);
-                
-                // 2. Сохраняем путь к профилю
-                std::string fullPath = profilesDir + "\\" + profiles[selectedProfile];
-                std::ofstream settingsFile("C:\\WoWBot\\settings.ini");
-                settingsFile << fullPath;
-                settingsFile.close();
-
-                // 3. Инжектим bot_payload.dll
-                DWORD procId = GetProcessId("Wow.exe");
-                if (!procId) {
-                    strcpy(logBuffer, "[-] Error: Wow.exe not found! Open the game first.\n");
+        } 
+        else {
+            if (targetDynFlags & 1) { 
+                if (dist > 4.5f && !isLooting) {
+                    ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
                 } else {
-                    std::string dllPath = std::string(currentDir) + "\\bot_payload.dll";
-                    ManualMapInject(procId, dllPath.c_str(), logBuffer);
+                    if (!isLooting) {
+                        uint64_t ctmGuid = g_BotTarget;
+                        float ctmPos[3] = { tX, tY, tZ };
+                        ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, CTM_LOOT, &ctmGuid, ctmPos, 0.5f);
+                        isLooting = true;
+                        lootTimer = GetTickCount();
+                    }
+
+                    static DWORD lastLoot = 0;
+                    if (GetTickCount() - lastLoot > 300) {
+                        *(uint64_t*)ADDR_MOUSEOVER_GUID = g_BotTarget;
+                        ExecuteLua("InteractUnit('mouseover'); if LootFrame:IsVisible() then for i=1, GetNumLootItems() do LootSlot(i) end end");
+                        lastLoot = GetTickCount();
+                    }
+
+                    if (GetTickCount() - lootTimer > 3000) {
+                        g_Blacklist.push_back(g_BotTarget);
+                        
+                        if (!g_Profile.empty() && g_CurrentTaskIndex < g_Profile.size()) {
+                            if (g_Profile[g_CurrentTaskIndex].type == TASK_GRIND) {
+                                g_Profile[g_CurrentTaskIndex].killsDone++;
+                                printf("\n[GRIND] Kill %d / %d\n", g_Profile[g_CurrentTaskIndex].killsDone, g_Profile[g_CurrentTaskIndex].count);
+                                if (g_Profile[g_CurrentTaskIndex].killsDone >= g_Profile[g_CurrentTaskIndex].count) {
+                                    g_CurrentTaskIndex++;
+                                    printf("[TASK] Grind complete! Moving to next task.\n");
+                                }
+                            }
+                        }
+
+                        g_BotTarget = 0; 
+                        isLooting = false;
+                        ExecuteLua("ClearTarget(); CloseLoot();"); 
+                    }
+                }
+            } else {
+                if (isLooting) {
+                    g_Blacklist.push_back(g_BotTarget);
+                    g_BotTarget = 0; 
+                    isLooting = false;
+                    ExecuteLua("ClearTarget(); CloseLoot();"); 
+                } else {
+                    if (deathTime == 0) deathTime = GetTickCount();
+                    if (GetTickCount() - deathTime > 1500) {
+                        g_Blacklist.push_back(g_BotTarget);
+                        g_BotTarget = 0; 
+                        deathTime = 0;
+                        ExecuteLua("ClearTarget();"); 
+                    }
                 }
             }
         }
+        return; 
+    } 
+    
+    // ==========================================
+    // НОВАЯ ЛОГИКА ПОИСКА ЦЕЛЕЙ (ФИКС ЛОШАДИ)
+    // ==========================================
+    uint64_t bestGuid = 0;
+    float bestDist = 25.0f; 
 
-        ImGui::Spacing();
-        ImGui::Text("Status Log:");
-        ImGui::InputTextMultiline("##log", logBuffer, sizeof(logBuffer), ImVec2(-1, -1), ImGuiInputTextFlags_ReadOnly);
+    bool isGrindTask = (!g_Profile.empty() && g_CurrentTaskIndex < g_Profile.size() && g_Profile[g_CurrentTaskIndex].type == TASK_GRIND);
+    int targetNpcId = isGrindTask ? g_Profile[g_CurrentTaskIndex].npcId : 0;
 
-        ImGui::End();
+    cur = *(uintptr_t*)(mgr + 0xAC);
+    while (cur && (cur & 1) == 0) {
+        int type = *(int*)(cur + 0x14);
+        if (type == 3) { // Если это NPC/Моб
+            uint64_t guid = *(uint64_t*)(cur + 0x30);
+            if (std::find(g_Blacklist.begin(), g_Blacklist.end(), guid) == g_Blacklist.end()) {
+                uintptr_t desc = *(uintptr_t*)(cur + 0x8);
+                if (desc) {
+                    int hp = *(int*)(desc + 0x60); 
+                    uint32_t mobDynFlags = *(uint32_t*)(desc + 0x13C);
+                    int entryId = *(int*)(desc + 0xC); // ЧИТАЕМ ID МОБА ИЗ ПАМЯТИ!
 
-        ImGui::Render();
-        const float clear_color_with_alpha[4] = { 0.1f, 0.1f, 0.1f, 1.0f };
-        g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
-        g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color_with_alpha);
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        g_pSwapChain->Present(1, 0);
+                    bool isTapped = (mobDynFlags & 0x4) != 0;       
+
+                    // Атакуем ТОЛЬКО если у нас задача GRIND и ID моба совпадает с нужным!
+                    if (isGrindTask && entryId == targetNpcId && hp > 0 && !isTapped) {
+                        float mX = *(float*)(cur + 0x798);
+                        float mY = *(float*)(cur + 0x79C);
+                        float mZ = *(float*)(cur + 0x7A0);
+                        float dist = GetDistance3D(myX, myY, myZ, mX, mY, mZ);
+                        
+                        if (dist < bestDist && dist > 0.1f) {
+                            bestDist = dist;
+                            bestGuid = guid;
+                        }
+                    }
+                }
+            }
+        }
+        cur = *(uintptr_t*)(cur + 0x3C);
     }
 
-    ImGui_ImplDX11_Shutdown();
-    ImGui_ImplWin32_Shutdown();
-    ImGui::DestroyContext();
-    CleanupDeviceD3D();
-    DestroyWindow(hwnd);
-    UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    if (bestGuid) {
+        g_BotTarget = bestGuid; 
+        ProgrammaticTarget(g_BotTarget);
+        return;
+    }
+
+    if (g_Profile.empty() || g_CurrentTaskIndex >= g_Profile.size()) {
+        printf("[IDLE] Profile finished or not loaded. Waiting...      \r");
+        return;
+    }
+
+    BotTask& task = g_Profile[g_CurrentTaskIndex];
+    static DWORD taskTimer = 0; 
+
+    if (task.type == TASK_GOTO) {
+        float distToWaypoint = GetDistance3D(myX, myY, myZ, task.x, task.y, task.z);
+        if (distToWaypoint < 2.0f) {
+            printf("\n[TASK] Reached waypoint %d!\n", g_CurrentTaskIndex);
+            g_CurrentTaskIndex++; 
+        } else {
+            ActionCTM(pLocal, CTM_MOVE, 0, task.x, task.y, task.z);
+            printf("[TASK] Moving to Waypoint %d... Dist: %.1f      \r", g_CurrentTaskIndex, distToWaypoint);
+        }
+    }
+    else if (task.type == TASK_ACCEPT_QUEST) {
+        if (taskTimer == 0) {
+            printf("\n[TASK] Accepting Quest %d from NPC %d...\n", task.questId, task.npcId);
+            taskTimer = GetTickCount();
+        }
+        if (GetTickCount() - taskTimer > 2000) {
+            g_CurrentTaskIndex++;
+            taskTimer = 0;
+        }
+    }
+    else if (task.type == TASK_TURN_IN_QUEST) {
+        if (taskTimer == 0) {
+            printf("\n[TASK] Turning in Quest %d to NPC %d...\n", task.questId, task.npcId);
+            taskTimer = GetTickCount();
+        }
+        if (GetTickCount() - taskTimer > 2000) {
+            g_CurrentTaskIndex++;
+            taskTimer = 0;
+        }
+    }
+    else if (task.type == TASK_GRIND) {
+        printf("[TASK] Grinding mode active. Looking for mob ID %d... (%d/%d)      \r", task.npcId, task.killsDone, task.count);
+    }
+    else if (task.type == TASK_LOAD_PROFILE) {
+        printf("\n[SYSTEM] Loading next profile: %s\n", task.nextProfile);
+        
+        // Формируем полный путь к новому профилю (ищем в той же папке, где лежал старый)
+        std::string currentPath = GetProfilePathFromGUI();
+        size_t lastSlash = currentPath.find_last_of("\\/");
+        if (lastSlash != std::string::npos) {
+            std::string newPath = currentPath.substr(0, lastSlash + 1) + task.nextProfile;
+            LoadProfile(newPath);
+        }
+    }
+}
+
+void SafeBotPulse() {
+    __try { BotPulse(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+DWORD WINAPI EjectThread(LPVOID) {
+    SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)oWndProc); 
+    KillTimer(g_WoWHwnd, 1337);
+    Sleep(100);
+    FreeConsole();
+    FreeLibraryAndExitThread(g_hModule, 0); 
     return 0;
+}
+
+LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (uMsg == WM_TIMER && wParam == 1337) {
+        if (GetAsyncKeyState(VK_END) & 0x8000) {
+            g_Active = false;
+            CreateThread(0, 0, EjectThread, 0, 0, 0);
+            return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
+        }
+
+        static bool f9Pressed = false;
+        if (GetAsyncKeyState(VK_F9) & 0x8000) {
+            if (!f9Pressed) {
+                f9Pressed = true;
+                uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
+                uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
+                if (mgr) {
+                    uint64_t localGuid = *(uint64_t*)(mgr + 0xC0);
+                    uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
+                    while (cur && (cur & 1) == 0) {
+                        if (*(uint64_t*)(cur + 0x30) == localGuid) {
+                            float x = *(float*)(cur + 0x798);
+                            float y = *(float*)(cur + 0x79C);
+                            float z = *(float*)(cur + 0x7A0);
+                            
+                            CreateDirectoryA("C:\\WoWBot", NULL);
+                            std::ofstream outfile("C:\\WoWBot\\RecordedProfile.txt", std::ios_base::app);
+                            outfile << "GOTO " << x << " " << y << " " << z << "\n";
+                            outfile.close();
+                            
+                            Beep(1000, 100);
+                            printf("\n[+] Waypoint Saved: %.2f %.2f %.2f\n", x, y, z);
+                            break;
+                        }
+                        cur = *(uintptr_t*)(cur + 0x3C);
+                    }
+                }
+            }
+        } else {
+            f9Pressed = false;
+        }
+
+        static bool isPressed = false;
+        if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
+            if (!isPressed) {
+                isPressed = true;
+                g_Active = !g_Active;
+                Beep(g_Active ? 800 : 400, 100);
+                printf("\n\n[!] BOT STATUS: %s\n", g_Active ? "ACTIVE" : "PAUSED");
+                
+                if (g_Active) {
+                    std::string profileToLoad = GetProfilePathFromGUI();
+                    if (!profileToLoad.empty()) {
+                        LoadProfile(profileToLoad);
+                    } else {
+                        printf("[-] No profile selected in GUI!\n");
+                    }
+                } else { 
+                    g_BotTarget = 0; 
+                    ExecuteLua("ClearTarget(); CloseLoot();");
+                    g_Blacklist.clear(); 
+                }
+            }
+        } else {
+            isPressed = false;
+        }
+
+        static DWORD lastTick = 0;
+        static bool isPulsing = false; 
+        if (g_Active && !isPulsing && (GetTickCount() - lastTick > 150)) {
+            isPulsing = true;
+            SafeBotPulse(); 
+            lastTick = GetTickCount();
+            isPulsing = false;
+        }
+    }
+    return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
+}
+
+DWORD WINAPI Setup(LPVOID) {
+    AllocConsole(); 
+    freopen("CONOUT$", "w", stdout);
+    printf("--- Bot Core Loaded ---\n");
+    g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
+    if (!g_WoWHwnd) return 0;
+    oWndProc = (WNDPROC)SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)HookedWndProc);
+    SetTimer(g_WoWHwnd, 1337, 50, NULL); 
+    return 0;
+}
+
+extern "C" BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
+    if (r == DLL_PROCESS_ATTACH) {
+        g_hModule = h; 
+        DisableThreadLibraryCalls(h);
+        CreateThread(0, 0, Setup, 0, 0, 0);
+    }
+    return TRUE;
 }
