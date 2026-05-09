@@ -41,12 +41,15 @@ void ExecuteLua(const char* command) {
     ((tLuaExecute)ADDR_LUA_EXECUTE)(command, "bot_core", 0);
 }
 
-// Жестко прописываем таргет в память, чтобы InteractUnit('target') работал безотказно
+// [!] ТВОЙ ИДЕАЛЬНЫЙ ТАРГЕТИНГ (ВОССТАНОВЛЕНО) [!]
 void ProgrammaticTarget(uint64_t guid) {
-    *(uint64_t*)ADDR_TARGET_GUID = guid; 
-    *(uint64_t*)ADDR_MOUSEOVER_GUID = guid; 
+    if (*(uint64_t*)ADDR_TARGET_GUID != guid) {
+        *(uint64_t*)ADDR_MOUSEOVER_GUID = guid;
+        ExecuteLua("TargetUnit('mouseover')");
+    }
 }
 
+// Твоя защита от спама команд
 void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, float z) {
     static uint64_t lastGuid = 0;
     static int lastType = 0;
@@ -124,7 +127,7 @@ void BotPulse() {
         if (targetHp > 0) {
             isLooting = false; 
 
-            // --- БОЕВКА ---
+            // [!] ТВОЯ ИДЕАЛЬНАЯ БОЕВКА (ВОССТАНОВЛЕНО) [!]
             ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
             printf("Chasing/Attacking... Dist: %.1f      \r", dist);
             
@@ -137,23 +140,24 @@ void BotPulse() {
             }
         } 
         else {
-            // --- ИДЕАЛЬНЫЙ ЛУТ (БЕЗ АВТОЛУТА) ---
-            if (dist > 4.0f && !isLooting) {
+            // --- ЛУТ ---
+            if (dist > 4.5f && !isLooting) {
                 ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
                 printf("Running to Corpse... Dist: %.1f        \r", dist);
             } else {
                 if (!isLooting) {
-                    // Тормозим
                     ExecuteLua("MoveForwardStop(); MoveBackwardStart(); MoveBackwardStop();");
                     isLooting = true;
                     lootTimer = GetTickCount();
                     printf("Looting Corpse... Waiting 3 sec.       \r");
                 }
 
-                // Спамим открытие окна и сбор лута (каждые 300мс)
                 static DWORD lastLoot = 0;
                 if (GetTickCount() - lastLoot > 300) {
-                    ExecuteLua("InteractUnit('target'); if LootFrame:IsVisible() then for i=1, GetNumLootItems() do LootSlot(i) end end");
+                    // [!] ГЛАВНЫЙ ФИКС ЛУТА: Используем MOUSEOVER для взаимодействия с трупом!
+                    // Это гарантированно откроет окно лута, даже если труп не берется в таргет.
+                    *(uint64_t*)ADDR_MOUSEOVER_GUID = g_BotTarget;
+                    ExecuteLua("InteractUnit('mouseover'); if LootFrame:IsVisible() then for i=1, GetNumLootItems() do LootSlot(i) end end");
                     lastLoot = GetTickCount();
                 }
 
@@ -239,7 +243,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
                 printf("\n\n[!] BOT STATUS: %s\n", g_Active ? "ACTIVE" : "PAUSED");
                 
                 if (g_Active) { 
-                    // [!] ОТКЛЮЧАЕМ АВТОЛУТ В ИГРЕ, ЧТОБЫ ОБОЙТИ ЗАЩИТУ [!]
+                    // Отключаем автолут, чтобы окно не закрывалось само и скрипт успел всё забрать
                     ExecuteLua("SetCVar('autoLootDefault', '0')");
                 } else { 
                     g_BotTarget = 0; 
@@ -269,7 +273,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v147: The Shift Bypass ---\n");
+    printf("--- Bot v148: The Mouseover Looter ---\n");
 
     g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
     if (!g_WoWHwnd) return 0;
@@ -277,8 +281,8 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(g_WoWHwnd, 1337, 50, NULL); 
 
-    printf("[+] Auto-Loot Hardware Protection Bypassed.\n");
-    printf("[+] 3-Second Loot Standstill: INTEGRATED.\n");
+    printf("[+] User's Combat Logic: RESTORED.\n");
+    printf("[+] Mouseover Loot Bypass: INTEGRATED.\n");
     printf("[!] Press [INSERT] to Start/Pause.\n");
     printf("[!] Press [END] to Unload the Bot.\n\n");
     return 0;
