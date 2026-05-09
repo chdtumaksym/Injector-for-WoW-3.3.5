@@ -15,9 +15,8 @@
 #define ADDR_MOUSEOVER_GUID     0x00BD07A0 
 #define ADDR_LUA_EXECUTE        0x00819210 
 
-// Боевые типы Click-To-Move
 #define CTM_MOVE                4 
-#define CTM_LOOT                6  // Нативный сбор лута
+#define CTM_LOOT                6  
 #define CTM_ATTACK              11 
 
 #pragma runtime_checks("", off)
@@ -29,6 +28,9 @@ typedef void(__cdecl* tLuaExecute)(const char* code, const char* fileName, int s
 
 bool g_Active = false;
 WNDPROC oWndProc = nullptr;
+HWND g_WoWHwnd = NULL;
+HINSTANCE g_hModule = NULL; 
+
 std::vector<uint64_t> g_Blacklist; 
 uint64_t g_BotTarget = 0; 
 
@@ -90,7 +92,6 @@ void BotPulse() {
 
     bool hasTarget = false;
     int targetHp = 0;
-    uint32_t targetFlags = 0;
     float tX = 0, tY = 0, tZ = 0;
 
     if (g_BotTarget != 0) {
@@ -102,7 +103,6 @@ void BotPulse() {
                     uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                     if (desc) {
                         targetHp = *(int*)(desc + 0x60); 
-                        targetFlags = *(uint32_t*)(desc + 0x114);
                         tX = *(float*)(cur + 0x798);
                         tY = *(float*)(cur + 0x79C);
                         tZ = *(float*)(cur + 0x7A0);
@@ -113,10 +113,10 @@ void BotPulse() {
             }
             cur = *(uintptr_t*)(cur + 0x3C);
         }
+        // Если труп исчез (залутали) - сбрасываем таргет мгновенно
         if (!hasTarget) g_BotTarget = 0; 
     }
 
-    // [!] ПАТЧ GPT: Добавляем таймер смерти для ожидания сервера
     static DWORD deathTime = 0;
 
     if (hasTarget) {
@@ -124,11 +124,11 @@ void BotPulse() {
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
 
         if (targetHp > 0) {
-            deathTime = 0; // Сбрасываем таймер, пока моб жив
+            deathTime = 0; // Сбрасываем таймер смерти
 
-            // Твоя рабочая логика боя
+            // Твоя идеальная боевка
             ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
-            printf("Chasing Target... Dist: %.1f      \r", dist);
+            printf("Chasing/Attacking... Dist: %.1f      \r", dist);
             
             if (dist < 5.0f) {
                 static DWORD lastAtk = 0;
@@ -142,45 +142,32 @@ void BotPulse() {
             // Моб мертв. Запускаем таймер.
             if (deathTime == 0) deathTime = GetTickCount();
 
-            if (targetFlags & 1) {
-                // Сервер подтвердил: ЛУТ ЕСТЬ!
-                if (dist > 4.5f) {
-                    ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
-                    printf("Running to Corpse... Dist: %.1f        \r", dist);
-                } else {
-                    static DWORD lastLoot = 0;
-                    if (GetTickCount() - lastLoot > 1000) {
-                        // 1. Шлем команду движку нагнуться к трупу
-                        uint64_t ctmGuid = g_BotTarget;
-                        float ctmPos[3] = { tX, tY, tZ };
-                        ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, CTM_LOOT, &ctmGuid, ctmPos, 0.5f);
+            if (dist > 4.5f) {
+                ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
+                printf("Running to Corpse... Dist: %.1f        \r", dist);
+            } else {
+                static DWORD lastLoot = 0;
+                if (GetTickCount() - lastLoot > 1000) {
+                    // 1. Шлем команду движку нагнуться к трупу
+                    uint64_t ctmGuid = g_BotTarget;
+                    float ctmPos[3] = { tX, tY, tZ };
+                    ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, CTM_LOOT, &ctmGuid, ctmPos, 0.5f);
 
-                        // 2. ПАТЧ GPT: Проверяем окно и собираем лут через Lua
-                        ExecuteLua("if LootFrame:IsShown() then for i=1, GetNumLootItems() do LootSlot(i) end end");
-                        
-                        lastLoot = GetTickCount();
-                        printf("Looting Corpse... Dist: %.1f           \r", dist);
-                    }
+                    // 2. Пылесосим лут через Lua (работает безотказно)
+                    ExecuteLua("for i=1, GetNumLootItems() do LootSlot(i) end");
+                    
+                    lastLoot = GetTickCount();
+                    printf("Looting Corpse...                      \r");
                 }
+            }
 
-                // ПАТЧ GPT: Failsafe по времени (если застряли на луте больше 6 секунд)
-                if (GetTickCount() - deathTime > 6000) {
-                    g_Blacklist.push_back(g_BotTarget);
-                    g_BotTarget = 0; 
-                    ExecuteLua("ClearTarget()"); 
-                    printf("\n[!] Loot Timeout. Blacklisted.\n");
-                }
-            } 
-            else {
-                // Флага лута нет. Ждем 1.5 секунды ответа от сервера.
-                if (GetTickCount() - deathTime > 1500) {
-                    g_Blacklist.push_back(g_BotTarget);
-                    g_BotTarget = 0; 
-                    ExecuteLua("ClearTarget()"); 
-                    printf("Target Empty. Blacklisted.             \n");
-                } else {
-                    printf("Waiting for server loot flag...        \r");
-                }
+            // [!] ТАЙМАУТ 5 СЕКУНД [!]
+            // Если за 5 секунд труп не исчез (нет лута или полные сумки) - бросаем его
+            if (GetTickCount() - deathTime > 5000) {
+                g_Blacklist.push_back(g_BotTarget);
+                g_BotTarget = 0; 
+                ExecuteLua("ClearTarget()"); 
+                printf("\n[!] Corpse empty or looted. Moving on.\n");
             }
         }
     } 
@@ -227,9 +214,29 @@ void BotPulse() {
     }
 }
 
+// ==========================================
+// --- ПОТОК ВЫГРУЗКИ (КНОПКА END) ---
+// ==========================================
+DWORD WINAPI EjectThread(LPVOID) {
+    SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)oWndProc); 
+    KillTimer(g_WoWHwnd, 1337);
+    Sleep(100);
+    FreeConsole();
+    FreeLibraryAndExitThread(g_hModule, 0); 
+    return 0;
+}
+
 LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     if (uMsg == WM_TIMER && wParam == 1337) {
         
+        // [!] КНОПКА ВЫГРУЗКИ ЧИТА (END) [!]
+        if (GetAsyncKeyState(VK_END) & 0x8000) {
+            g_Active = false;
+            printf("\n[!] EJECTING BOT... You can close this console.\n");
+            CreateThread(0, 0, EjectThread, 0, 0, 0);
+            return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
+        }
+
         static bool isPressed = false;
         if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
             if (!isPressed) {
@@ -239,7 +246,6 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
                 printf("\n[!] BOT STATUS: %s                                \n", g_Active ? "ACTIVE" : "PAUSED");
                 
                 if (g_Active) {
-                    // Принудительно включаем Авто-лут в настройках игры
                     ExecuteLua("SetCVar('autoLootDefault', '1')");
                 } else { 
                     g_BotTarget = 0; 
@@ -269,23 +275,25 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v138: GPT Loot Patch ---\n");
+    printf("--- Bot v139: The Foolproof Looter ---\n");
 
-    HWND hwnd = FindWindowA(NULL, "World of Warcraft");
-    if (!hwnd) return 0;
+    g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
+    if (!g_WoWHwnd) return 0;
 
-    oWndProc = (WNDPROC)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)HookedWndProc);
-    SetTimer(hwnd, 1337, 50, NULL); 
+    oWndProc = (WNDPROC)SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)HookedWndProc);
+    SetTimer(g_WoWHwnd, 1337, 50, NULL); 
 
     printf("[+] User's Combat Logic: INTEGRATED.\n");
-    printf("[+] GPT Server Delay Fix: INTEGRATED.\n");
-    printf("[+] GPT Lua LootSlot Fix: INTEGRATED.\n");
-    printf("[!] Focus WoW window and press [INSERT] to start.\n");
+    printf("[+] Flagless Looting (5s Timeout): INTEGRATED.\n");
+    printf("[+] Safe Eject (END Key): INTEGRATED.\n");
+    printf("[!] Press [INSERT] to Start/Pause.\n");
+    printf("[!] Press [END] to Unload the Bot.\n");
     return 0;
 }
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
     if (r == DLL_PROCESS_ATTACH) {
+        g_hModule = h; 
         DisableThreadLibraryCalls(h);
         CreateThread(0, 0, Setup, 0, 0, 0);
     }
