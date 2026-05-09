@@ -16,7 +16,6 @@
 #define ADDR_LUA_EXECUTE        0x00819210 
 
 #define CTM_MOVE                4 
-#define CTM_ATTACK              11 
 
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
@@ -27,11 +26,13 @@ typedef void(__cdecl* tLuaExecute)(const char* code, const char* fileName, int s
 
 bool g_Active = false;
 WNDPROC oWndProc = nullptr;
-HWND g_WoWHwnd = NULL; // Глобальный хэндл окна для отправки нажатий клавиш
+HWND g_WoWHwnd = NULL;
+HINSTANCE g_hModule = NULL; // Для выгрузки DLL
 
 std::vector<uint64_t> g_Blacklist; 
 uint64_t g_BotTarget = 0; 
-DWORD g_DeathTime = 0; // Таймер ожидания ответа от сервера
+DWORD g_DeathTime = 0; 
+DWORD g_LootPause = 0; // Пауза для сбора лута
 
 float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) {
     return sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2) + pow(z2 - z1, 2));
@@ -58,16 +59,17 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
     if (guid != lastGuid || type != lastType || diff > 1.5f) {
         uint64_t ctmGuid = guid;
         float ctmPos[3] = { x, y, z };
-        
         ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, type, &ctmGuid, ctmPos, 0.5f);
         
-        lastGuid = guid;
-        lastType = type;
+        lastGuid = guid; lastType = type;
         lastX = x; lastY = y; lastZ = z;
     }
 }
 
 void BotPulse() {
+    // Если мы лутаем - блокируем логику, чтобы не прервать сбор вещей!
+    if (GetTickCount() < g_LootPause) return;
+
     uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
     uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
     if (!mgr) return;
@@ -117,17 +119,26 @@ void BotPulse() {
         if (!hasTarget) g_BotTarget = 0; 
     }
 
+    static bool inMelee = false;
+
     if (hasTarget) {
         ProgrammaticTarget(g_BotTarget);
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
 
         if (targetHp > 0) {
-            g_DeathTime = 0; // Сбрасываем таймер смерти
+            g_DeathTime = 0; 
 
-            ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
-            printf("Chasing Target... Dist: %.1f      \r", dist);
-            
-            if (dist < 5.0f) {
+            if (dist > 4.5f) {
+                ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
+                inMelee = false;
+                printf("Chasing Target... Dist: %.1f      \r", dist);
+            } else {
+                if (!inMelee) {
+                    // [!] ГАШЕНИЕ ИНЕРЦИИ: Бьем по тормозам, чтобы не пробежать сквозь моба!
+                    ExecuteLua("MoveForwardStop(); MoveBackwardStart(); MoveBackwardStop();");
+                    inMelee = true;
+                }
+                
                 static DWORD lastAtk = 0;
                 if (GetTickCount() - lastAtk > 1500) {
                     ExecuteLua("InteractUnit('mouseover'); StartAttack();");
@@ -136,32 +147,30 @@ void BotPulse() {
             }
         } 
         else {
-            // Моб мертв. Запускаем таймер ожидания лута от сервера.
             if (g_DeathTime == 0) g_DeathTime = GetTickCount();
 
             if (targetFlags & 1) { 
-                // Сервер подтвердил: ЛУТ ЕСТЬ!
                 if (dist > 4.5f) {
                     ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
+                    inMelee = false;
                     printf("Moving to Loot... Dist: %.1f        \r", dist);
                 } else {
-                    static DWORD lastLoot = 0;
-                    if (GetTickCount() - lastLoot > 1500) {
-                        // [!] АППАРАТНЫЙ ОБХОД ЗАЩИТЫ ЛУТА [!]
-                        // Посылаем окну игры нажатие клавиши F8 (Interact with Target)
-                        // Это легально открывает окно лута и собирает вещи!
-                        PostMessage(g_WoWHwnd, WM_KEYDOWN, VK_F8, (0x42 << 16) | 1);
-                        PostMessage(g_WoWHwnd, WM_KEYUP, VK_F8, (1 << 31) | (1 << 30) | (0x42 << 16) | 1);
-                        
-                        lastLoot = GetTickCount();
-                        printf("Looting Corpse (Hardware Key)...    \r");
+                    if (!inMelee) {
+                        ExecuteLua("MoveForwardStop(); MoveBackwardStart(); MoveBackwardStop();");
+                        inMelee = true;
                     }
+
+                    // [!] АППАРАТНЫЙ ЛУТ + ПАУЗА [!]
+                    SendMessage(g_WoWHwnd, WM_KEYDOWN, VK_F8, 0);
+                    SendMessage(g_WoWHwnd, WM_KEYUP, VK_F8, 0);
+                    
+                    // Замораживаем бота на 2 секунды, чтобы он успел забрать вещи и не убежал!
+                    g_LootPause = GetTickCount() + 2000; 
+                    printf("Looting Corpse! Pausing for 2s...   \n");
                 }
             } 
             else {
-                // Флага лута нет. Ждем 1.5 секунды, вдруг сервер лагает.
                 if (GetTickCount() - g_DeathTime > 1500) {
-                    // Прошло 1.5 сек, лута точно нет. Бросаем труп.
                     g_Blacklist.push_back(g_BotTarget);
                     g_BotTarget = 0; 
                     ExecuteLua("ClearTarget()"); 
@@ -215,9 +224,27 @@ void BotPulse() {
     }
 }
 
+// Поток для безопасной выгрузки DLL
+DWORD WINAPI EjectThread(LPVOID) {
+    SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)oWndProc); // Возвращаем оригинальный обработчик окну
+    KillTimer(g_WoWHwnd, 1337);
+    Sleep(100);
+    FreeConsole();
+    FreeLibraryAndExitThread(g_hModule, 0); // Выгружаем DLL из памяти
+    return 0;
+}
+
 LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     if (uMsg == WM_TIMER && wParam == 1337) {
         
+        // [!] КНОПКА ВЫГРУЗКИ ЧИТА (END) [!]
+        if (GetAsyncKeyState(VK_END) & 0x8000) {
+            g_Active = false;
+            printf("\n[!] EJECTING BOT... You can close this console.\n");
+            CreateThread(0, 0, EjectThread, 0, 0, 0);
+            return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
+        }
+
         static bool isPressed = false;
         if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
             if (!isPressed) {
@@ -227,9 +254,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
                 printf("\n[!] BOT STATUS: %s                                \n", g_Active ? "ACTIVE" : "PAUSED");
                 
                 if (g_Active) {
-                    // При включении биндим F8 на "Взаимодействие с целью" и включаем Автолут
-                    ExecuteLua("SetBinding('F8', 'INTERACTTARGET')");
-                    ExecuteLua("SetCVar('autoLootDefault', '1')");
+                    ExecuteLua("SetBinding('F8', 'INTERACTTARGET'); SaveBindings(1); SetCVar('autoLootDefault', '1');");
                 } else { 
                     g_BotTarget = 0; 
                     ExecuteLua("ClearTarget()");
@@ -258,7 +283,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v134: Hardware Loot Bypass ---\n");
+    printf("--- Bot v135: The Masterpiece ---\n");
 
     g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
     if (!g_WoWHwnd) return 0;
@@ -266,14 +291,17 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(g_WoWHwnd, 1337, 50, NULL); 
 
-    printf("[+] Server Loot Delay Fix (1.5s): INTEGRATED.\n");
-    printf("[+] Hardware Keypress Emulator (F8): INTEGRATED.\n");
-    printf("[!] Focus WoW window and press [INSERT] to start.\n");
+    printf("[+] Momentum Kill (Anti-Overshoot): INTEGRATED.\n");
+    printf("[+] Loot Pause (Anti-Interrupt): INTEGRATED.\n");
+    printf("[+] Safe Eject (END Key): INTEGRATED.\n");
+    printf("[!] Press [INSERT] to Start/Pause.\n");
+    printf("[!] Press [END] to Unload the Bot.\n");
     return 0;
 }
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
     if (r == DLL_PROCESS_ATTACH) {
+        g_hModule = h; // Сохраняем хэндл для выгрузки
         DisableThreadLibraryCalls(h);
         CreateThread(0, 0, Setup, 0, 0, 0);
     }
