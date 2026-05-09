@@ -116,13 +116,13 @@ void BotPulse() {
     if (!pLocalDesc) return;
     
     int myHp = *(int*)(pLocalDesc + 0x60);
-    int myMaxHp = *(int*)(pLocalDesc + 0x70);
+    // [!] ИСПРАВЛЕНО: 0x80 - это Макс ХП. (0x70 была Мана!)
+    int myMaxHp = *(int*)(pLocalDesc + 0x80); 
     float myHpPercent = ((float)myHp / (float)myMaxHp) * 100.0f;
     
     uint32_t myFlags = *(uint32_t*)(pLocalDesc + 0x114);
     bool inCombat = (myFlags & 0x80000) != 0; 
     
-    // Читаем нашу фракцию, чтобы отличать своих от чужих
     int myFaction = *(int*)(pLocalDesc + 0x8C);
 
     // --- 1. СИСТЕМА ВЫЖИВАНИЯ ---
@@ -133,7 +133,7 @@ void BotPulse() {
                 printf("[SURVIVAL] HP %.1f%%! Casting Holy Light...\n", myHpPercent);
             }
         }
-        return; 
+        return; // Блокируем поиск мобов, пока не вылечимся
     }
 
     bool hasTarget = false;
@@ -228,7 +228,7 @@ void BotPulse() {
         }
     } 
     else {
-        // --- 4. УМНЫЙ РАДАР (СВОЙ/ЧУЖОЙ) ---
+        // --- 4. УМНЫЙ РАДАР ---
         uint64_t bestGuid = 0;
         float bestDist = 40.0f; 
 
@@ -244,17 +244,14 @@ void BotPulse() {
                         int hp = *(int*)(desc + 0x60); 
                         int maxHp = *(int*)(desc + 0x80); 
                         
-                        // Читаем флаги моба
                         int mobFaction = *(int*)(desc + 0x8C);
-                        uint32_t mobFlags = *(uint32_t*)(desc + 0xD4);
                         uint32_t mobDynFlags = *(uint32_t*)(desc + 0x114);
+                        uint32_t mobFlags = *(uint32_t*)(desc + 0xD4);
 
-                        // [!] ФИЛЬТРЫ ЦЕЛИ [!]
-                        bool isSameFaction = (myFaction == mobFaction); // Свои (стража, вендоры)
-                        bool isTapped = (mobDynFlags & 0x4) != 0;       // Чужой моб (серый, бьет другой игрок)
-                        bool isUnattackable = (mobFlags & 0x8) != 0;    // Нельзя атаковать (мирный NPC)
+                        bool isSameFaction = (myFaction == mobFaction); 
+                        bool isTapped = (mobDynFlags & 0x4) != 0;       
+                        bool isUnattackable = (mobFlags & 0x8) != 0;    
 
-                        // Берем только живых, чужих, свободных и атакуемых мобов!
                         if (hp > 0 && maxHp > 1 && !isSameFaction && !isTapped && !isUnattackable) {
                             float mX = *(float*)(cur + 0x798);
                             float mY = *(float*)(cur + 0x79C);
@@ -338,7 +335,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v154: The Smart Radar ---\n");
+    printf("--- Bot v155: The Healthy Paladin ---\n");
 
     g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
     if (!g_WoWHwnd) return 0;
@@ -346,9 +343,9 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(g_WoWHwnd, 1337, 50, NULL); 
 
-    printf("[+] Faction Filter (Friend/Foe): INTEGRATED.\n");
-    printf("[+] Kill-Steal Prevention (Tapped Mobs): INTEGRATED.\n");
-    printf("[+] Unattackable NPC Filter: INTEGRATED.\n");
+    printf("[+] HP Offset Fixed (0x80).\n");
+    printf("[+] Paladin Brain (Heal, Buffs, Judgement): INTEGRATED.\n");
+    printf("[!] Action Bar Setup: 1=Heal, 2=Aura, 3=Seal, 4=Might, 5=Judgement\n");
     printf("[!] Press [INSERT] to Start/Pause.\n");
     printf("[!] Press [END] to Unload the Bot.\n\n");
     return 0;
