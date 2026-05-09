@@ -13,13 +13,17 @@ jobs:
         with:
           arch: x86
 
+      - name: Download ImGui
+        run: |
+          git clone --depth 1 -b docking https://github.com/ocornut/imgui.git imgui_src
+
       - name: Compile Injector and Payload
         run: |
-          # Компилируем инжектор (EXE)
-          cl.exe /O2 /EHsc injector.cpp /link /OUT:injector.exe user32.lib advapi32.lib shell32.lib
-          
           # Компилируем бота (DLL)
           cl.exe /O2 /LD /EHsc payload.cpp /link /OUT:bot_payload.dll user32.lib
+          
+          # Компилируем инжектор (EXE) с ImGui и DirectX 11
+          cl.exe /O2 /EHsc injector.cpp imgui_src/imgui.cpp imgui_src/imgui_draw.cpp imgui_src/imgui_tables.cpp imgui_src/imgui_widgets.cpp imgui_src/backends/imgui_impl_win32.cpp imgui_src/backends/imgui_impl_dx11.cpp /I imgui_src /I imgui_src/backends /link /OUT:injector.exe d3d11.lib d3dcompiler.lib user32.lib advapi32.lib shell32.lib
 
       - name: Upload Finished Bot
         uses: actions/upload-artifact@v4
@@ -28,3 +32,4 @@ jobs:
           path: |
             injector.exe
             bot_payload.dll
+            Profiles/
