@@ -92,6 +92,7 @@ void BotPulse() {
 
     bool hasTarget = false;
     int targetHp = 0;
+    uint32_t targetFlags = 0;
     float tX = 0, tY = 0, tZ = 0;
 
     if (g_BotTarget != 0) {
@@ -103,6 +104,7 @@ void BotPulse() {
                     uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                     if (desc) {
                         targetHp = *(int*)(desc + 0x60); 
+                        targetFlags = *(uint32_t*)(desc + 0x114); // [!] ВЕРНУЛИ ЧТЕНИЕ ФЛАГОВ
                         tX = *(float*)(cur + 0x798);
                         tY = *(float*)(cur + 0x79C);
                         tZ = *(float*)(cur + 0x7A0);
@@ -117,13 +119,15 @@ void BotPulse() {
     }
 
     static DWORD deathTime = 0;
+    static bool ctmLootTriggered = false;
 
     if (hasTarget) {
         ProgrammaticTarget(g_BotTarget);
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
 
         if (targetHp > 0) {
-            deathTime = 0; // Сбрасываем таймер смерти
+            deathTime = 0; 
+            ctmLootTriggered = false;
 
             ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
             printf("Chasing/Attacking... Dist: %.1f      \r", dist);
@@ -137,40 +141,48 @@ void BotPulse() {
             }
         } 
         else {
-            // [!] ИДЕАЛЬНАЯ СТЕЙТ-МАШИНА ЛУТА [!]
-            static bool ctmLootTriggered = false;
             if (deathTime == 0) {
                 deathTime = GetTickCount();
-                ctmLootTriggered = false; 
+                ctmLootTriggered = false;
             }
 
-            if (dist > 4.5f) {
-                ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
-                printf("Running to Corpse... Dist: %.1f        \r", dist);
-            } else {
-                // Отправляем приказ на лут СТРОГО ОДИН РАЗ
-                if (!ctmLootTriggered) {
-                    uint64_t ctmGuid = g_BotTarget;
-                    float ctmPos[3] = { tX, tY, tZ };
-                    ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, CTM_LOOT, &ctmGuid, ctmPos, 0.5f);
-                    ctmLootTriggered = true;
+            // [!] ИДЕАЛЬНАЯ ЛОГИКА ЛУТА С УЧЕТОМ AUTO LOOT [!]
+            if (targetFlags & 1) { 
+                // Флаг есть - бежим и лутаем
+                if (dist > 4.5f) {
+                    ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
+                    printf("Running to Corpse... Dist: %.1f        \r", dist);
+                } else {
+                    if (!ctmLootTriggered) {
+                        uint64_t ctmGuid = g_BotTarget;
+                        float ctmPos[3] = { tX, tY, tZ };
+                        ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, CTM_LOOT, &ctmGuid, ctmPos, 0.5f);
+                        ctmLootTriggered = true;
+                        printf("Looting Corpse (CTM Sent)...           \r");
+                    }
                 }
-
-                // Спамим проверку UI каждые 250мс
-                static DWORD lastLoot = 0;
-                if (GetTickCount() - lastLoot > 250) {
-                    ExecuteLua("if LootFrame:IsVisible() then for i=1, GetNumLootItems() do LootSlot(i) end end");
-                    lastLoot = GetTickCount();
-                    printf("Looting Corpse...                      \r");
+            } 
+            else {
+                // Флага нет. 
+                // Если мы уже отправляли команду на лут (ctmLootTriggered == true), 
+                // значит клиент успешно всё собрал и сервер снял флаг! Мгновенно идем дальше.
+                // ИЛИ если прошло 1.5 сек, а флаг так и не появился - труп изначально был пуст.
+                if (ctmLootTriggered || (GetTickCount() - deathTime > 1500)) {
+                    g_Blacklist.push_back(g_BotTarget);
+                    g_BotTarget = 0; 
+                    ExecuteLua("ClearTarget()"); 
+                    printf("Target Empty/Looted. Moving on.        \n");
+                } else {
+                    printf("Waiting for server loot flag...        \r");
                 }
             }
 
-            // Таймаут 5 секунд
+            // Failsafe: Если застряли на трупе на 5 сек (например, сумки полные)
             if (GetTickCount() - deathTime > 5000) {
                 g_Blacklist.push_back(g_BotTarget);
                 g_BotTarget = 0; 
-                ExecuteLua("ClearTarget(); CloseLoot()"); // Закрываем окно, чтобы не забагать UI
-                printf("\n[!] Corpse empty or looted. Moving on.\n");
+                ExecuteLua("ClearTarget()"); 
+                printf("\n[!] Loot Timeout (Bags full?). Blacklisted.\n");
             }
         }
     } 
@@ -249,7 +261,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
                 
                 if (!g_Active) { 
                     g_BotTarget = 0; 
-                    ExecuteLua("ClearTarget(); CloseLoot()");
+                    ExecuteLua("ClearTarget()");
                     g_Blacklist.clear(); 
                 }
             }
@@ -275,7 +287,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v140: The GPT State-Machine Edition ---\n");
+    printf("--- Bot v141: The GPT State-Machine ---\n");
 
     g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
     if (!g_WoWHwnd) return 0;
