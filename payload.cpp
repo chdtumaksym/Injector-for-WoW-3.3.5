@@ -74,12 +74,10 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
     }
 }
 
-// [!] ИДЕАЛЬНАЯ ЭМУЛЯЦИЯ КЛАВИАТУРЫ ДЛЯ ФОНОВОГО РЕЖИМА [!]
 bool TryCast(int vkKey, DWORD& lastCastTime, DWORD cooldown, DWORD castTime = 1500) {
     if (GetTickCount() < g_GCD) return false; 
     if (GetTickCount() - lastCastTime < cooldown) return false; 
 
-    // Генерируем правильные аппаратные скан-коды, чтобы WoW 100% увидел нажатие в фоне
     UINT scanCode = MapVirtualKey(vkKey, MAPVK_VK_TO_VSC);
     LPARAM lParamDown = (scanCode << 16) | 1;
     LPARAM lParamUp = (scanCode << 16) | (1 << 30) | (1 << 31) | 1;
@@ -123,6 +121,9 @@ void BotPulse() {
     
     uint32_t myFlags = *(uint32_t*)(pLocalDesc + 0x114);
     bool inCombat = (myFlags & 0x80000) != 0; 
+    
+    // Читаем нашу фракцию, чтобы отличать своих от чужих
+    int myFaction = *(int*)(pLocalDesc + 0x8C);
 
     // --- 1. СИСТЕМА ВЫЖИВАНИЯ ---
     if (myHpPercent < 40.0f) {
@@ -227,6 +228,7 @@ void BotPulse() {
         }
     } 
     else {
+        // --- 4. УМНЫЙ РАДАР (СВОЙ/ЧУЖОЙ) ---
         uint64_t bestGuid = 0;
         float bestDist = 40.0f; 
 
@@ -242,7 +244,18 @@ void BotPulse() {
                         int hp = *(int*)(desc + 0x60); 
                         int maxHp = *(int*)(desc + 0x80); 
                         
-                        if (hp > 0 && maxHp > 1) {
+                        // Читаем флаги моба
+                        int mobFaction = *(int*)(desc + 0x8C);
+                        uint32_t mobFlags = *(uint32_t*)(desc + 0xD4);
+                        uint32_t mobDynFlags = *(uint32_t*)(desc + 0x114);
+
+                        // [!] ФИЛЬТРЫ ЦЕЛИ [!]
+                        bool isSameFaction = (myFaction == mobFaction); // Свои (стража, вендоры)
+                        bool isTapped = (mobDynFlags & 0x4) != 0;       // Чужой моб (серый, бьет другой игрок)
+                        bool isUnattackable = (mobFlags & 0x8) != 0;    // Нельзя атаковать (мирный NPC)
+
+                        // Берем только живых, чужих, свободных и атакуемых мобов!
+                        if (hp > 0 && maxHp > 1 && !isSameFaction && !isTapped && !isUnattackable) {
                             float mX = *(float*)(cur + 0x798);
                             float mY = *(float*)(cur + 0x79C);
                             float mZ = *(float*)(cur + 0x7A0);
@@ -262,7 +275,7 @@ void BotPulse() {
         if (bestGuid) {
             g_BotTarget = bestGuid; 
             ProgrammaticTarget(g_BotTarget);
-            printf("\nFound new target! Dist: %.1f        \n", bestDist);
+            printf("\nFound new HOSTILE target! Dist: %.1f        \n", bestDist);
         } else {
             if (GetTickCount() > g_GCD) g_GCD = 0;
             printf("Scanning for enemies...             \r");
@@ -325,7 +338,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v153: The VM Farm Edition ---\n");
+    printf("--- Bot v154: The Smart Radar ---\n");
 
     g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
     if (!g_WoWHwnd) return 0;
@@ -333,11 +346,11 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(g_WoWHwnd, 1337, 50, NULL); 
 
-    printf("[+] Hardware Scan-Codes (Background Cast): INTEGRATED.\n");
-    printf("[+] Paladin Brain (Heal, Buffs, Judgement): INTEGRATED.\n");
-    printf("[!] Action Bar Setup: 1=Heal, 2=Aura, 3=Seal, 4=Might, 5=Judgement\n");
+    printf("[+] Faction Filter (Friend/Foe): INTEGRATED.\n");
+    printf("[+] Kill-Steal Prevention (Tapped Mobs): INTEGRATED.\n");
+    printf("[+] Unattackable NPC Filter: INTEGRATED.\n");
     printf("[!] Press [INSERT] to Start/Pause.\n");
-    printf("[!] Press[END] to Unload the Bot.\n\n");
+    printf("[!] Press [END] to Unload the Bot.\n\n");
     return 0;
 }
 
