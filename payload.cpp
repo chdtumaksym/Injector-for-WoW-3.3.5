@@ -15,7 +15,7 @@
 #define ADDR_MOUSEOVER_GUID     0x00BD07A0 
 #define ADDR_LUA_EXECUTE        0x00819210 
 
-// Возвращаем правильные боевые типы!
+#define CTM_MOVE                4 
 #define CTM_LOOT                6  
 #define CTM_ATTACK              11 
 
@@ -49,6 +49,26 @@ void ProgrammaticTarget(uint64_t guid) {
     }
 }
 
+// Твоя идеальная функция движения (Anti-Dance)
+void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, float z) {
+    static uint64_t lastGuid = 0;
+    static int lastType = 0;
+    static float lastX = 0, lastY = 0, lastZ = 0;
+
+    float diff = sqrt(pow(x - lastX, 2) + pow(y - lastY, 2) + pow(z - lastZ, 2));
+
+    if (guid != lastGuid || type != lastType || diff > 1.5f) {
+        uint64_t ctmGuid = guid;
+        float ctmPos[3] = { x, y, z };
+        
+        ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, type, &ctmGuid, ctmPos, 0.5f);
+        
+        lastGuid = guid;
+        lastType = type;
+        lastX = x; lastY = y; lastZ = z;
+    }
+}
+
 void BotPulse() {
     uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
     uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
@@ -73,7 +93,6 @@ void BotPulse() {
 
     bool hasTarget = false;
     int targetHp = 0;
-    uint32_t targetFlags = 0;
     float tX = 0, tY = 0, tZ = 0;
 
     if (g_BotTarget != 0) {
@@ -85,7 +104,6 @@ void BotPulse() {
                     uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                     if (desc) {
                         targetHp = *(int*)(desc + 0x60); 
-                        targetFlags = *(uint32_t*)(desc + 0x114);
                         tX = *(float*)(cur + 0x798);
                         tY = *(float*)(cur + 0x79C);
                         tZ = *(float*)(cur + 0x7A0);
@@ -99,25 +117,21 @@ void BotPulse() {
         if (!hasTarget) g_BotTarget = 0; 
     }
 
-    static DWORD stateTimer = 0;
-    static bool hasAttemptedLoot = false;
+    static DWORD deathTime = 0;
+    static DWORD reachTime = 0;
 
     if (hasTarget) {
         ProgrammaticTarget(g_BotTarget);
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
 
         if (targetHp > 0) {
-            //[СОСТОЯНИЕ: БОЙ] - ВЕРНУЛИ ТВОЮ РАБОЧУЮ ЛОГИКУ!
-            hasAttemptedLoot = false;
-            
-            static DWORD lastChase = 0;
-            if (GetTickCount() - lastChase > 1500) {
-                uint64_t ctmGuid = g_BotTarget;
-                float ctmPos[3] = { tX, tY, tZ };
-                ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, CTM_ATTACK, &ctmGuid, ctmPos, 0.5f);
-                lastChase = GetTickCount();
-            }
+            deathTime = 0; 
+            reachTime = 0;
 
+            // --- ТВОЯ ИДЕАЛЬНАЯ БОЕВКА ---
+            ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
+            printf("Chasing/Attacking... Dist: %.1f      \r", dist);
+            
             if (dist < 5.0f) {
                 static DWORD lastAtk = 0;
                 if (GetTickCount() - lastAtk > 1500) {
@@ -125,75 +139,53 @@ void BotPulse() {
                     lastAtk = GetTickCount();
                 }
             }
-            
-            printf("\r[COMBAT] Dist: %-5.1f | HP: %-5d | Flags: %-3u       ", dist, targetHp, targetFlags);
         } 
         else {
-            // [СОСТОЯНИЕ: МЕРТВ]
-            if (targetFlags & 1) { 
-                // Флаг лута ЕСТЬ
-                if (!hasAttemptedLoot) {
-                    hasAttemptedLoot = true;
-                    stateTimer = GetTickCount();
-                    
-                    // Посылаем команду CTM_LOOT (6) СТРОГО ОДИН РАЗ
+            // --- НОВАЯ ЛОГИКА ЛУТА (БЕЗ ФЛАГОВ) ---
+            if (deathTime == 0) deathTime = GetTickCount();
+
+            if (dist > 4.5f) {
+                ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
+                printf("Running to Corpse... Dist: %.1f        \r", dist);
+            } else {
+                // Мы добежали до трупа! Запускаем таймер стояния на месте.
+                if (reachTime == 0) reachTime = GetTickCount();
+
+                static DWORD lastLoot = 0;
+                if (GetTickCount() - lastLoot > 1000) {
+                    // 1. Нативный клик по трупу
                     uint64_t ctmGuid = g_BotTarget;
                     float ctmPos[3] = { tX, tY, tZ };
                     ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, CTM_LOOT, &ctmGuid, ctmPos, 0.5f);
-                }
-                
-                DWORD waitTime = GetTickCount() - stateTimer;
-                printf("\r[LOOTING] Dist: %-5.1f | Wait: %-4d ms | Flags: %-3u ", dist, waitTime, targetFlags);
 
-                // Страховка: пылесосим лут через Lua, если окно открылось
-                static DWORD lastLuaLoot = 0;
-                if (GetTickCount() - lastLuaLoot > 500) {
+                    // 2. Lua пылесос
                     ExecuteLua("if LootFrame:IsVisible() then for i=1, GetNumLootItems() do LootSlot(i) end end");
-                    lastLuaLoot = GetTickCount();
-                }
-
-                // Если за 5 секунд флаг не пропал - забагалось (сумки полные)
-                if (waitTime > 5000) {
-                    printf("\n[!] Loot Timeout (Bags full?). Blacklisting.\n");
-                    g_Blacklist.push_back(g_BotTarget);
-                    g_BotTarget = 0; 
-                    ExecuteLua("ClearTarget(); CloseLoot();"); 
-                }
-            } 
-            else {
-                // Флага лута НЕТ
-                if (hasAttemptedLoot) {
-                    // Если мы уже пытались лутать, и флаг пропал -> МЫ УСПЕШНО СОБРАЛИ ЛУТ!
-                    printf("\n[+] Loot Successful! Moving on.\n");
-                    g_Blacklist.push_back(g_BotTarget);
-                    g_BotTarget = 0; 
-                    ExecuteLua("ClearTarget(); CloseLoot();"); 
-                } 
-                else {
-                    // Мы еще не лутали. Ждем, пока сервер пришлет флаг (до 1.5 сек)
-                    static DWORD waitFlagTimer = 0;
-                    static uint64_t waitGuid = 0;
                     
-                    if (waitGuid != g_BotTarget) {
-                        waitGuid = g_BotTarget;
-                        waitFlagTimer = GetTickCount();
-                    }
-
-                    DWORD waitTime = GetTickCount() - waitFlagTimer;
-                    printf("\r[WAIT_FLAG] Dist: %-5.1f | Wait: %-4d ms | Flags: %-3u ", dist, waitTime, targetFlags);
-
-                    if (waitTime > 1500) {
-                        printf("\n[-] No loot on this corpse. Blacklisting.\n");
-                        g_Blacklist.push_back(g_BotTarget);
-                        g_BotTarget = 0; 
-                        ExecuteLua("ClearTarget()"); 
-                    }
+                    lastLoot = GetTickCount();
+                    printf("Looting Corpse...                      \r");
                 }
+
+                // Ждем ровно 2 секунды на трупе, чтобы всё 100% собралось
+                if (GetTickCount() - reachTime > 2000) {
+                    g_Blacklist.push_back(g_BotTarget);
+                    g_BotTarget = 0; 
+                    reachTime = 0;
+                    ExecuteLua("ClearTarget(); CloseLoot();"); 
+                    printf("\n[+] Corpse processed. Moving on.\n");
+                }
+            }
+
+            // Глобальный таймаут (если застрял в текстурах и не может добежать)
+            if (GetTickCount() - deathTime > 8000) {
+                g_Blacklist.push_back(g_BotTarget);
+                g_BotTarget = 0; 
+                reachTime = 0;
+                ExecuteLua("ClearTarget(); CloseLoot();"); 
+                printf("\n[!] Corpse unreachable. Blacklisted.\n");
             }
         }
     } 
     else {
-        //[СОСТОЯНИЕ: ПОИСК]
         uint64_t bestGuid = 0;
         float bestDist = 40.0f; 
 
@@ -229,9 +221,9 @@ void BotPulse() {
         if (bestGuid) {
             g_BotTarget = bestGuid; 
             ProgrammaticTarget(g_BotTarget);
-            printf("\n[+] Found new target! Dist: %.1f\n", bestDist);
+            printf("\nFound new target! Dist: %.1f        \n", bestDist);
         } else {
-            printf("\r[SCANNING] Looking for enemies...                      ");
+            printf("Scanning for enemies...             \r");
         }
     }
 }
@@ -279,7 +271,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
         static DWORD lastTick = 0;
         static bool isPulsing = false; 
 
-        if (g_Active && !isPulsing && (GetTickCount() - lastTick > 200)) { 
+        if (g_Active && !isPulsing && (GetTickCount() - lastTick > 400)) {
             isPulsing = true;
             __try {
                 BotPulse();
@@ -294,7 +286,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v143: The Perfect Hybrid ---\n");
+    printf("--- Bot v144: The Flagless Looter ---\n");
 
     g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
     if (!g_WoWHwnd) return 0;
@@ -302,8 +294,9 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(g_WoWHwnd, 1337, 50, NULL); 
 
-    printf("[+] Combat Engine: RESTORED (CTM_ATTACK + StartAttack).\n");
-    printf("[+] Loot State-Machine: ACTIVE.\n");
+    printf("[+] User's Combat Logic: RESTORED.\n");
+    printf("[+] Flagless Looting (2s Wait): INTEGRATED.\n");
+    printf("[+] Safe Eject (END Key): INTEGRATED.\n");
     printf("[!] Press [INSERT] to Start/Pause.\n");
     printf("[!] Press [END] to Unload the Bot.\n\n");
     return 0;
