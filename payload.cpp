@@ -4,6 +4,9 @@
 #include <iostream>
 #include <vector>
 #include <algorithm>
+#include <fstream>
+#include <sstream>
+#include <string>
 
 // ==========================================
 // --- АДРЕСА ПАМЯТИ WoW 3.3.5a (12340) ---
@@ -33,15 +36,62 @@ HINSTANCE g_hModule = NULL;
 
 std::vector<uint64_t> g_Blacklist; 
 uint64_t g_BotTarget = 0; 
-
-// --- ТАЙМЕРЫ ПАЛАДИНА ---
 DWORD g_GCD = 0; 
-DWORD g_LastHeal = 0;
-DWORD g_LastDevotion = 0;
-DWORD g_LastSeal = 0;
-DWORD g_LastBlessing = 0;
-DWORD g_LastJudgement = 0;
 
+// ==========================================
+// --- СИСТЕМА ПРОФИЛЕЙ (ВНЕШНИЕ ФАЙЛЫ) ---
+// ==========================================
+enum TaskType { TASK_GOTO, TASK_ACCEPT_QUEST, TASK_TURN_IN_QUEST, TASK_GRIND };
+
+struct BotTask {
+    TaskType type;
+    float x, y, z;
+    int npcId;
+    int questId;
+    int count;
+};
+
+std::vector<BotTask> g_Profile;
+int g_CurrentTaskIndex = 0;
+std::string g_CurrentProfileName = "";
+
+void LoadProfile(const std::string& filename) {
+    g_Profile.clear();
+    g_CurrentTaskIndex = 0;
+    g_CurrentProfileName = filename;
+    
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        printf("[-] ERROR: Could not open profile %s\n", filename.c_str());
+        return;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '/') continue; 
+
+        std::istringstream iss(line);
+        std::string command;
+        iss >> command;
+
+        BotTask task = {};
+        if (command == "GOTO") {
+            task.type = TASK_GOTO;
+            iss >> task.x >> task.y >> task.z;
+            g_Profile.push_back(task);
+        } 
+        else if (command == "GRIND") {
+            task.type = TASK_GRIND;
+            iss >> task.count;
+            g_Profile.push_back(task);
+        }
+    }
+    printf("[+] Profile '%s' loaded! Total tasks: %d\n", filename.c_str(), g_Profile.size());
+}
+
+// ==========================================
+// --- БАЗОВЫЕ ФУНКЦИИ ---
+// ==========================================
 float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) {
     return sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2) + pow(z2 - z1, 2));
 }
@@ -74,22 +124,9 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
     }
 }
 
-bool TryCast(int vkKey, DWORD& lastCastTime, DWORD cooldown, DWORD castTime = 1500) {
-    if (GetTickCount() < g_GCD) return false; 
-    if (GetTickCount() - lastCastTime < cooldown) return false; 
-
-    UINT scanCode = MapVirtualKey(vkKey, MAPVK_VK_TO_VSC);
-    LPARAM lParamDown = (scanCode << 16) | 1;
-    LPARAM lParamUp = (scanCode << 16) | (1 << 30) | (1 << 31) | 1;
-
-    PostMessage(g_WoWHwnd, WM_KEYDOWN, vkKey, lParamDown);
-    PostMessage(g_WoWHwnd, WM_KEYUP, vkKey, lParamUp);
-
-    lastCastTime = GetTickCount();
-    g_GCD = GetTickCount() + castTime; 
-    return true;
-}
-
+// ==========================================
+// --- ЯДРО БОТА ---
+// ==========================================
 void BotPulse() {
     uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
     uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
@@ -117,23 +154,32 @@ void BotPulse() {
     
     int myHp = *(int*)(pLocalDesc + 0x60);
     int myMaxHp = *(int*)(pLocalDesc + 0x80); 
-    if (myMaxHp <= 0) myMaxHp = 1; // [!] ЗАЩИТА ОТ ДЕЛЕНИЯ НА НОЛЬ (Фикс ложного хила)
+    if (myMaxHp <= 0) myMaxHp = 1; 
     float myHpPercent = ((float)myHp / (float)myMaxHp) * 100.0f;
     
     uint32_t myFlags = *(uint32_t*)(pLocalDesc + 0xEC); 
     bool inCombat = (myFlags & 0x80000) != 0; 
-    
-    // [!] ИСТИННЫЙ АДРЕС ФРАКЦИИ
     int myFaction = *(int*)(pLocalDesc + 0xDC);
+    
+    // [!] ЧИТАЕМ УРОВЕНЬ ПЕРСОНАЖА [!]
+    int myLevel = *(int*)(pLocalDesc + 0xD8);
+    static int lastLevel = 0;
 
-    // --- 1. СИСТЕМА ВЫЖИВАНИЯ ---
-    if (myHpPercent < 40.0f) {
-        if (GetTickCount() >= g_GCD) {
-            ExecuteLua("MoveForwardStop(); MoveBackwardStop();"); 
-            if (TryCast('1', g_LastHeal, 0, 3000)) { 
-                printf("[SURVIVAL] HP %.1f%%! Casting Holy Light...\n", myHpPercent);
-            }
+    // --- АВТО-СМЕНА ПРОФИЛЕЙ ПО УРОВНЮ ---
+    if (myLevel != lastLevel) {
+        if (lastLevel != 0) printf("\n[LEVEL UP] Congratulations! You are now level %d!\n", myLevel);
+        lastLevel = myLevel;
+
+        if (myLevel >= 6 && g_CurrentProfileName != "C:\\Elwynn_6_10.txt") {
+            printf("[SYSTEM] Level 6 reached. Leaving Northshire...\n");
+            LoadProfile("C:\\Elwynn_6_10.txt");
         }
+    }
+
+    // --- 1. ВЫЖИВАНИЕ ---
+    if (myHpPercent < 40.0f) {
+        ExecuteLua("MoveForwardStop(); MoveBackwardStop();"); 
+        printf("[SURVIVAL] HP %.1f%%! Pausing tasks to heal...\n", myHpPercent);
         return; 
     }
 
@@ -151,7 +197,7 @@ void BotPulse() {
                     uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                     if (desc) {
                         targetHp = *(int*)(desc + 0x60); 
-                        targetDynFlags = *(uint32_t*)(desc + 0x13C); // [!] ИСТИННЫЙ АДРЕС ДИНАМИЧЕСКИХ ФЛАГОВ
+                        targetDynFlags = *(uint32_t*)(desc + 0x13C); 
                         tX = *(float*)(cur + 0x798);
                         tY = *(float*)(cur + 0x79C);
                         tZ = *(float*)(cur + 0x7A0);
@@ -165,18 +211,13 @@ void BotPulse() {
         if (!hasTarget) g_BotTarget = 0; 
     }
 
-    // --- 2. СИСТЕМА БАФОВ ---
-    if (!inCombat && !hasTarget) {
-        if (TryCast('2', g_LastDevotion, 3600000)) { printf("[BUFF] Casting Devotion Aura\n"); return; }
-        if (TryCast('3', g_LastSeal, 1680000)) { printf("[BUFF] Casting Seal of Righteousness\n"); return; }
-        if (TryCast('4', g_LastBlessing, 540000)) { printf("[BUFF] Casting Blessing of Might\n"); return; }
-    }
-
     static bool isLooting = false;
     static DWORD lootTimer = 0;
     static DWORD deathTime = 0;
 
-    // --- 3. БОЙ И ЛУТ ---
+    // ==========================================
+    // РЕЖИМ БОЯ (ПРИОРИТЕТ)
+    // ==========================================
     if (hasTarget) {
         ProgrammaticTarget(g_BotTarget);
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
@@ -186,7 +227,7 @@ void BotPulse() {
             deathTime = 0;
 
             ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
-            printf("Chasing/Attacking... Dist: %.1f      \r", dist);
+            printf("[COMBAT] Attacking... Dist: %.1f      \r", dist);
             
             if (dist < 5.0f) {
                 static DWORD lastAtk = 0;
@@ -194,27 +235,20 @@ void BotPulse() {
                     ExecuteLua("InteractUnit('mouseover'); StartAttack();");
                     lastAtk = GetTickCount();
                 }
-
-                if (TryCast('5', g_LastJudgement, 10500)) {
-                    printf("\n[COMBAT] Casting Judgement!\n");
-                }
             }
         } 
         else {
-            // [!] УМНЫЙ ЛУТ ВОЗВРАЩАЕТСЯ[!]
-            if (targetDynFlags & 1) { // Флаг лута ЕСТЬ
+            if (targetDynFlags & 1) { 
                 if (dist > 4.5f && !isLooting) {
                     ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
-                    printf("Running to Corpse... Dist: %.1f        \r", dist);
+                    printf("[LOOT] Running to Corpse... Dist: %.1f        \r", dist);
                 } else {
                     if (!isLooting) {
                         uint64_t ctmGuid = g_BotTarget;
                         float ctmPos[3] = { tX, tY, tZ };
                         ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, CTM_LOOT, &ctmGuid, ctmPos, 0.5f);
-                        
                         isLooting = true;
                         lootTimer = GetTickCount();
-                        printf("Looting Corpse... Waiting 3 sec.       \r");
                     }
 
                     static DWORD lastLoot = 0;
@@ -229,88 +263,105 @@ void BotPulse() {
                         g_BotTarget = 0; 
                         isLooting = false;
                         ExecuteLua("ClearTarget(); CloseLoot();"); 
-                        printf("\n[+] Corpse processed. Moving on.\n");
+                        printf("\n[+] Corpse processed.\n");
                     }
                 }
             } else {
-                // Флага лута НЕТ
                 if (isLooting) {
-                    // Мы лутали, и флаг пропал -> Успешно собрали!
                     g_Blacklist.push_back(g_BotTarget);
                     g_BotTarget = 0; 
                     isLooting = false;
                     ExecuteLua("ClearTarget(); CloseLoot();"); 
-                    printf("\n[+] Loot collected successfully!\n");
                 } else {
-                    // Ждем 1.5 сек ответа от сервера
                     if (deathTime == 0) deathTime = GetTickCount();
                     if (GetTickCount() - deathTime > 1500) {
                         g_Blacklist.push_back(g_BotTarget);
                         g_BotTarget = 0; 
                         deathTime = 0;
                         ExecuteLua("ClearTarget();"); 
-                        printf("\n[-] Corpse empty. Moving on.\n");
-                    } else {
-                        printf("Waiting for server loot flag...        \r");
                     }
                 }
             }
         }
+        return; // Пока есть таргет - задачи профиля стоят на паузе!
     } 
-    else {
-        // --- 4. УМНЫЙ РАДАР ---
-        uint64_t bestGuid = 0;
-        float bestDist = 40.0f; 
 
-        cur = *(uintptr_t*)(mgr + 0xAC);
-        while (cur && (cur & 1) == 0) {
-            int type = *(int*)(cur + 0x14);
-            if (type == 3) { 
-                uint64_t guid = *(uint64_t*)(cur + 0x30);
-                
-                if (std::find(g_Blacklist.begin(), g_Blacklist.end(), guid) == g_Blacklist.end()) {
-                    uintptr_t desc = *(uintptr_t*)(cur + 0x8);
-                    if (desc) {
-                        int hp = *(int*)(desc + 0x60); 
-                        int maxHp = *(int*)(desc + 0x80); 
+    // ==========================================
+    // РЕЖИМ ЗАДАЧ (НАВИГАЦИЯ)
+    // ==========================================
+    
+    // 1. Радар (Ищем врагов вокруг)
+    uint64_t bestGuid = 0;
+    float bestDist = 25.0f; 
+
+    cur = *(uintptr_t*)(mgr + 0xAC);
+    while (cur && (cur & 1) == 0) {
+        int type = *(int*)(cur + 0x14);
+        if (type == 3) { 
+            uint64_t guid = *(uint64_t*)(cur + 0x30);
+            if (std::find(g_Blacklist.begin(), g_Blacklist.end(), guid) == g_Blacklist.end()) {
+                uintptr_t desc = *(uintptr_t*)(cur + 0x8);
+                if (desc) {
+                    int hp = *(int*)(desc + 0x60); 
+                    int maxHp = *(int*)(desc + 0x80); 
+                    int mobFaction = *(int*)(desc + 0xDC);
+                    uint32_t mobFlags = *(uint32_t*)(desc + 0xEC);
+                    uint32_t mobDynFlags = *(uint32_t*)(desc + 0x13C);
+
+                    bool isSameFaction = (myFaction == mobFaction); 
+                    bool isTapped = (mobDynFlags & 0x4) != 0;       
+                    bool isUnattackable = (mobFlags & 0x102) != 0; 
+
+                    if (hp > 0 && maxHp > 1 && !isSameFaction && !isTapped && !isUnattackable) {
+                        float mX = *(float*)(cur + 0x798);
+                        float mY = *(float*)(cur + 0x79C);
+                        float mZ = *(float*)(cur + 0x7A0);
+                        float dist = GetDistance3D(myX, myY, myZ, mX, mY, mZ);
                         
-                        // [!] ИСТИННЫЕ АДРЕСА ФРАКЦИИ И ФЛАГОВ
-                        int mobFaction = *(int*)(desc + 0xDC);
-                        uint32_t mobFlags = *(uint32_t*)(desc + 0xEC);
-                        uint32_t mobDynFlags = *(uint32_t*)(desc + 0x13C);
-
-                        bool isSameFaction = (myFaction == mobFaction); 
-                        bool isTapped = (mobDynFlags & 0x4) != 0;       
-                        bool isUnattackable = (mobFlags & 0x102) != 0; 
-
-                        if (hp > 0 && maxHp > 1 && !isSameFaction && !isTapped && !isUnattackable) {
-                            float mX = *(float*)(cur + 0x798);
-                            float mY = *(float*)(cur + 0x79C);
-                            float mZ = *(float*)(cur + 0x7A0);
-                            float dist = GetDistance3D(myX, myY, myZ, mX, mY, mZ);
-                            
-                            if (dist < bestDist && dist > 0.1f) {
-                                bestDist = dist;
-                                bestGuid = guid;
-                            }
+                        if (dist < bestDist && dist > 0.1f) {
+                            bestDist = dist;
+                            bestGuid = guid;
                         }
                     }
                 }
             }
-            cur = *(uintptr_t*)(cur + 0x3C);
         }
+        cur = *(uintptr_t*)(cur + 0x3C);
+    }
 
-        if (bestGuid) {
-            g_BotTarget = bestGuid; 
-            ProgrammaticTarget(g_BotTarget);
-            printf("\nFound new HOSTILE target! Dist: %.1f        \n", bestDist);
+    if (bestGuid) {
+        g_BotTarget = bestGuid; 
+        ProgrammaticTarget(g_BotTarget);
+        printf("\n[!] Enemy detected! Interrupting task to fight.\n");
+        return;
+    }
+
+    // 2. Выполняем текущую задачу из профиля
+    if (g_Profile.empty() || g_CurrentTaskIndex >= g_Profile.size()) {
+        printf("[IDLE] Profile finished or not loaded. Waiting...      \r");
+        return;
+    }
+
+    BotTask& task = g_Profile[g_CurrentTaskIndex];
+
+    if (task.type == TASK_GOTO) {
+        float distToWaypoint = GetDistance3D(myX, myY, myZ, task.x, task.y, task.z);
+        if (distToWaypoint < 2.0f) {
+            printf("\n[TASK] Reached waypoint %d!\n", g_CurrentTaskIndex);
+            g_CurrentTaskIndex++; 
         } else {
-            if (GetTickCount() > g_GCD) g_GCD = 0;
-            printf("Scanning for enemies...             \r");
+            ActionCTM(pLocal, CTM_MOVE, 0, task.x, task.y, task.z);
+            printf("[TASK] Moving to Waypoint %d... Dist: %.1f      \r", g_CurrentTaskIndex, distToWaypoint);
         }
+    }
+    else if (task.type == TASK_GRIND) {
+        printf("[TASK] Grinding mode active. Looking for mobs...      \r");
     }
 }
 
+// ==========================================
+// --- ПОТОК ВЫГРУЗКИ И КЛАВИАТУРЫ ---
+// ==========================================
 DWORD WINAPI EjectThread(LPVOID) {
     SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)oWndProc); 
     KillTimer(g_WoWHwnd, 1337);
@@ -330,6 +381,40 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
             return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
         }
 
+        // [!] РЕКОРДЕР МАРШРУТОВ (КНОПКА F9) [!]
+        static bool f9Pressed = false;
+        if (GetAsyncKeyState(VK_F9) & 0x8000) {
+            if (!f9Pressed) {
+                f9Pressed = true;
+                
+                uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
+                uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
+                if (mgr) {
+                    uint64_t localGuid = *(uint64_t*)(mgr + 0xC0);
+                    uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
+                    while (cur && (cur & 1) == 0) {
+                        if (*(uint64_t*)(cur + 0x30) == localGuid) {
+                            float x = *(float*)(cur + 0x798);
+                            float y = *(float*)(cur + 0x79C);
+                            float z = *(float*)(cur + 0x7A0);
+                            
+                            std::ofstream outfile;
+                            outfile.open("C:\\RecordedProfile.txt", std::ios_base::app);
+                            outfile << "GOTO " << x << " " << y << " " << z << "\n";
+                            outfile.close();
+                            
+                            Beep(1000, 100);
+                            printf("\n[+] Waypoint Saved: %.2f %.2f %.2f\n", x, y, z);
+                            break;
+                        }
+                        cur = *(uintptr_t*)(cur + 0x3C);
+                    }
+                }
+            }
+        } else {
+            f9Pressed = false;
+        }
+
         static bool isPressed = false;
         if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
             if (!isPressed) {
@@ -338,7 +423,10 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
                 Beep(g_Active ? 800 : 400, 100);
                 printf("\n\n[!] BOT STATUS: %s\n", g_Active ? "ACTIVE" : "PAUSED");
                 
-                if (!g_Active) { 
+                if (g_Active) {
+                    // При старте загружаем начальный профиль
+                    LoadProfile("C:\\Northshire_1_6.txt");
+                } else { 
                     g_BotTarget = 0; 
                     ExecuteLua("ClearTarget(); CloseLoot();");
                     g_Blacklist.clear(); 
@@ -366,7 +454,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v157: The True Radar ---\n");
+    printf("--- Bot v160: The Leveling Framework ---\n");
 
     g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
     if (!g_WoWHwnd) return 0;
@@ -374,9 +462,10 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(g_WoWHwnd, 1337, 50, NULL); 
 
-    printf("[+] Faction Offset Fixed (0xDC).\n");
-    printf("[+] Dynamic Flags Offset Fixed (0x13C).\n");
-    printf("[+] Smart Loot Logic Restored.\n");
+    printf("[+] External Profile Engine: INTEGRATED.\n");
+    printf("[+] Auto-Level Profile Switcher: INTEGRATED.\n");
+    printf("[+] Waypoint Recorder (F9): INTEGRATED.\n");
+    printf("[!] Press [F9] in-game to save your current position to C:\\RecordedProfile.txt\n");
     printf("[!] Press [INSERT] to Start/Pause.\n");
     printf("[!] Press [END] to Unload the Bot.\n\n");
     return 0;
