@@ -116,14 +116,14 @@ void BotPulse() {
     if (!pLocalDesc) return;
     
     int myHp = *(int*)(pLocalDesc + 0x60);
-    // [!] ИСПРАВЛЕНО: 0x80 - это Макс ХП. (0x70 была Мана!)
     int myMaxHp = *(int*)(pLocalDesc + 0x80); 
     float myHpPercent = ((float)myHp / (float)myMaxHp) * 100.0f;
     
     uint32_t myFlags = *(uint32_t*)(pLocalDesc + 0x114);
     bool inCombat = (myFlags & 0x80000) != 0; 
     
-    int myFaction = *(int*)(pLocalDesc + 0x8C);
+    // [!] ИСПРАВЛЕНО: Истинный адрес фракции (0xD8)
+    int myFaction = *(int*)(pLocalDesc + 0xD8);
 
     // --- 1. СИСТЕМА ВЫЖИВАНИЯ ---
     if (myHpPercent < 40.0f) {
@@ -133,7 +133,7 @@ void BotPulse() {
                 printf("[SURVIVAL] HP %.1f%%! Casting Holy Light...\n", myHpPercent);
             }
         }
-        return; // Блокируем поиск мобов, пока не вылечимся
+        return; 
     }
 
     bool hasTarget = false;
@@ -244,13 +244,14 @@ void BotPulse() {
                         int hp = *(int*)(desc + 0x60); 
                         int maxHp = *(int*)(desc + 0x80); 
                         
-                        int mobFaction = *(int*)(desc + 0x8C);
+                        // [!] ИСПРАВЛЕНО: Истинные адреса фракции и флагов
+                        int mobFaction = *(int*)(desc + 0xD8);
+                        uint32_t mobFlags = *(uint32_t*)(desc + 0xE4);
                         uint32_t mobDynFlags = *(uint32_t*)(desc + 0x114);
-                        uint32_t mobFlags = *(uint32_t*)(desc + 0xD4);
 
                         bool isSameFaction = (myFaction == mobFaction); 
                         bool isTapped = (mobDynFlags & 0x4) != 0;       
-                        bool isUnattackable = (mobFlags & 0x8) != 0;    
+                        bool isUnattackable = (mobFlags & 0x102) != 0; // 0x2 (NonAttackable) | 0x100 (ImmuneToPC)
 
                         if (hp > 0 && maxHp > 1 && !isSameFaction && !isTapped && !isUnattackable) {
                             float mX = *(float*)(cur + 0x798);
@@ -335,7 +336,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v155: The Healthy Paladin ---\n");
+    printf("--- Bot v156: The True Radar ---\n");
 
     g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
     if (!g_WoWHwnd) return 0;
@@ -343,7 +344,7 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(g_WoWHwnd, 1337, 50, NULL); 
 
-    printf("[+] HP Offset Fixed (0x80).\n");
+    printf("[+] Faction Offset Fixed (0xD8).\n");
     printf("[+] Paladin Brain (Heal, Buffs, Judgement): INTEGRATED.\n");
     printf("[!] Action Bar Setup: 1=Heal, 2=Aura, 3=Seal, 4=Might, 5=Judgement\n");
     printf("[!] Press [INSERT] to Start/Pause.\n");
