@@ -34,6 +34,14 @@ HINSTANCE g_hModule = NULL;
 std::vector<uint64_t> g_Blacklist; 
 uint64_t g_BotTarget = 0; 
 
+// --- ТАЙМЕРЫ ПАЛАДИНА ---
+DWORD g_GCD = 0; 
+DWORD g_LastHeal = 0;
+DWORD g_LastDevotion = 0;
+DWORD g_LastSeal = 0;
+DWORD g_LastBlessing = 0;
+DWORD g_LastJudgement = 0;
+
 float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) {
     return sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2) + pow(z2 - z1, 2));
 }
@@ -49,7 +57,6 @@ void ProgrammaticTarget(uint64_t guid) {
     }
 }
 
-// [!] ВЕРНУЛ ТВОЮ ИДЕАЛЬНУЮ ЧУВСТВИТЕЛЬНОСТЬ (1.5f) [!]
 void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, float z) {
     static uint64_t lastGuid = 0;
     static int lastType = 0;
@@ -60,13 +67,29 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
     if (guid != lastGuid || type != lastType || diff > 1.5f) {
         uint64_t ctmGuid = guid;
         float ctmPos[3] = { x, y, z };
-        
         ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, type, &ctmGuid, ctmPos, 0.5f);
         
-        lastGuid = guid;
-        lastType = type;
+        lastGuid = guid; lastType = type;
         lastX = x; lastY = y; lastZ = z;
     }
+}
+
+// [!] ИДЕАЛЬНАЯ ЭМУЛЯЦИЯ КЛАВИАТУРЫ ДЛЯ ФОНОВОГО РЕЖИМА [!]
+bool TryCast(int vkKey, DWORD& lastCastTime, DWORD cooldown, DWORD castTime = 1500) {
+    if (GetTickCount() < g_GCD) return false; 
+    if (GetTickCount() - lastCastTime < cooldown) return false; 
+
+    // Генерируем правильные аппаратные скан-коды, чтобы WoW 100% увидел нажатие в фоне
+    UINT scanCode = MapVirtualKey(vkKey, MAPVK_VK_TO_VSC);
+    LPARAM lParamDown = (scanCode << 16) | 1;
+    LPARAM lParamUp = (scanCode << 16) | (1 << 30) | (1 << 31) | 1;
+
+    PostMessage(g_WoWHwnd, WM_KEYDOWN, vkKey, lParamDown);
+    PostMessage(g_WoWHwnd, WM_KEYUP, vkKey, lParamUp);
+
+    lastCastTime = GetTickCount();
+    g_GCD = GetTickCount() + castTime; 
+    return true;
 }
 
 void BotPulse() {
@@ -90,6 +113,27 @@ void BotPulse() {
         cur = *(uintptr_t*)(cur + 0x3C);
     }
     if (!pLocal) return;
+
+    uintptr_t pLocalDesc = *(uintptr_t*)(pLocal + 0x8);
+    if (!pLocalDesc) return;
+    
+    int myHp = *(int*)(pLocalDesc + 0x60);
+    int myMaxHp = *(int*)(pLocalDesc + 0x70);
+    float myHpPercent = ((float)myHp / (float)myMaxHp) * 100.0f;
+    
+    uint32_t myFlags = *(uint32_t*)(pLocalDesc + 0x114);
+    bool inCombat = (myFlags & 0x80000) != 0; 
+
+    // --- 1. СИСТЕМА ВЫЖИВАНИЯ ---
+    if (myHpPercent < 40.0f) {
+        if (GetTickCount() >= g_GCD) {
+            ExecuteLua("MoveForwardStop(); MoveBackwardStop();"); 
+            if (TryCast('1', g_LastHeal, 0, 3000)) { 
+                printf("[SURVIVAL] HP %.1f%%! Casting Holy Light...\n", myHpPercent);
+            }
+        }
+        return; 
+    }
 
     bool hasTarget = false;
     int targetHp = 0;
@@ -117,9 +161,17 @@ void BotPulse() {
         if (!hasTarget) g_BotTarget = 0; 
     }
 
+    // --- 2. СИСТЕМА БАФОВ ---
+    if (!inCombat && !hasTarget) {
+        if (TryCast('2', g_LastDevotion, 3600000)) { printf("[BUFF] Casting Devotion Aura\n"); return; }
+        if (TryCast('3', g_LastSeal, 1680000)) { printf("[BUFF] Casting Seal of Righteousness\n"); return; }
+        if (TryCast('4', g_LastBlessing, 540000)) { printf("[BUFF] Casting Blessing of Might\n"); return; }
+    }
+
     static bool isLooting = false;
     static DWORD lootTimer = 0;
 
+    // --- 3. БОЙ И ЛУТ ---
     if (hasTarget) {
         ProgrammaticTarget(g_BotTarget);
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
@@ -127,28 +179,27 @@ void BotPulse() {
         if (targetHp > 0) {
             isLooting = false; 
 
-            // [!] ТВОЯ ИДЕАЛЬНАЯ БОЕВКА (БЕЗ ТОРМОЗОВ И КОСТЫЛЕЙ) [!]
-            // Движок WoW сам знает, что при CTM_ATTACK нужно остановиться на краю хитбокса!
             ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
             printf("Chasing/Attacking... Dist: %.1f      \r", dist);
             
             if (dist < 5.0f) {
                 static DWORD lastAtk = 0;
                 if (GetTickCount() - lastAtk > 1500) {
-                    // InteractUnit легально поворачивает лицом, StartAttack бьет
                     ExecuteLua("InteractUnit('mouseover'); StartAttack();");
                     lastAtk = GetTickCount();
+                }
+
+                if (TryCast('5', g_LastJudgement, 10500)) {
+                    printf("\n[COMBAT] Casting Judgement!\n");
                 }
             }
         } 
         else {
-            // --- ИДЕАЛЬНЫЙ ЛУТ ---
             if (dist > 4.5f && !isLooting) {
                 ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
                 printf("Running to Corpse... Dist: %.1f        \r", dist);
             } else {
                 if (!isLooting) {
-                    // Шлем команду CTM_LOOT. Движок сам нагнется к трупу.
                     uint64_t ctmGuid = g_BotTarget;
                     float ctmPos[3] = { tX, tY, tZ };
                     ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, CTM_LOOT, &ctmGuid, ctmPos, 0.5f);
@@ -213,6 +264,7 @@ void BotPulse() {
             ProgrammaticTarget(g_BotTarget);
             printf("\nFound new target! Dist: %.1f        \n", bestDist);
         } else {
+            if (GetTickCount() > g_GCD) g_GCD = 0;
             printf("Scanning for enemies...             \r");
         }
     }
@@ -258,7 +310,6 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
         static DWORD lastTick = 0;
         static bool isPulsing = false; 
 
-        // Оставил 150мс, чтобы он быстро реагировал на появление новых мобов
         if (g_Active && !isPulsing && (GetTickCount() - lastTick > 150)) {
             isPulsing = true;
             __try {
@@ -274,7 +325,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v151: The Flawless Position ---\n");
+    printf("--- Bot v153: The VM Farm Edition ---\n");
 
     g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
     if (!g_WoWHwnd) return 0;
@@ -282,10 +333,11 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(g_WoWHwnd, 1337, 50, NULL); 
 
-    printf("[+] Original Combat Logic: RESTORED.\n");
-    printf("[+] Engine Auto-Braking: ACTIVE.\n");
+    printf("[+] Hardware Scan-Codes (Background Cast): INTEGRATED.\n");
+    printf("[+] Paladin Brain (Heal, Buffs, Judgement): INTEGRATED.\n");
+    printf("[!] Action Bar Setup: 1=Heal, 2=Aura, 3=Seal, 4=Might, 5=Judgement\n");
     printf("[!] Press [INSERT] to Start/Pause.\n");
-    printf("[!] Press [END] to Unload the Bot.\n\n");
+    printf("[!] Press[END] to Unload the Bot.\n\n");
     return 0;
 }
 
