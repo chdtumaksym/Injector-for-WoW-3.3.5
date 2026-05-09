@@ -15,10 +15,8 @@
 #define ADDR_MOUSEOVER_GUID     0x00BD07A0 
 #define ADDR_LUA_EXECUTE        0x00819210 
 
-// Правильные типы CTM
-#define CTM_MOVE                4  // Обычный бег
-#define CTM_LOOT                6  // Нативный сбор лута (нагнуться к трупу)
-#define CTM_ATTACK              11 // Атака
+#define CTM_MOVE                4 
+#define CTM_ATTACK              11 
 
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
@@ -40,11 +38,19 @@ void ExecuteLua(const char* command) {
     ((tLuaExecute)ADDR_LUA_EXECUTE)(command, "bot_core", 0);
 }
 
+// [!] ФИКС ЛУТА: Мы ВСЕГДА обновляем mouseover, чтобы скрипт лута знал, кого лутать
 void ProgrammaticTarget(uint64_t guid) {
+    *(uint64_t*)ADDR_MOUSEOVER_GUID = guid; 
     if (*(uint64_t*)ADDR_TARGET_GUID != guid) {
-        *(uint64_t*)ADDR_MOUSEOVER_GUID = guid;
         ExecuteLua("TargetUnit('mouseover')");
     }
+}
+
+// [!] ФИКС ПОВОРОТА: Мгновенно разворачиваем персонажа лицом к координатам цели
+void FaceTarget(uintptr_t pLocal, float myX, float myY, float tX, float tY) {
+    float angle = atan2(tY - myY, tX - myX);
+    if (angle < 0.0f) angle += 6.283185307f; // 2 * PI
+    *(float*)(pLocal + 0x7A8) = angle; // 0x7A8 - смещение угла поворота (Facing) в 3.3.5a
 }
 
 void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, float z) {
@@ -125,6 +131,7 @@ void BotPulse() {
             printf("Chasing Target... Dist: %.1f      \r", dist);
             
             if (dist < 5.0f) {
+                FaceTarget(pLocal, myX, myY, tX, tY); // [!] ПРИНУДИТЕЛЬНЫЙ ПОВОРОТ ЛИЦОМ
                 static DWORD lastAtk = 0;
                 if (GetTickCount() - lastAtk > 1500) {
                     ExecuteLua("StartAttack()");
@@ -133,18 +140,19 @@ void BotPulse() {
             }
         } 
         else if (targetHp <= 0 && (targetFlags & 1)) {
-            // [!] ФИКС ЛУТА: Разделяем бег и сам лут [!]
             if (dist > 4.5f) {
                 ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
                 printf("Running to Corpse... Dist: %.1f        \r", dist);
             } else {
-                printf("Looting Corpse (Native)... Dist: %.1f  \r", dist);
+                FaceTarget(pLocal, myX, myY, tX, tY); // [!] ПОВОРОТ К ТРУПУ
+                printf("Looting Corpse (Lua Bypass)... Dist: %.1f  \r", dist);
+                
                 static DWORD lastLoot = 0;
-                if (GetTickCount() - lastLoot > 1500) {
-                    uint64_t lootGuid = g_BotTarget;
-                    float lootPos[3] = { tX, tY, tZ };
-                    // Жесткий приказ движку игры нагнуться и забрать лут (Тип 6)
-                    ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, CTM_LOOT, &lootGuid, lootPos, 0.5f);
+                if (GetTickCount() - lastLoot > 800) {
+                    // [!] ГЕНИАЛЬНЫЙ ОБХОД ЛУТА:
+                    // Если окно лута открыто - собираем вещи через незащищенную функцию LootSlot()
+                    // Если закрыто - открываем его через InteractUnit
+                    ExecuteLua("if GetNumLootItems() > 0 then for i=1, GetNumLootItems() do LootSlot(i) end else InteractUnit('mouseover') end");
                     lastLoot = GetTickCount();
                 }
             }
@@ -227,8 +235,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
             isPulsing = true;
             __try {
                 BotPulse();
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-            }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
             lastTick = GetTickCount();
             isPulsing = false;
         }
@@ -239,7 +246,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v131: Flawless Native Loot ---\n");
+    printf("--- Bot v132: Face & Loot Edition ---\n");
 
     HWND hwnd = FindWindowA(NULL, "World of Warcraft");
     if (!hwnd) return 0;
@@ -247,9 +254,8 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(hwnd, 1337, 50, NULL); 
 
-    printf("[+] Anti-Dance Logic: INTEGRATED.\n");
-    printf("[+] Smart Mouseover Targeting: INTEGRATED.\n");
-    printf("[+] CTM_LOOT (6) Engine Bypasser: INTEGRATED.\n");
+    printf("[+] Memory Facing (atan2): INTEGRATED.\n");
+    printf("[+] Lua LootSlot() Bypasser: INTEGRATED.\n");
     printf("[!] Focus WoW window and press [INSERT] to start.\n");
     return 0;
 }
