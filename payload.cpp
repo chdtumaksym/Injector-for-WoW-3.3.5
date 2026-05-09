@@ -15,7 +15,7 @@
 #define ADDR_MOUSEOVER_GUID     0x00BD07A0 
 #define ADDR_LUA_EXECUTE        0x00819210 
 
-#define CTM_LOOT                6  
+#define CTM_MOVE                4 
 #define CTM_ATTACK              11 
 
 #pragma runtime_checks("", off)
@@ -27,9 +27,11 @@ typedef void(__cdecl* tLuaExecute)(const char* code, const char* fileName, int s
 
 bool g_Active = false;
 WNDPROC oWndProc = nullptr;
+HWND g_WoWHwnd = NULL; // Глобальный хэндл окна для отправки нажатий клавиш
+
 std::vector<uint64_t> g_Blacklist; 
 uint64_t g_BotTarget = 0; 
-DWORD g_DeathTime = 0; // Таймер для фикса задержки сервера при луте
+DWORD g_DeathTime = 0; // Таймер ожидания ответа от сервера
 
 float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) {
     return sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2) + pow(z2 - z1, 2));
@@ -120,7 +122,7 @@ void BotPulse() {
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
 
         if (targetHp > 0) {
-            g_DeathTime = 0; // Сбрасываем таймер смерти, пока моб жив
+            g_DeathTime = 0; // Сбрасываем таймер смерти
 
             ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
             printf("Chasing Target... Dist: %.1f      \r", dist);
@@ -128,34 +130,38 @@ void BotPulse() {
             if (dist < 5.0f) {
                 static DWORD lastAtk = 0;
                 if (GetTickCount() - lastAtk > 1500) {
-                    // InteractUnit легально поворачивает персонажа лицом к цели для сервера!
                     ExecuteLua("InteractUnit('mouseover'); StartAttack();");
                     lastAtk = GetTickCount();
                 }
             }
         } 
         else {
-            // Моб мертв. Засекаем время смерти.
+            // Моб мертв. Запускаем таймер ожидания лута от сервера.
             if (g_DeathTime == 0) g_DeathTime = GetTickCount();
 
             if (targetFlags & 1) { 
-                // Сервер прислал флаг лута!
-                ActionCTM(pLocal, CTM_LOOT, g_BotTarget, tX, tY, tZ);
-                printf("Moving to Loot... Dist: %.1f        \r", dist);
-                
-                if (dist < 5.0f) {
+                // Сервер подтвердил: ЛУТ ЕСТЬ!
+                if (dist > 4.5f) {
+                    ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
+                    printf("Moving to Loot... Dist: %.1f        \r", dist);
+                } else {
                     static DWORD lastLoot = 0;
                     if (GetTickCount() - lastLoot > 1500) {
-                        // Открываем окно лута
-                        ExecuteLua("InteractUnit('mouseover')");
+                        // [!] АППАРАТНЫЙ ОБХОД ЗАЩИТЫ ЛУТА [!]
+                        // Посылаем окну игры нажатие клавиши F8 (Interact with Target)
+                        // Это легально открывает окно лута и собирает вещи!
+                        PostMessage(g_WoWHwnd, WM_KEYDOWN, VK_F8, (0x42 << 16) | 1);
+                        PostMessage(g_WoWHwnd, WM_KEYUP, VK_F8, (1 << 31) | (1 << 30) | (0x42 << 16) | 1);
+                        
                         lastLoot = GetTickCount();
+                        printf("Looting Corpse (Hardware Key)...    \r");
                     }
                 }
             } 
             else {
-                // Флага лута нет. Ждем 1.5 секунды ответа от сервера.
+                // Флага лута нет. Ждем 1.5 секунды, вдруг сервер лагает.
                 if (GetTickCount() - g_DeathTime > 1500) {
-                    // Прошло 1.5 сек, лута точно нет. Сбрасываем.
+                    // Прошло 1.5 сек, лута точно нет. Бросаем труп.
                     g_Blacklist.push_back(g_BotTarget);
                     g_BotTarget = 0; 
                     ExecuteLua("ClearTarget()"); 
@@ -220,7 +226,11 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
                 Beep(g_Active ? 800 : 400, 100);
                 printf("\n[!] BOT STATUS: %s                                \n", g_Active ? "ACTIVE" : "PAUSED");
                 
-                if (!g_Active) { 
+                if (g_Active) {
+                    // При включении биндим F8 на "Взаимодействие с целью" и включаем Автолут
+                    ExecuteLua("SetBinding('F8', 'INTERACTTARGET')");
+                    ExecuteLua("SetCVar('autoLootDefault', '1')");
+                } else { 
                     g_BotTarget = 0; 
                     ExecuteLua("ClearTarget()");
                     g_Blacklist.clear(); 
@@ -248,16 +258,16 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v133: Server Sync & Loot Fix ---\n");
+    printf("--- Bot v134: Hardware Loot Bypass ---\n");
 
-    HWND hwnd = FindWindowA(NULL, "World of Warcraft");
-    if (!hwnd) return 0;
+    g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
+    if (!g_WoWHwnd) return 0;
 
-    oWndProc = (WNDPROC)SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)HookedWndProc);
-    SetTimer(hwnd, 1337, 50, NULL); 
+    oWndProc = (WNDPROC)SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)HookedWndProc);
+    SetTimer(g_WoWHwnd, 1337, 50, NULL); 
 
-    printf("[+] Server Desync (Facing) Fixed.\n");
-    printf("[+] Loot Race Condition Fixed (1.5s delay).\n");
+    printf("[+] Server Loot Delay Fix (1.5s): INTEGRATED.\n");
+    printf("[+] Hardware Keypress Emulator (F8): INTEGRATED.\n");
     printf("[!] Focus WoW window and press [INSERT] to start.\n");
     return 0;
 }
