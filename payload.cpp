@@ -41,7 +41,7 @@ void ExecuteLua(const char* command) {
     ((tLuaExecute)ADDR_LUA_EXECUTE)(command, "bot_core", 0);
 }
 
-// [!] ТВОЙ ИДЕАЛЬНЫЙ ТАРГЕТИНГ (ВОССТАНОВЛЕНО) [!]
+// [!] ТВОЙ ИДЕАЛЬНЫЙ ТАРГЕТИНГ (БЕЗ ВМЕШАТЕЛЬСТВА В ПАМЯТЬ)[!]
 void ProgrammaticTarget(uint64_t guid) {
     if (*(uint64_t*)ADDR_TARGET_GUID != guid) {
         *(uint64_t*)ADDR_MOUSEOVER_GUID = guid;
@@ -127,9 +127,9 @@ void BotPulse() {
         if (targetHp > 0) {
             isLooting = false; 
 
-            // [!] ТВОЯ ИДЕАЛЬНАЯ БОЕВКА (ВОССТАНОВЛЕНО) [!]
+            // [!] ТВОЯ ИДЕАЛЬНАЯ БОЕВКА [!]
             ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
-            printf("Chasing/Attacking... Dist: %.1f      \r", dist);
+            printf("Chasing Target... Dist: %.1f      \r", dist);
             
             if (dist < 5.0f) {
                 static DWORD lastAtk = 0;
@@ -140,7 +140,7 @@ void BotPulse() {
             }
         } 
         else {
-            // --- ЛУТ ---
+            //[!] НАШ ИДЕАЛЬНЫЙ ЛУТ [!]
             if (dist > 4.5f && !isLooting) {
                 ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
                 printf("Running to Corpse... Dist: %.1f        \r", dist);
@@ -154,14 +154,11 @@ void BotPulse() {
 
                 static DWORD lastLoot = 0;
                 if (GetTickCount() - lastLoot > 300) {
-                    // [!] ГЛАВНЫЙ ФИКС ЛУТА: Используем MOUSEOVER для взаимодействия с трупом!
-                    // Это гарантированно откроет окно лута, даже если труп не берется в таргет.
                     *(uint64_t*)ADDR_MOUSEOVER_GUID = g_BotTarget;
                     ExecuteLua("InteractUnit('mouseover'); if LootFrame:IsVisible() then for i=1, GetNumLootItems() do LootSlot(i) end end");
                     lastLoot = GetTickCount();
                 }
 
-                // Ждем 3 секунды, чтобы всё точно собралось
                 if (GetTickCount() - lootTimer > 3000) {
                     g_Blacklist.push_back(g_BotTarget);
                     g_BotTarget = 0; 
@@ -243,7 +240,6 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
                 printf("\n\n[!] BOT STATUS: %s\n", g_Active ? "ACTIVE" : "PAUSED");
                 
                 if (g_Active) { 
-                    // Отключаем автолут, чтобы окно не закрывалось само и скрипт успел всё забрать
                     ExecuteLua("SetCVar('autoLootDefault', '0')");
                 } else { 
                     g_BotTarget = 0; 
@@ -273,7 +269,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v148: The Mouseover Looter ---\n");
+    printf("--- Bot v149: The Final Release ---\n");
 
     g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
     if (!g_WoWHwnd) return 0;
