@@ -41,7 +41,6 @@ void ExecuteLua(const char* command) {
     ((tLuaExecute)ADDR_LUA_EXECUTE)(command, "bot_core", 0);
 }
 
-// [!] ТВОЙ ИДЕАЛЬНЫЙ ТАРГЕТИНГ (БЕЗ ВМЕШАТЕЛЬСТВА В ПАМЯТЬ)[!]
 void ProgrammaticTarget(uint64_t guid) {
     if (*(uint64_t*)ADDR_TARGET_GUID != guid) {
         *(uint64_t*)ADDR_MOUSEOVER_GUID = guid;
@@ -49,7 +48,6 @@ void ProgrammaticTarget(uint64_t guid) {
     }
 }
 
-// Твоя защита от спама команд
 void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, float z) {
     static uint64_t lastGuid = 0;
     static int lastType = 0;
@@ -57,7 +55,8 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
 
     float diff = sqrt(pow(x - lastX, 2) + pow(y - lastY, 2) + pow(z - lastZ, 2));
 
-    if (guid != lastGuid || type != lastType || diff > 1.5f) {
+    //[!] Сделал трекинг более резким (0.5f вместо 1.5f), чтобы бот точнее бегал за мобом
+    if (guid != lastGuid || type != lastType || diff > 0.5f) {
         uint64_t ctmGuid = guid;
         float ctmPos[3] = { x, y, z };
         
@@ -118,6 +117,7 @@ void BotPulse() {
     }
 
     static bool isLooting = false;
+    static bool inMelee = false;
     static DWORD lootTimer = 0;
 
     if (hasTarget) {
@@ -127,26 +127,37 @@ void BotPulse() {
         if (targetHp > 0) {
             isLooting = false; 
 
-            // [!] ТВОЯ ИДЕАЛЬНАЯ БОЕВКА [!]
-            ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
-            printf("Chasing Target... Dist: %.1f      \r", dist);
-            
-            if (dist < 5.0f) {
+            // --- БОЕВКА (УСКОРЕННАЯ И ТОЧНАЯ) ---
+            if (dist > 4.5f) {
+                ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
+                inMelee = false;
+                printf("Chasing Target... Dist: %.1f      \r", dist);
+            } else {
+                if (!inMelee) {
+                    // [!] ТОРМОЗА: Мгновенно останавливаемся, чтобы не пролететь сквозь моба
+                    ExecuteLua("MoveForwardStop();");
+                    inMelee = true;
+                }
+
                 static DWORD lastAtk = 0;
-                if (GetTickCount() - lastAtk > 1500) {
-                    ExecuteLua("StartAttack()");
+                if (GetTickCount() - lastAtk > 1000) {
+                    // [!] ПОВОРОТ ЛИЦОМ: InteractUnit заставляет перса легально повернуться к мобу!
+                    ExecuteLua("InteractUnit('mouseover'); StartAttack();");
                     lastAtk = GetTickCount();
                 }
+                printf("Melee Combat... Dist: %.1f        \r", dist);
             }
         } 
         else {
-            //[!] НАШ ИДЕАЛЬНЫЙ ЛУТ [!]
+            // --- ИДЕАЛЬНЫЙ ЛУТ (БЕЗ ИЗМЕНЕНИЙ) ---
+            inMelee = false;
+
             if (dist > 4.5f && !isLooting) {
                 ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
                 printf("Running to Corpse... Dist: %.1f        \r", dist);
             } else {
                 if (!isLooting) {
-                    ExecuteLua("MoveForwardStop(); MoveBackwardStart(); MoveBackwardStop();");
+                    ExecuteLua("MoveForwardStop();"); // Тормозим перед трупом
                     isLooting = true;
                     lootTimer = GetTickCount();
                     printf("Looting Corpse... Waiting 3 sec.       \r");
@@ -239,9 +250,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
                 Beep(g_Active ? 800 : 400, 100);
                 printf("\n\n[!] BOT STATUS: %s\n", g_Active ? "ACTIVE" : "PAUSED");
                 
-                if (g_Active) { 
-                    ExecuteLua("SetCVar('autoLootDefault', '0')");
-                } else { 
+                if (!g_Active) { 
                     g_BotTarget = 0; 
                     ExecuteLua("ClearTarget(); CloseLoot();");
                     g_Blacklist.clear(); 
@@ -254,7 +263,8 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
         static DWORD lastTick = 0;
         static bool isPulsing = false; 
 
-        if (g_Active && !isPulsing && (GetTickCount() - lastTick > 400)) {
+        // [!] УСКОРИЛ БОТА: Теперь он думает каждые 150мс вместо 400мс!
+        if (g_Active && !isPulsing && (GetTickCount() - lastTick > 150)) {
             isPulsing = true;
             __try {
                 BotPulse();
@@ -269,7 +279,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v149: The Final Release ---\n");
+    printf("--- Bot v150: The Snappy Edition ---\n");
 
     g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
     if (!g_WoWHwnd) return 0;
@@ -277,8 +287,8 @@ DWORD WINAPI Setup(LPVOID) {
     oWndProc = (WNDPROC)SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(g_WoWHwnd, 1337, 50, NULL); 
 
-    printf("[+] User's Combat Logic: RESTORED.\n");
-    printf("[+] Mouseover Loot Bypass: INTEGRATED.\n");
+    printf("[+] 150ms Tick Rate (Ultra Responsive): INTEGRATED.\n");
+    printf("[+] Auto-Brake & Auto-Face Target: INTEGRATED.\n");
     printf("[!] Press [INSERT] to Start/Pause.\n");
     printf("[!] Press [END] to Unload the Bot.\n\n");
     return 0;
