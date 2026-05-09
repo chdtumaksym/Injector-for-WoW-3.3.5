@@ -161,7 +161,6 @@ void BotPulse() {
     bool inCombat = (myFlags & 0x80000) != 0; 
     int myFaction = *(int*)(pLocalDesc + 0xDC);
     
-    // [!] ЧИТАЕМ УРОВЕНЬ ПЕРСОНАЖА [!]
     int myLevel = *(int*)(pLocalDesc + 0xD8);
     static int lastLevel = 0;
 
@@ -238,6 +237,7 @@ void BotPulse() {
             }
         } 
         else {
+            // ЛУТ
             if (targetDynFlags & 1) { 
                 if (dist > 4.5f && !isLooting) {
                     ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
@@ -283,14 +283,13 @@ void BotPulse() {
                 }
             }
         }
-        return; // Пока есть таргет - задачи профиля стоят на паузе!
+        return; 
     } 
 
     // ==========================================
-    // РЕЖИМ ЗАДАЧ (НАВИГАЦИЯ)
+    // РЕЖИМ ЗАДАЧ (КВЕСТИНГ / НАВИГАЦИЯ)
     // ==========================================
     
-    // 1. Радар (Ищем врагов вокруг)
     uint64_t bestGuid = 0;
     float bestDist = 25.0f; 
 
@@ -336,13 +335,13 @@ void BotPulse() {
         return;
     }
 
-    // 2. Выполняем текущую задачу из профиля
     if (g_Profile.empty() || g_CurrentTaskIndex >= g_Profile.size()) {
         printf("[IDLE] Profile finished or not loaded. Waiting...      \r");
         return;
     }
 
     BotTask& task = g_Profile[g_CurrentTaskIndex];
+    static DWORD taskTimer = 0; 
 
     if (task.type == TASK_GOTO) {
         float distToWaypoint = GetDistance3D(myX, myY, myZ, task.x, task.y, task.z);
@@ -354,8 +353,37 @@ void BotPulse() {
             printf("[TASK] Moving to Waypoint %d... Dist: %.1f      \r", g_CurrentTaskIndex, distToWaypoint);
         }
     }
+    else if (task.type == TASK_ACCEPT_QUEST) {
+        if (taskTimer == 0) {
+            printf("\n[TASK] Accepting Quest %d from NPC %d...\n", task.questId, task.npcId);
+            taskTimer = GetTickCount();
+        }
+        if (GetTickCount() - taskTimer > 2000) {
+            g_CurrentTaskIndex++;
+            taskTimer = 0;
+        }
+    }
+    else if (task.type == TASK_TURN_IN_QUEST) {
+        if (taskTimer == 0) {
+            printf("\n[TASK] Turning in Quest %d to NPC %d...\n", task.questId, task.npcId);
+            taskTimer = GetTickCount();
+        }
+        if (GetTickCount() - taskTimer > 2000) {
+            g_CurrentTaskIndex++;
+            taskTimer = 0;
+        }
+    }
     else if (task.type == TASK_GRIND) {
         printf("[TASK] Grinding mode active. Looking for mobs...      \r");
+    }
+}
+
+// [!] БЕЗОПАСНАЯ ОБЕРТКА ДЛЯ ИСКЛЮЧЕНИЙ (ФИКС ОШИБКИ C2712) [!]
+void SafeBotPulse() {
+    __try {
+        BotPulse();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Игнорируем ошибки чтения памяти
     }
 }
 
@@ -381,7 +409,6 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
             return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
         }
 
-        // [!] РЕКОРДЕР МАРШРУТОВ (КНОПКА F9) [!]
         static bool f9Pressed = false;
         if (GetAsyncKeyState(VK_F9) & 0x8000) {
             if (!f9Pressed) {
@@ -424,7 +451,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
                 printf("\n\n[!] BOT STATUS: %s\n", g_Active ? "ACTIVE" : "PAUSED");
                 
                 if (g_Active) {
-                    // При старте загружаем начальный профиль
+                    // Укажи здесь правильный путь к файлу профиля!
                     LoadProfile("C:\\Northshire_1_6.txt");
                 } else { 
                     g_BotTarget = 0; 
@@ -441,9 +468,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 
         if (g_Active && !isPulsing && (GetTickCount() - lastTick > 150)) {
             isPulsing = true;
-            __try {
-                BotPulse();
-            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            SafeBotPulse(); // Вызываем безопасную обертку
             lastTick = GetTickCount();
             isPulsing = false;
         }
@@ -454,7 +479,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v160: The Leveling Framework ---\n");
+    printf("--- Bot v161: The Compiler Fix ---\n");
 
     g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
     if (!g_WoWHwnd) return 0;
@@ -465,7 +490,7 @@ DWORD WINAPI Setup(LPVOID) {
     printf("[+] External Profile Engine: INTEGRATED.\n");
     printf("[+] Auto-Level Profile Switcher: INTEGRATED.\n");
     printf("[+] Waypoint Recorder (F9): INTEGRATED.\n");
-    printf("[!] Press [F9] in-game to save your current position to C:\\RecordedProfile.txt\n");
+    printf("[!] Press[F9] in-game to save your current position to C:\\RecordedProfile.txt\n");
     printf("[!] Press [INSERT] to Start/Pause.\n");
     printf("[!] Press [END] to Unload the Bot.\n\n");
     return 0;
