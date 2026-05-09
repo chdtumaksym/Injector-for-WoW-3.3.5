@@ -5,9 +5,6 @@
 #include <vector>
 #include <algorithm>
 
-// ==========================================
-// --- АДРЕСА ПАМЯТИ WoW 3.3.5a (12340) ---
-// ==========================================
 #define ADDR_S_CUR_MGR          0x00C79CE0
 #define OFFSET_OBJECT_MANAGER   0x2ED0
 #define ADDR_CLICK_TO_MOVE      0x00727400 
@@ -16,7 +13,7 @@
 #define ADDR_LUA_EXECUTE        0x00819210 
 
 #define CTM_MOVE                4 
-#define CTM_LOOT                6  // Нативный сбор лута
+#define CTM_LOOT                6 
 #define CTM_ATTACK              11 
 
 #pragma runtime_checks("", off)
@@ -119,6 +116,7 @@ void BotPulse() {
 
     static bool combatInMelee = false;
     static bool lootInMelee = false;
+    static DWORD lootStartTime = 0;
 
     if (hasTarget) {
         ProgrammaticTarget(g_BotTarget);
@@ -126,67 +124,55 @@ void BotPulse() {
 
         if (targetHp > 0) {
             g_DeathTime = 0; 
-            lootInMelee = false; // Сбрасываем статус лута
+            lootInMelee = false; 
 
             if (dist > 4.5f) {
-                ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
+                ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
                 combatInMelee = false;
                 printf("Chasing Target... Dist: %.1f      \r", dist);
             } else {
                 if (!combatInMelee) {
-                    ExecuteLua("MoveForwardStop(); MoveBackwardStart(); MoveBackwardStop();");
+                    ExecuteLua("StartAttack()");
                     combatInMelee = true;
                 }
                 
                 static DWORD lastAtk = 0;
-                if (GetTickCount() - lastAtk > 1500) {
+                if (GetTickCount() - lastAtk > 2000) {
                     ExecuteLua("InteractUnit('mouseover'); StartAttack();");
                     lastAtk = GetTickCount();
                 }
             }
         } 
         else {
-            combatInMelee = false; // Сбрасываем статус боя
+            combatInMelee = false; 
 
             if (g_DeathTime == 0) g_DeathTime = GetTickCount();
 
-            if (targetFlags & 1) { 
+            if (targetFlags & 1) { // Если есть лут
                 if (dist > 4.5f) {
-                    ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
+                    ActionCTM(pLocal, CTM_LOOT, g_BotTarget, tX, tY, tZ);
                     lootInMelee = false;
                     printf("Moving to Loot... Dist: %.1f        \r", dist);
                 } else {
-                    static DWORD lootStartTime = 0;
                     if (!lootInMelee) {
-                        ExecuteLua("MoveForwardStop(); MoveBackwardStart(); MoveBackwardStop();");
+                        // Как только добежали - кликаем один раз и ждем
+                        ExecuteLua("InteractUnit('mouseover')");
                         lootInMelee = true;
                         lootStartTime = GetTickCount();
+                        printf("Looting... Waiting for server.       \r");
                     }
 
-                    // [!] ЗАЩИТА ОТ ЗАВИСАНИЯ: Если лутаем дольше 5 секунд - бросаем труп
-                    if (GetTickCount() - lootStartTime > 5000) {
+                    // Ждем 3 секунды. Если лут не собрался (сумки полные/забагалось) - кидаем в ЧС
+                    if (GetTickCount() - lootStartTime > 3000) {
                         g_Blacklist.push_back(g_BotTarget);
                         g_BotTarget = 0; 
                         ExecuteLua("ClearTarget()"); 
                         printf("Loot Timeout. Blacklisted.             \n");
-                    } else {
-                        static DWORD lastLoot = 0;
-                        if (GetTickCount() - lastLoot > 1000) {
-                            // 1. Заставляем движок открыть окно лута
-                            uint64_t ctmGuid = g_BotTarget;
-                            float ctmPos[3] = { tX, tY, tZ };
-                            ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, CTM_LOOT, &ctmGuid, ctmPos, 0.5f);
-                            
-                            // 2. Заставляем Lua собрать все вещи (LootSlot не защищен!)
-                            ExecuteLua("for i=1, GetNumLootItems() do LootSlot(i) end");
-                            
-                            lastLoot = GetTickCount();
-                            printf("Looting Corpse (Memory + Lua)...    \r");
-                        }
                     }
                 }
             } 
             else {
+                // Если флага лута нет, даем серверу 1.5 секунды на его прогрузку
                 if (GetTickCount() - g_DeathTime > 1500) {
                     g_Blacklist.push_back(g_BotTarget);
                     g_BotTarget = 0; 
@@ -241,7 +227,6 @@ void BotPulse() {
     }
 }
 
-// Поток для безопасной выгрузки DLL
 DWORD WINAPI EjectThread(LPVOID) {
     SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)oWndProc); 
     KillTimer(g_WoWHwnd, 1337);
@@ -297,7 +282,7 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 DWORD WINAPI Setup(LPVOID) {
     AllocConsole(); 
     freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v136: The Ultimate Looter ---\n");
+    printf("--- Bot v131: Clean Looting Edition ---\n");
 
     g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
     if (!g_WoWHwnd) return 0;
@@ -306,8 +291,8 @@ DWORD WINAPI Setup(LPVOID) {
     SetTimer(g_WoWHwnd, 1337, 50, NULL); 
 
     printf("[+] Combat Engine: PERFECTED.\n");
-    printf("[+] Memory + Lua Looting: INTEGRATED.\n");
-    printf("[+] Loot Timeout Failsafe: INTEGRATED.\n");
+    printf("[+] Native AutoLoot: INTEGRATED.\n");
+    printf("[!] WARNING: Enable 'Auto Loot' in game settings!\n");
     printf("[!] Press [INSERT] to Start/Pause.\n");
     printf("[!] Press [END] to Unload the Bot.\n");
     return 0;
