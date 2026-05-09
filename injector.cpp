@@ -12,7 +12,7 @@
 #include <filesystem>
 
 // ==========================================
-// --- ТВОЙ КОД MANUAL MAPPING ---
+// --- MANUAL MAPPING ---
 // ==========================================
 struct MANUAL_MAPPING_DATA {
     typedef HMODULE(WINAPI* pLoadLibraryA)(LPCSTR);
@@ -85,11 +85,10 @@ void __stdcall ShellCode(MANUAL_MAPPING_DATA* pData) {
 void __stdcall ShellCodeEnd() {}
 #pragma optimize("", on)
 
-// Обертка для инжекта, чтобы вызывать по кнопке
 bool ManualMapInject(DWORD pid, const char* dllPath, char* logBuffer) {
     std::ifstream f(dllPath, std::ios::binary | std::ios::ate);
     if (!f.is_open()) {
-        strcpy(logBuffer, "[-] Error: payload.dll not found in folder!\n");
+        strcpy(logBuffer, "[-] Error: bot_payload.dll not found in folder!\n");
         return false;
     }
     auto sz = f.tellg();
@@ -144,7 +143,7 @@ bool ManualMapInject(DWORD pid, const char* dllPath, char* logBuffer) {
 }
 
 // ==========================================
-// --- НАСТРОЙКА DIRECTX И GUI ---
+// --- DIRECTX 11 & GUI ---
 // ==========================================
 static ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
@@ -212,7 +211,6 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
 
-// --- СТИЛЬ CS2 ---
 void SetupCS2Style() {
     ImGuiStyle& style = ImGui::GetStyle();
     style.WindowRounding = 6.0f;
@@ -221,7 +219,7 @@ void SetupCS2Style() {
     style.Colors[ImGuiCol_WindowBg] = ImVec4(0.11f, 0.11f, 0.13f, 1.00f);
     style.Colors[ImGuiCol_FrameBg] = ImVec4(0.18f, 0.18f, 0.20f, 1.00f);
     style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.24f, 0.24f, 0.26f, 1.00f);
-    style.Colors[ImGuiCol_Button] = ImVec4(0.85f, 0.50f, 0.10f, 1.00f); // CS2 Orange
+    style.Colors[ImGuiCol_Button] = ImVec4(0.85f, 0.50f, 0.10f, 1.00f); 
     style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.95f, 0.60f, 0.20f, 1.00f);
     style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.75f, 0.40f, 0.05f, 1.00f);
     style.Colors[ImGuiCol_Text] = ImVec4(0.95f, 0.95f, 0.95f, 1.00f);
@@ -249,7 +247,6 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     int selectedProfile = 0;
     char logBuffer[512] = "Waiting for action...\n";
 
-    // Ищем профили в папке Profiles
     char currentDir[MAX_PATH];
     GetCurrentDirectoryA(MAX_PATH, currentDir);
     std::string profilesDir = std::string(currentDir) + "\\Profiles";
@@ -299,18 +296,21 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             if (profiles.empty()) {
                 strcpy(logBuffer, "[-] Error: No profiles found in /Profiles folder!\n");
             } else {
-                // 1. Сохраняем путь в settings.ini для payload.dll
+                // 1. Создаем общую папку для связи с DLL
+                CreateDirectoryA("C:\\WoWBot", NULL);
+                
+                // 2. Сохраняем путь к профилю
                 std::string fullPath = profilesDir + "\\" + profiles[selectedProfile];
-                std::ofstream settingsFile(std::string(currentDir) + "\\settings.ini");
+                std::ofstream settingsFile("C:\\WoWBot\\settings.ini");
                 settingsFile << fullPath;
                 settingsFile.close();
 
-                // 2. Ищем WoW и делаем Manual Map
+                // 3. Инжектим bot_payload.dll
                 DWORD procId = GetProcessId("Wow.exe");
                 if (!procId) {
                     strcpy(logBuffer, "[-] Error: Wow.exe not found! Open the game first.\n");
                 } else {
-                    std::string dllPath = std::string(currentDir) + "\\payload.dll";
+                    std::string dllPath = std::string(currentDir) + "\\bot_payload.dll";
                     ManualMapInject(procId, dllPath.c_str(), logBuffer);
                 }
             }
