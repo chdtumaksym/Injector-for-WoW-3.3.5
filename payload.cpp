@@ -8,6 +8,7 @@
 #include <sstream>
 #include <string>
 #include <cstdarg>
+#include <cstdio>
 
 #define ADDR_S_CUR_MGR          0x00C79CE0
 #define OFFSET_OBJECT_MANAGER   0x2ED0
@@ -20,8 +21,10 @@
 #define CTM_LOOT                6
 #define CTM_ATTACK              11 
 
-#define WM_TOGGLE_BOT           (WM_APP + 1337)
-#define WM_EJECT_BOT            (WM_APP + 1338)
+#define WM_PULSE_BOT            (WM_APP + 1000)
+
+// [!] ТВОЯ ПАПКА С ЧИТОМ (БОЛЬШЕ НИКАКИХ C:\WoWBot)
+#define CHEAT_FOLDER "E:\\Cheats\\WoW Inject\\"
 
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
@@ -31,6 +34,7 @@ typedef void(__fastcall* tClickToMove)(uintptr_t ecx, uintptr_t edx, int type, u
 typedef void(__cdecl* tLuaExecute)(const char* code, const char* fileName, int state);
 
 bool g_Active = false;
+bool g_ThreadRunning = true;
 WNDPROC oWndProc = nullptr;
 HWND g_WoWHwnd = NULL;
 HINSTANCE g_hModule = NULL; 
@@ -38,7 +42,6 @@ HANDLE g_hMutex = NULL;
 
 std::vector<uint64_t> g_Blacklist; 
 uint64_t g_BotTarget = 0; 
-DWORD g_GCD = 0; 
 
 struct Vector3 { float x, y, z; };
 
@@ -54,8 +57,7 @@ void Log(const char* format, ...) {
     if (newMsg == lastMsg) return; 
     lastMsg = newMsg;
 
-    CreateDirectoryA("C:\\WoWBot", NULL);
-    std::ofstream logFile("C:\\WoWBot\\bot_log.txt", std::ios_base::app);
+    std::ofstream logFile(CHEAT_FOLDER "bot_log.txt", std::ios_base::app);
     if (logFile.is_open()) {
         logFile << newMsg << "\n";
         logFile.close();
@@ -109,7 +111,7 @@ void AdvanceTask() {
     g_CurrentTaskIndex++;
     g_CurrentPath.clear();
     
-    std::ofstream progFile("C:\\WoWBot\\progress.txt");
+    std::ofstream progFile(CHEAT_FOLDER "progress.txt");
     if (progFile.is_open()) {
         progFile << g_CurrentProfileName << "\n" << g_CurrentTaskIndex;
         progFile.close();
@@ -118,7 +120,7 @@ void AdvanceTask() {
 }
 
 std::string GetProfilePathFromGUI() {
-    std::ifstream config("C:\\WoWBot\\settings.ini");
+    std::ifstream config(CHEAT_FOLDER "settings.ini");
     std::string profilePath;
     if (config.is_open()) {
         std::getline(config, profilePath);
@@ -171,14 +173,9 @@ void LoadProfile(const std::string& filename) {
             if (!(iss >> task.x >> task.y >> task.z)) { task.x = task.y = task.z = 0.0f; }
             g_Profile.push_back(task);
         }
-        else if (command == "LOAD_PROFILE") {
-            task.type = TASK_LOAD_PROFILE;
-            iss >> task.nextProfile;
-            g_Profile.push_back(task);
-        }
     }
     
-    std::ifstream progRead("C:\\WoWBot\\progress.txt");
+    std::ifstream progRead(CHEAT_FOLDER "progress.txt");
     if (progRead.is_open()) {
         std::string savedProfile;
         int savedIdx;
@@ -388,12 +385,10 @@ void BotPulse() {
                         "if not UnitBuff(p, 'Seal of Righteousness') then CastSpellByName('Seal of Righteousness') end "
                         "if not UnitBuff(p, 'Power Word: Fortitude') then CastSpellByName('Power Word: Fortitude') end "
                         "if not UnitBuff(p, 'Mark of the Wild') then CastSpellByName('Mark of the Wild') end "
-                        "if not UnitBuff(p, 'Demon Armor') then CastSpellByName('Demon Armor') end "
                         "if not UnitCastingInfo(p) then "
                         "  CastSpellByName('Judgement'); CastSpellByName('Crusader Strike'); "
                         "  CastSpellByName('Sinister Strike'); CastSpellByName('Eviscerate'); "
-                        "  CastSpellByName('Fireball'); CastSpellByName('Frostbolt'); "
-                        "  CastSpellByName('Smite'); CastSpellByName('Lightning Bolt'); CastSpellByName('Wrath'); "
+                        "  CastSpellByName('Fireball'); CastSpellByName('Smite'); "
                         "end"
                     );
                     lastAtk = GetTickCount();
@@ -689,92 +684,93 @@ void BotPulse() {
             }
         }
     }
-    else if (task.type == TASK_LOAD_PROFILE) {
-        std::string currentPath = GetProfilePathFromGUI();
-        size_t lastSlash = currentPath.find_last_of("\\/");
-        if (lastSlash != std::string::npos) {
-            std::string newPath = currentPath.substr(0, lastSlash + 1) + task.nextProfile;
-            LoadProfile(newPath);
-        }
-    }
 }
 
 void SafeBotPulse() {
     __try { BotPulse(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-DWORD WINAPI EjectThread(LPVOID) {
-    SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)oWndProc); 
-    KillTimer(g_WoWHwnd, 1337);
-    if (g_hMutex) { ReleaseMutex(g_hMutex); CloseHandle(g_hMutex); }
-    Sleep(100);
-    FreeLibraryAndExitThread(g_hModule, 0); 
-    return 0;
-}
-
 void UpdateStatusFile() {
-    std::ofstream statFile("C:\\WoWBot\\status.txt");
+    std::ofstream statFile(CHEAT_FOLDER "status.txt");
     if (statFile.is_open()) {
         statFile << (g_Active ? "1" : "0");
         statFile.close();
     }
 }
 
-LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    if (uMsg == WM_TOGGLE_BOT) {
-        g_Active = !g_Active;
-        UpdateStatusFile();
-        Log("[!] BOT STATUS: %s", g_Active ? "ACTIVE" : "PAUSED");
-        if (!g_Active) {
-            g_BotTarget = 0; 
-            g_CurrentPath.clear();
-            ExecuteLua("ClearTarget(); CloseLoot(); MoveForwardStop();");
-        } else {
-            std::string profileToLoad = GetProfilePathFromGUI();
-            if (!profileToLoad.empty() && (g_CurrentProfileName != profileToLoad || g_Profile.empty())) {
-                LoadProfile(profileToLoad);
-            }
+void ToggleBot() {
+    g_Active = !g_Active;
+    UpdateStatusFile();
+    Log("[!] BOT STATUS: %s", g_Active ? "ACTIVE" : "PAUSED");
+    if (!g_Active) {
+        g_BotTarget = 0; 
+        g_CurrentPath.clear();
+        ExecuteLua("ClearTarget(); CloseLoot(); MoveForwardStop();");
+    } else {
+        std::string profileToLoad = GetProfilePathFromGUI();
+        if (!profileToLoad.empty() && (g_CurrentProfileName != profileToLoad || g_Profile.empty())) {
+            LoadProfile(profileToLoad);
         }
-        return 1;
     }
-    if (uMsg == WM_EJECT_BOT) {
-        g_Active = false;
-        std::remove("C:\\WoWBot\\status.txt"); 
-        Log("[!] EJECTING BOT...");
-        CreateThread(0, 0, EjectThread, 0, 0, 0);
-        return 1;
-    }
+}
 
-    if (uMsg == WM_TIMER && wParam == 1337) {
-        if (GetAsyncKeyState(VK_END) & 0x8000) {
-            SendMessageA(hWnd, WM_EJECT_BOT, 0, 0);
-        }
+void TriggerEject() {
+    g_ThreadRunning = false;
+    g_Active = false;
+    std::remove(CHEAT_FOLDER "status.txt"); 
+    Log("[!] EJECTING BOT...");
+}
 
-        static bool isPressed = false;
+// [!] ФОНОВЫЙ ПОТОК УПРАВЛЕНИЯ (Решает проблему зависания таймеров)
+DWORD WINAPI BotThread(LPVOID) {
+    while (g_ThreadRunning) {
+        static bool insPressed = false;
         if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
-            if (!isPressed) {
-                isPressed = true;
-                SendMessageA(hWnd, WM_TOGGLE_BOT, 0, 0);
-            }
-        } else {
-            isPressed = false;
+            if (!insPressed) { insPressed = true; ToggleBot(); }
+        } else { insPressed = false; }
+
+        if (GetAsyncKeyState(VK_END) & 0x8000) {
+            TriggerEject();
         }
 
-        static DWORD lastTick = 0;
-        static bool isPulsing = false; 
-        if (g_Active && !isPulsing && (GetTickCount() - lastTick > 150)) {
-            isPulsing = true;
-            SafeBotPulse(); 
-            lastTick = GetTickCount();
-            isPulsing = false;
+        std::ifstream cmdFile(CHEAT_FOLDER "cmd.txt");
+        if (cmdFile.is_open()) {
+            int cmd = -1;
+            cmdFile >> cmd;
+            cmdFile.close();
+            std::remove(CHEAT_FOLDER "cmd.txt");
+
+            if (cmd == 1 && !g_Active) ToggleBot();
+            if (cmd == 0 && g_Active) ToggleBot();
+            if (cmd == 2) TriggerEject();
         }
+
+        if (g_Active) {
+            PostMessageA(g_WoWHwnd, WM_PULSE_BOT, 0, 0); 
+        }
+
+        Sleep(50);
+    }
+    
+    SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)oWndProc); 
+    if (g_hMutex) { ReleaseMutex(g_hMutex); CloseHandle(g_hMutex); }
+    Sleep(100);
+    FreeLibraryAndExitThread(g_hModule, 0);
+    return 0;
+}
+
+LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    // Безопасный вызов Lua только в главном потоке WoW
+    if (uMsg == WM_PULSE_BOT) {
+        SafeBotPulse();
+        return 1;
     }
     return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
 }
 
 DWORD WINAPI Setup(LPVOID) {
-    CreateDirectoryA("C:\\WoWBot", NULL);
-    std::ofstream logFile("C:\\WoWBot\\bot_log.txt", std::ios_base::app);
+    CreateDirectoryA(CHEAT_FOLDER, NULL);
+    std::ofstream logFile(CHEAT_FOLDER "bot_log.txt", std::ios_base::app);
     if (logFile.is_open()) {
         logFile << "\n--- NEW INJECTION ---\n";
         logFile.close();
@@ -785,10 +781,12 @@ DWORD WINAPI Setup(LPVOID) {
     
     g_hMutex = CreateMutexA(NULL, FALSE, "WoWBot_Active_Mutex");
     oWndProc = (WNDPROC)SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)HookedWndProc);
-    SetTimer(g_WoWHwnd, 1337, 50, NULL); 
     
     g_Active = false; 
     UpdateStatusFile();
+    
+    // Запускаем фоновый поток (сердце бота)
+    CreateThread(0, 0, BotThread, 0, 0, 0);
     return 0;
 }
 
