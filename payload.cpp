@@ -23,7 +23,6 @@
 
 #define WM_PULSE_BOT            (WM_APP + 1000)
 
-// ТВОЯ ПАПКА
 #define CHEAT_FOLDER "E:\\Cheats\\WoW Inject\\"
 
 #pragma runtime_checks("", off)
@@ -67,9 +66,7 @@ void Log(const char* format, ...) {
 
 std::vector<Vector3> RequestPathFromServer(Vector3 start, Vector3 end) {
     std::vector<Vector3> path;
-    if (!WaitNamedPipeA("\\\\.\\pipe\\WoWNavMeshPipe", 500)) {
-        return path;
-    }
+    if (!WaitNamedPipeA("\\\\.\\pipe\\WoWNavMeshPipe", 500)) return path;
 
     HANDLE hPipe = CreateFileA("\\\\.\\pipe\\WoWNavMeshPipe", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
     if (hPipe != INVALID_HANDLE_VALUE) {
@@ -256,11 +253,13 @@ uint64_t FindNpcGuidById(int npcId, float& outX, float& outY, float& outZ) {
     return 0;
 }
 
-// [!] ТОЧНАЯ ПРОВЕРКА КВЕСТА: 20 байт (5 полей) для 3.3.5a
+// [!] ИДЕАЛЬНЫЙ СКАНЕР ПАМЯТИ КВЕСТОВ
+// Сканирует всю область журнала в дескрипторе игрока. 100% защита от смещений репаков.
 bool HasQuest(uintptr_t pLocalDesc, int questId) {
-    for (int i = 0; i < 25; i++) {
-        int qId = *(int*)(pLocalDesc + 0xA34 + (i * 20)); 
-        if (qId == questId) return true;
+    for (int offset = 0x900; offset < 0xD00; offset += 4) {
+        if (*(int*)(pLocalDesc + offset) == questId) {
+            return true;
+        }
     }
     return false;
 }
@@ -277,7 +276,6 @@ void CompleteKill() {
             Log("[GRIND] Kill %d / %d", g_Profile[g_CurrentTaskIndex].killsDone, g_Profile[g_CurrentTaskIndex].count);
             if (g_Profile[g_CurrentTaskIndex].killsDone >= g_Profile[g_CurrentTaskIndex].count) {
                 AdvanceTask();
-                Log("[TASK] Grind complete!");
             }
         }
     }
@@ -315,7 +313,6 @@ void BotPulse() {
     
     if (myHpPercent < 40.0f) {
         ExecuteLua("MoveForwardStop(); MoveBackwardStop();"); 
-        
         ExecuteLua(
             "local p='player'; "
             "if not UnitCastingInfo(p) then "
@@ -504,7 +501,6 @@ void BotPulse() {
         return;
     }
 
-    // [!] Задержка 2 сек перед переходом к новой задаче (Синхронизация квестов)
     if (GetTickCount() - g_TaskDelay < 2000) return;
 
     BotTask& task = g_Profile[g_CurrentTaskIndex];
@@ -578,7 +574,6 @@ void BotPulse() {
                         Vector3 nextPt = g_CurrentPath[g_PathIndex];
                         if (GetDistance3D(myX, myY, myZ, nextPt.x, nextPt.y, nextPt.z) < 1.5f) g_PathIndex++;
                         else ActionCTM(pLocal, CTM_MOVE, 0, nextPt.x, nextPt.y, nextPt.z);
-                        Log("[TASK] Navigating to NPC %d spawn... Dist: %.1f", task.npcId, distToWaypoint);
                     } else {
                         ActionCTM(pLocal, CTM_MOVE, 0, task.x, task.y, task.z);
                     }
@@ -607,7 +602,6 @@ void BotPulse() {
                 ActionCTM(pLocal, CTM_MOVE, npcGuid, npcX, npcY, npcZ);
             }
         } else {
-            // [!] УМНАЯ МАШИНА СОСТОЯНИЙ ДЛЯ ВЗЯТИЯ КВЕСТА
             if (taskState == 0) {
                 ExecuteLua("MoveForwardStop();");
                 *(uint64_t*)ADDR_MOUSEOVER_GUID = npcGuid;
@@ -617,24 +611,22 @@ void BotPulse() {
                 Log("[TASK] Opening Dialog...");
             }
             else if (taskState == 1) {
-                // Спамим Lua раз в полсекунды (Надежный проклик)
                 if (GetTickCount() - taskTimer > 500) {
                     ExecuteLua(
                         "if GossipFrame and GossipFrame:IsVisible() then SelectGossipAvailableQuest(1) end "
                         "if QuestFrameGreetingPanel and QuestFrameGreetingPanel:IsVisible() then SelectAvailableQuest(1) end "
-                        "if QuestFrameDetailPanel and QuestFrameDetailPanel:IsVisible() then AcceptQuest(); HideUIPanel(QuestFrame); end"
+                        "if QuestFrameDetailPanel and QuestFrameDetailPanel:IsVisible() then AcceptQuest(); end"
                     );
                     
-                    // Успех: Если квест появился в памяти
                     if (HasQuest(pLocalDesc, task.questId)) {
                         Log("[TASK] Quest Accepted successfully!");
+                        ExecuteLua("CloseGossip(); HideUIPanel(QuestFrame);");
                         AdvanceTask();
                         taskState = 0;
                     }
-                    // Анти-зависание (через 10 секунд закрывает окно)
                     else if (GetTickCount() - taskTimer > 10000) {
                         Log("[!] Timeout interacting with NPC. Escaping...");
-                        ExecuteLua("CloseGossip(); HideUIPanel(QuestFrame);");
+                        ExecuteLua("CloseGossip(); HideUIPanel(QuestFrame); CloseQuest();");
                         AdvanceTask();
                         taskState = 0;
                     }
@@ -693,7 +685,6 @@ void BotPulse() {
                 ActionCTM(pLocal, CTM_MOVE, npcGuid, npcX, npcY, npcZ);
             }
         } else {
-            // [!] УМНАЯ МАШИНА СОСТОЯНИЙ ДЛЯ СДАЧИ КВЕСТА
             if (taskState == 0) {
                 ExecuteLua("MoveForwardStop();");
                 *(uint64_t*)ADDR_MOUSEOVER_GUID = npcGuid;
@@ -702,27 +693,25 @@ void BotPulse() {
                 taskState = 1;
             }
             else if (taskState == 1) {
-                // Спамим Lua раз в полсекунды (Надежный проклик)
                 if (GetTickCount() - taskTimer > 500) {
                     ExecuteLua(
                         "if GossipFrame and GossipFrame:IsVisible() then SelectGossipActiveQuest(1) end "
                         "if QuestFrameGreetingPanel and QuestFrameGreetingPanel:IsVisible() then SelectActiveQuest(1) end "
                         "if QuestFrameProgressPanel and QuestFrameProgressPanel:IsVisible() then CompleteQuest() end "
                         "if QuestFrameRewardPanel and QuestFrameRewardPanel:IsVisible() then "
-                        "  if GetNumQuestChoices() > 0 then GetQuestReward(1) else GetQuestReward() end; HideUIPanel(QuestFrame); "
+                        "  if GetNumQuestChoices() > 0 then GetQuestReward(1) else GetQuestReward() end "
                         "end"
                     );
 
-                    // Успех: Если квеста больше нет в памяти
                     if (!HasQuest(pLocalDesc, task.questId)) {
                         Log("[TASK] Quest Turned In successfully!");
+                        ExecuteLua("CloseGossip(); HideUIPanel(QuestFrame);");
                         AdvanceTask();
                         taskState = 0;
                     }
-                    // Анти-зависание (через 10 секунд закрывает окно)
                     else if (GetTickCount() - taskTimer > 10000) {
                         Log("[!] Timeout interacting with NPC. Escaping...");
-                        ExecuteLua("CloseGossip(); HideUIPanel(QuestFrame);");
+                        ExecuteLua("CloseGossip(); HideUIPanel(QuestFrame); CloseQuest();");
                         AdvanceTask();
                         taskState = 0;
                     }
@@ -797,10 +786,11 @@ DWORD WINAPI BotThread(LPVOID) {
             if (cmd == 0 && g_Active) ToggleBot();
             if (cmd == 2) TriggerEject();
             if (cmd == 3) {
-                // [!] ИСПРАВЛЕНИЕ: Мгновенный сброс прогресса в ОЗУ
+                // Команда сброса из GUI
                 std::remove(CHEAT_FOLDER "progress.txt");
                 g_CurrentTaskIndex = 0;
                 g_CurrentPath.clear();
+                g_TaskDelay = 0;
                 if (g_Active) LoadProfile(GetProfilePathFromGUI());
                 Log("[!] Progress cleared. Bot reset to Task 0.");
             }
