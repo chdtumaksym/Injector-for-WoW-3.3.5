@@ -7,6 +7,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <cstdarg>
 
 #define ADDR_S_CUR_MGR          0x00C79CE0
 #define OFFSET_OBJECT_MANAGER   0x2ED0
@@ -27,6 +28,7 @@ typedef void(__fastcall* tClickToMove)(uintptr_t ecx, uintptr_t edx, int type, u
 typedef void(__cdecl* tLuaExecute)(const char* code, const char* fileName, int state);
 
 bool g_Active = false;
+WNDPROC oWndProc = nullptr;
 HWND g_WoWHwnd = NULL;
 HINSTANCE g_hModule = NULL; 
 
@@ -34,6 +36,33 @@ std::vector<uint64_t> g_Blacklist;
 uint64_t g_BotTarget = 0; 
 DWORD g_GCD = 0; 
 
+// ==========================================
+// --- СИСТЕМА ЛОГИРОВАНИЯ В ФАЙЛ (ДЛЯ GUI) ---
+// ==========================================
+void Log(const char* format, ...) {
+    char buffer[512];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+
+    // Анти-спам: не пишем одну и ту же строчку 100 раз подряд
+    static std::string lastMsg = "";
+    std::string newMsg(buffer);
+    if (newMsg == lastMsg) return; 
+    lastMsg = newMsg;
+
+    CreateDirectoryA("C:\\WoWBot", NULL);
+    std::ofstream logFile("C:\\WoWBot\\bot_log.txt", std::ios_base::app);
+    if (logFile.is_open()) {
+        logFile << newMsg << "\n";
+        logFile.close();
+    }
+}
+
+// ==========================================
+// --- СИСТЕМА ПРОФИЛЕЙ ---
+// ==========================================
 enum TaskType { TASK_GOTO, TASK_ACCEPT_QUEST, TASK_TURN_IN_QUEST, TASK_GRIND, TASK_LOAD_PROFILE };
 
 struct BotTask {
@@ -68,7 +97,7 @@ void LoadProfile(const std::string& filename) {
     
     std::ifstream file(filename);
     if (!file.is_open()) {
-        printf("[-] ERROR: Could not open profile %s\n", filename.c_str());
+        Log("[-] ERROR: Could not open profile %s", filename.c_str());
         return;
     }
 
@@ -108,7 +137,7 @@ void LoadProfile(const std::string& filename) {
             g_Profile.push_back(task);
         }
     }
-    printf("[+] Profile loaded! Total tasks: %d\n", g_Profile.size());
+    Log("[+] Profile loaded! Total tasks: %d", g_Profile.size());
 }
 
 float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) {
@@ -130,33 +159,20 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
     static uint64_t lastGuid = 0;
     static int lastType = 0;
     static float lastX = 0, lastY = 0, lastZ = 0;
+    static DWORD lastTime = 0;
 
     float diff = sqrt(pow(x - lastX, 2) + pow(y - lastY, 2) + pow(z - lastZ, 2));
 
-    if (guid != lastGuid || type != lastType || diff > 1.5f) {
+    // [!] ФИКС ПЕРЕХВАТА УПРАВЛЕНИЯ: Обновляем приказ каждые 1.5 сек, даже если координаты те же
+    if (guid != lastGuid || type != lastType || diff > 1.5f || GetTickCount() - lastTime > 1500) {
         uint64_t ctmGuid = guid;
         float ctmPos[3] = { x, y, z };
         ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, type, &ctmGuid, ctmPos, 0.5f);
         
         lastGuid = guid; lastType = type;
         lastX = x; lastY = y; lastZ = z;
+        lastTime = GetTickCount();
     }
-}
-
-bool TryCast(int vkKey, DWORD& lastCastTime, DWORD cooldown, DWORD castTime = 1500) {
-    if (GetTickCount() < g_GCD) return false; 
-    if (GetTickCount() - lastCastTime < cooldown) return false; 
-
-    UINT scanCode = MapVirtualKey(vkKey, MAPVK_VK_TO_VSC);
-    LPARAM lParamDown = (scanCode << 16) | 1;
-    LPARAM lParamUp = (scanCode << 16) | (1 << 30) | (1 << 31) | 1;
-
-    PostMessage(g_WoWHwnd, WM_KEYDOWN, vkKey, lParamDown);
-    PostMessage(g_WoWHwnd, WM_KEYUP, vkKey, lParamUp);
-
-    lastCastTime = GetTickCount();
-    g_GCD = GetTickCount() + castTime; 
-    return true;
 }
 
 uint64_t FindNpcGuidById(int npcId, float& outX, float& outY, float& outZ) {
@@ -192,10 +208,10 @@ void CompleteKill() {
     if (!g_Profile.empty() && g_CurrentTaskIndex < g_Profile.size()) {
         if (g_Profile[g_CurrentTaskIndex].type == TASK_GRIND) {
             g_Profile[g_CurrentTaskIndex].killsDone++;
-            printf("\n[GRIND] Kill %d / %d\n", g_Profile[g_CurrentTaskIndex].killsDone, g_Profile[g_CurrentTaskIndex].count);
+            Log("[GRIND] Kill %d / %d", g_Profile[g_CurrentTaskIndex].killsDone, g_Profile[g_CurrentTaskIndex].count);
             if (g_Profile[g_CurrentTaskIndex].killsDone >= g_Profile[g_CurrentTaskIndex].count) {
                 g_CurrentTaskIndex++;
-                printf("[TASK] Grind complete! Moving to next task.\n");
+                Log("[TASK] Grind complete! Moving to next task.");
             }
         }
     }
@@ -233,7 +249,7 @@ void BotPulse() {
 
     if (myHpPercent < 40.0f) {
         ExecuteLua("MoveForwardStop(); MoveBackwardStop();"); 
-        printf("[SURVIVAL] HP %.1f%%! Pausing tasks to heal...\n", myHpPercent);
+        Log("[SURVIVAL] HP %.1f%%! Pausing tasks to heal...", myHpPercent);
         return; 
     }
 
@@ -277,7 +293,7 @@ void BotPulse() {
             isLooting = false; 
             deathTime = 0;
             ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
-            printf("[COMBAT] Attacking... Dist: %.1f      \r", dist);
+            Log("[COMBAT] Attacking... Dist: %.1f", dist);
             
             if (dist < 5.0f) {
                 static DWORD lastAtk = 0;
@@ -372,7 +388,7 @@ void BotPulse() {
     }
 
     if (g_Profile.empty() || g_CurrentTaskIndex >= g_Profile.size()) {
-        printf("[IDLE] Profile finished or not loaded. Waiting...      \r");
+        Log("[IDLE] Profile finished or not loaded. Waiting...");
         return;
     }
 
@@ -382,15 +398,14 @@ void BotPulse() {
     if (task.type == TASK_GOTO) {
         float distToWaypoint = GetDistance3D(myX, myY, myZ, task.x, task.y, task.z);
         
-        // [!] АНТИ-ЗАСТРЕВАНИЕ (ANTI-STUCK) [!]
         static float lastDist = 0;
         static DWORD stuckTimer = 0;
         
         if (abs(distToWaypoint - lastDist) < 0.5f) {
             if (GetTickCount() - stuckTimer > 3000) {
-                printf("\n[!] STUCK ON WALL! Jumping...\n");
+                Log("[!] STUCK ON WALL! Jumping...");
                 ExecuteLua("JumpOrAscendStart();");
-                stuckTimer = GetTickCount(); // Сбрасываем таймер после прыжка
+                stuckTimer = GetTickCount(); 
             }
         } else {
             lastDist = distToWaypoint;
@@ -398,11 +413,11 @@ void BotPulse() {
         }
 
         if (distToWaypoint < 2.0f) {
-            printf("\n[TASK] Reached waypoint %d!\n", g_CurrentTaskIndex);
+            Log("[TASK] Reached waypoint %d!", g_CurrentTaskIndex);
             g_CurrentTaskIndex++; 
         } else {
             ActionCTM(pLocal, CTM_MOVE, 0, task.x, task.y, task.z);
-            printf("[TASK] Moving to Waypoint %d... Dist: %.1f      \r", g_CurrentTaskIndex, distToWaypoint);
+            Log("[TASK] Moving to Waypoint %d... Dist: %.1f", g_CurrentTaskIndex, distToWaypoint);
         }
     }
     else if (task.type == TASK_ACCEPT_QUEST || task.type == TASK_TURN_IN_QUEST) {
@@ -410,7 +425,7 @@ void BotPulse() {
         uint64_t npcGuid = FindNpcGuidById(task.npcId, npcX, npcY, npcZ);
         
         if (!npcGuid) {
-            printf("[TASK] Looking for NPC %d...      \r", task.npcId);
+            Log("[TASK] Looking for NPC %d...", task.npcId);
             return;
         }
 
@@ -419,7 +434,7 @@ void BotPulse() {
         
         if (distToNpc > 4.5f) {
             ActionCTM(pLocal, CTM_MOVE, npcGuid, npcX, npcY, npcZ);
-            printf("[TASK] Approaching NPC %d... Dist: %.1f      \r", task.npcId, distToNpc);
+            Log("[TASK] Approaching NPC %d... Dist: %.1f", task.npcId, distToNpc);
             taskTimer = 0;
         } else {
             if (taskTimer == 0) {
@@ -427,15 +442,15 @@ void BotPulse() {
                 *(uint64_t*)ADDR_MOUSEOVER_GUID = npcGuid;
                 ExecuteLua("InteractUnit('mouseover')"); 
                 taskTimer = GetTickCount();
-                printf("\n[TASK] Opening Dialog with NPC...\n");
+                Log("[TASK] Opening Dialog with NPC...");
             }
             else if (GetTickCount() - taskTimer > 1500) {
                 if (task.type == TASK_ACCEPT_QUEST) {
                     ExecuteLua("SelectGossipAvailableQuest(1); SelectAvailableQuest(1); AcceptQuest();");
-                    printf("[TASK] Quest Accepted!\n");
+                    Log("[TASK] Quest Accepted!");
                 } else {
                     ExecuteLua("SelectGossipActiveQuest(1); SelectActiveQuest(1); CompleteQuest(); GetQuestReward(1);");
-                    printf("[TASK] Quest Turned In!\n");
+                    Log("[TASK] Quest Turned In!");
                 }
                 g_CurrentTaskIndex++;
                 taskTimer = 0;
@@ -443,10 +458,10 @@ void BotPulse() {
         }
     }
     else if (task.type == TASK_GRIND) {
-        printf("[TASK] Grinding mode active. Looking for mob ID %d... (%d/%d)      \r", task.npcId, task.killsDone, task.count);
+        Log("[TASK] Grinding mode active. Looking for mob ID %d... (%d/%d)", task.npcId, task.killsDone, task.count);
     }
     else if (task.type == TASK_LOAD_PROFILE) {
-        printf("\n[SYSTEM] Loading next profile: %s\n", task.nextProfile);
+        Log("[SYSTEM] Loading next profile: %s", task.nextProfile);
         std::string currentPath = GetProfilePathFromGUI();
         size_t lastSlash = currentPath.find_last_of("\\/");
         if (lastSlash != std::string::npos) {
@@ -460,32 +475,27 @@ void SafeBotPulse() {
     __try { BotPulse(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-DWORD WINAPI BotThread(LPVOID) {
-    AllocConsole(); 
-    freopen("CONOUT$", "w", stdout);
-    printf("--- Bot v163: The Anti-Stuck Update ---\n");
-    printf("[+] Console Hints Restored.\n");
-    printf("[+] Anti-Stuck (Jump) Logic Added.\n");
-    printf("[!] Press [F9] in-game to save Waypoint to C:\\WoWBot\\RecordedProfile.txt\n");
-    printf("[!] Press [INSERT] to Start/Pause.\n");
-    printf("[!] Press [END] to Unload the Bot.\n\n");
+DWORD WINAPI EjectThread(LPVOID) {
+    SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)oWndProc); 
+    KillTimer(g_WoWHwnd, 1337);
+    Sleep(100);
+    FreeLibraryAndExitThread(g_hModule, 0); 
+    return 0;
+}
 
-    bool isInsertPressed = false;
-    bool isF9Pressed = false;
-    DWORD lastPulse = 0;
-
-    while (true) {
+LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (uMsg == WM_TIMER && wParam == 1337) {
         if (GetAsyncKeyState(VK_END) & 0x8000) {
             g_Active = false;
-            printf("\n[!] EJECTING BOT... You can close this console.\n");
-            Sleep(100);
-            FreeConsole();
-            FreeLibraryAndExitThread(g_hModule, 0);
+            Log("[!] EJECTING BOT...");
+            CreateThread(0, 0, EjectThread, 0, 0, 0);
+            return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
         }
 
+        static bool f9Pressed = false;
         if (GetAsyncKeyState(VK_F9) & 0x8000) {
-            if (!isF9Pressed) {
-                isF9Pressed = true;
+            if (!f9Pressed) {
+                f9Pressed = true;
                 uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
                 uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
                 if (mgr) {
@@ -503,7 +513,7 @@ DWORD WINAPI BotThread(LPVOID) {
                             outfile.close();
                             
                             Beep(1000, 100);
-                            printf("\n[+] Waypoint Saved: %.2f %.2f %.2f\n", x, y, z);
+                            Log("[+] Waypoint Saved: %.2f %.2f %.2f", x, y, z);
                             break;
                         }
                         cur = *(uintptr_t*)(cur + 0x3C);
@@ -511,22 +521,22 @@ DWORD WINAPI BotThread(LPVOID) {
                 }
             }
         } else {
-            isF9Pressed = false;
+            f9Pressed = false;
         }
 
+        static bool isPressed = false;
         if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
-            if (!isInsertPressed) {
-                isInsertPressed = true;
+            if (!isPressed) {
+                isPressed = true;
                 g_Active = !g_Active;
                 Beep(g_Active ? 800 : 400, 100);
-                printf("\n\n[!] BOT STATUS: %s\n", g_Active ? "ACTIVE" : "PAUSED");
+                Log("[!] BOT STATUS: %s", g_Active ? "ACTIVE" : "PAUSED");
                 
                 if (g_Active) {
                     std::string profileToLoad = GetProfilePathFromGUI();
-                    if (!profileToLoad.empty()) {
+                    // [!] ФИКС: Загружаем профиль только если он изменился или пуст!
+                    if (!profileToLoad.empty() && (g_CurrentProfileName != profileToLoad || g_Profile.empty())) {
                         LoadProfile(profileToLoad);
-                    } else {
-                        printf("[-] No profile selected in GUI!\n");
                     }
                 } else { 
                     g_BotTarget = 0; 
@@ -535,25 +545,40 @@ DWORD WINAPI BotThread(LPVOID) {
                 }
             }
         } else {
-            isInsertPressed = false;
+            isPressed = false;
         }
 
-        if (g_Active && (GetTickCount() - lastPulse > 150)) {
-            SafeBotPulse();
-            lastPulse = GetTickCount();
+        static DWORD lastTick = 0;
+        static bool isPulsing = false; 
+        if (g_Active && !isPulsing && (GetTickCount() - lastTick > 150)) {
+            isPulsing = true;
+            SafeBotPulse(); 
+            lastTick = GetTickCount();
+            isPulsing = false;
         }
-
-        Sleep(50); 
     }
+    return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
+}
+
+DWORD WINAPI Setup(LPVOID) {
+    // Очищаем лог при новом инжекте
+    CreateDirectoryA("C:\\WoWBot", NULL);
+    std::ofstream logFile("C:\\WoWBot\\bot_log.txt", std::ios_base::trunc);
+    logFile.close();
+
+    Log("--- Bot Core Loaded ---");
+    g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
+    if (!g_WoWHwnd) return 0;
+    oWndProc = (WNDPROC)SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)HookedWndProc);
+    SetTimer(g_WoWHwnd, 1337, 50, NULL); 
     return 0;
 }
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
     if (r == DLL_PROCESS_ATTACH) {
         g_hModule = h; 
-        g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
         DisableThreadLibraryCalls(h);
-        CreateThread(0, 0, BotThread, 0, 0, 0);
+        CreateThread(0, 0, Setup, 0, 0, 0);
     }
     return TRUE;
 }
