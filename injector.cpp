@@ -11,9 +11,10 @@
 #include <vector>
 #include <string>
 #include <filesystem>
+#include <cstdio>
 
-#define WM_TOGGLE_BOT (WM_APP + 1337)
-#define WM_EJECT_BOT  (WM_APP + 1338)
+// ТВОЯ ПАПКА
+#define CHEAT_FOLDER "E:\\Cheats\\WoW Inject\\"
 
 struct MANUAL_MAPPING_DATA {
     typedef HMODULE(WINAPI* pLoadLibraryA)(LPCSTR);
@@ -101,7 +102,9 @@ bool ManualMapInject(DWORD pid, const char* dllPath, std::string& guiLog) {
     HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!hProc) return false;
 
-    std::remove("C:\\WoWBot\\status.txt");
+    // Очистка перед инжектом
+    std::remove(CHEAT_FOLDER "status.txt");
+    std::remove(CHEAT_FOLDER "cmd.txt");
 
     auto* pNt = reinterpret_cast<IMAGE_NT_HEADERS*>(buf.data() + reinterpret_cast<IMAGE_DOS_HEADER*>(buf.data())->e_lfanew);
     BYTE* pTarget = (BYTE*)VirtualAllocEx(hProc, nullptr, pNt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -146,23 +149,16 @@ bool CreateDeviceD3D(HWND hWnd) {
     DXGI_SWAP_CHAIN_DESC sd;
     ZeroMemory(&sd, sizeof(sd));
     sd.BufferCount = 2;
-    sd.BufferDesc.Width = 0;
-    sd.BufferDesc.Height = 0;
     sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.BufferDesc.RefreshRate.Numerator = 60;
-    sd.BufferDesc.RefreshRate.Denominator = 1;
-    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.OutputWindow = hWnd;
     sd.SampleDesc.Count = 1;
-    sd.SampleDesc.Quality = 0;
     sd.Windowed = TRUE;
     sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
-    UINT createDeviceFlags = 0;
     D3D_FEATURE_LEVEL featureLevel;
     const D3D_FEATURE_LEVEL featureLevelArray[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0, };
-    if (D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext) != S_OK)
+    if (D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext) != S_OK)
         return false;
 
     ID3D11Texture2D* pBackBuffer;
@@ -182,24 +178,16 @@ void CleanupDeviceD3D() {
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) return true;
-    switch (msg) {
-    case WM_SIZE:
-        if (g_pd3dDevice != nullptr && wParam != SIZE_MINIMIZED) {
-            if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = nullptr; }
-            g_pSwapChain->ResizeBuffers(0, (UINT)LOWORD(lParam), (UINT)HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
-            ID3D11Texture2D* pBackBuffer;
-            g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
-            g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
-            pBackBuffer->Release();
-        }
-        return 0;
-    case WM_SYSCOMMAND:
-        if ((wParam & 0xfff0) == SC_KEYMENU) return 0;
-        break;
-    case WM_DESTROY:
-        PostQuitMessage(0);
+    if (msg == WM_SIZE && g_pd3dDevice != nullptr && wParam != SIZE_MINIMIZED) {
+        if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = nullptr; }
+        g_pSwapChain->ResizeBuffers(0, (UINT)LOWORD(lParam), (UINT)HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
+        ID3D11Texture2D* pBackBuffer;
+        g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
+        g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
+        pBackBuffer->Release();
         return 0;
     }
+    if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
 
@@ -207,42 +195,21 @@ void SetupCS2Style() {
     ImGuiStyle& style = ImGui::GetStyle();
     style.WindowRounding = 6.0f;
     style.FrameRounding = 4.0f;
-    style.GrabRounding = 4.0f;
     style.Colors[ImGuiCol_WindowBg] = ImVec4(0.11f, 0.11f, 0.13f, 1.00f);
-    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.18f, 0.18f, 0.20f, 1.00f);
-    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.24f, 0.24f, 0.26f, 1.00f);
     style.Colors[ImGuiCol_Button] = ImVec4(0.85f, 0.50f, 0.10f, 1.00f); 
     style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.95f, 0.60f, 0.20f, 1.00f);
     style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.75f, 0.40f, 0.05f, 1.00f);
-    style.Colors[ImGuiCol_Text] = ImVec4(0.95f, 0.95f, 0.95f, 1.00f);
-    style.Colors[ImGuiCol_Header] = ImVec4(0.85f, 0.50f, 0.10f, 0.50f);
-    style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.85f, 0.50f, 0.10f, 0.80f);
 }
 
 std::string ReadBotLog() {
-    std::ifstream logFile("C:\\WoWBot\\bot_log.txt");
+    std::ifstream logFile(CHEAT_FOLDER "bot_log.txt");
     if (!logFile.is_open()) return "Waiting for bot to start...\n";
-    std::string content((std::istreambuf_iterator<char>(logFile)), std::istreambuf_iterator<char>());
-    return content;
+    return std::string((std::istreambuf_iterator<char>(logFile)), std::istreambuf_iterator<char>());
 }
 
-void SaveLogToFile(HWND hwndOwner, const std::string& logData) {
-    OPENFILENAMEA ofn;
-    char szFile[260] = { 0 };
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = hwndOwner;
-    ofn.lpstrFile = szFile;
-    ofn.nMaxFile = sizeof(szFile);
-    ofn.lpstrFilter = "Text Files (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
-    ofn.nFilterIndex = 1;
-    ofn.lpstrDefExt = "txt";
-    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
-
-    if (GetSaveFileNameA(&ofn) == TRUE) {
-        std::ofstream out(ofn.lpstrFile);
-        if (out.is_open()) out << logData;
-    }
+void SendCommand(int cmd) {
+    std::ofstream f(CHEAT_FOLDER "cmd.txt");
+    if (f.is_open()) { f << cmd; f.close(); }
 }
 
 int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
@@ -263,10 +230,7 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     int selectedProfile = 0;
     std::string guiLog = "";
 
-    char currentDir[MAX_PATH];
-    GetCurrentDirectoryA(MAX_PATH, currentDir);
-    std::string profilesDir = std::string(currentDir) + "\\Profiles";
-    
+    std::string profilesDir = std::string(CHEAT_FOLDER) + "Profiles";
     if (std::filesystem::exists(profilesDir)) {
         for (const auto& entry : std::filesystem::directory_iterator(profilesDir)) {
             if (entry.path().extension() == ".txt") profiles.push_back(entry.path().filename().string());
@@ -282,27 +246,20 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
         if (done) break;
 
-        // Читаем статус через Named Mutex (Истинная проверка наличия DLL в памяти)
-        int botStatus = -1; // -1: Not injected, 0: Paused, 1: Active
-        HWND hwndWow = FindWindowA(NULL, "World of Warcraft");
-        if (hwndWow) {
-            HANDLE hMutex = OpenMutexA(MUTEX_ALL_ACCESS, FALSE, "WoWBot_Active_Mutex");
-            if (hMutex) {
-                CloseHandle(hMutex);
-                std::ifstream stat("C:\\WoWBot\\status.txt");
-                if (stat.is_open()) {
-                    stat >> botStatus;
-                    stat.close();
-                }
-            } else {
-                std::remove("C:\\WoWBot\\status.txt");
-            }
+        // Надежная проверка мьютекса
+        int botStatus = -1; 
+        HANDLE hMutex = OpenMutexA(MUTEX_ALL_ACCESS, FALSE, "WoWBot_Active_Mutex");
+        if (hMutex) {
+            CloseHandle(hMutex);
+            std::ifstream stat(CHEAT_FOLDER "status.txt");
+            if (stat.is_open()) { stat >> botStatus; stat.close(); }
+        } else {
+            std::remove(CHEAT_FOLDER "status.txt");
         }
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
-
         ImGui::SetNextWindowPos(ImVec2(0, 0));
         ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
         ImGui::Begin("Main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize);
@@ -333,52 +290,40 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         if (botStatus == -1) {
             if (ImGui::Button("INJECT BOT", ImVec2(-1, 40))) {
                 if (!profiles.empty()) {
-                    CreateDirectoryA("C:\\WoWBot", NULL);
                     std::string fullPath = profilesDir + "\\" + profiles[selectedProfile];
-                    std::ofstream settingsFile("C:\\WoWBot\\settings.ini");
+                    std::ofstream settingsFile(CHEAT_FOLDER "settings.ini");
                     settingsFile << fullPath;
                     settingsFile.close();
 
                     DWORD procId = GetProcessId("Wow.exe");
                     if (!procId) guiLog += "[-] Error: Wow.exe not found!\n";
                     else {
-                        std::string dllPath = std::string(currentDir) + "\\bot_payload.dll";
+                        std::string dllPath = std::string(CHEAT_FOLDER) + "bot_payload.dll";
                         ManualMapInject(procId, dllPath.c_str(), guiLog);
                     }
                 }
             }
         } else {
             if (ImGui::Button(botStatus == 1 ? "PAUSE BOT (INSERT)" : "START BOT (INSERT)", ImVec2(ImGui::GetWindowWidth() / 2 - 12, 40))) {
-                PostMessageA(hwndWow, WM_TOGGLE_BOT, 0, 0);
+                SendCommand(botStatus == 1 ? 0 : 1);
             }
             ImGui::SameLine();
             if (ImGui::Button("EJECT BOT (END)", ImVec2(ImGui::GetWindowWidth() / 2 - 12, 40))) {
-                PostMessageA(hwndWow, WM_EJECT_BOT, 0, 0);
+                SendCommand(2);
             }
         }
 
-        ImGui::Spacing();
-        ImGui::Separator();
-
+        ImGui::Spacing(); ImGui::Separator();
         std::string liveLog = ReadBotLog();
 
-        if (ImGui::Button("Copy to Clipboard")) ImGui::SetClipboardText(liveLog.c_str());
-        ImGui::SameLine();
-        if (ImGui::Button("Save to File...")) SaveLogToFile(hwnd, liveLog);
-        ImGui::SameLine();
         if (ImGui::Button("Clear Progress")) {
-            std::remove("C:\\WoWBot\\progress.txt");
-            guiLog += "[!] Progress file cleared.\n";
+            std::remove(CHEAT_FOLDER "progress.txt");
         }
 
         ImGui::Spacing();
-        
         ImGui::BeginChild("LogRegion", ImVec2(0, 0), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
         ImGui::TextUnformatted(liveLog.c_str());
-        
-        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 10.0f) {
-            ImGui::SetScrollHereY(1.0f);
-        }
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 10.0f) ImGui::SetScrollHereY(1.0f);
         ImGui::EndChild();
 
         ImGui::End();
