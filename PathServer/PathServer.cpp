@@ -29,16 +29,21 @@ dtQueryFilter g_Filter;
 
 std::vector<std::string> g_LoadedTiles;
 
+// Идеально точный размер тайла в WoW
+const float TILE_SIZE = 1600.0f / 3.0f; 
+const float CENTER_POINT = 32.0f * TILE_SIZE;
+
+// [!] ИСПРАВЛЕНО: Истинная конвертация координат TrinityCore 3.3.5
 void WoWToRecast(const Vector3& wow, float* recast) {
-    recast[0] = wow.y;
+    recast[0] = CENTER_POINT - wow.x;
     recast[1] = wow.z;
-    recast[2] = wow.x;
+    recast[2] = CENTER_POINT - wow.y;
 }
 
 void RecastToWoW(const float* recast, Vector3& wow) {
-    wow.x = recast[2];
-    wow.y = recast[0];
+    wow.x = CENTER_POINT - recast[0];
     wow.z = recast[1];
+    wow.y = CENTER_POINT - recast[2];
 }
 
 void InitNavMesh() {
@@ -48,14 +53,13 @@ void InitNavMesh() {
     dtNavMeshParams params;
     memset(&params, 0, sizeof(params));
     
-    // [!] ИСПРАВЛЕНО: Идеально точный размер тайла без погрешностей float
-    float tileSize = 1600.0f / 3.0f; 
-    params.orig[0] = -32.0f * tileSize;
+    // В TrinityCore центр координат для Detour всегда 0,0,0
+    params.orig[0] = 0.0f;
     params.orig[1] = 0.0f;
-    params.orig[2] = -32.0f * tileSize;
+    params.orig[2] = 0.0f;
     
-    params.tileWidth = tileSize;
-    params.tileHeight = tileSize;
+    params.tileWidth = TILE_SIZE;
+    params.tileHeight = TILE_SIZE;
     params.maxTiles = 16384;     
     params.maxPolys = 1 << 22;   
     
@@ -64,21 +68,17 @@ void InitNavMesh() {
     
     g_Filter.setIncludeFlags(0xFFFF);
     g_Filter.setExcludeFlags(0);
-    std::cout << "[+] Detour NavMesh Engine Initialized (True Coordinates)!\n";
+    std::cout << "[+] Detour NavMesh Engine Initialized (TrinityCore Coordinates)!\n";
 }
 
 void GetGridCoordinates(float x, float y, int& gridX, int& gridY) {
-    float tileSize = 1600.0f / 3.0f;
-    gridX = (int)(32.0f - (x / tileSize));
-    gridY = (int)(32.0f - (y / tileSize));
+    gridX = (int)(32.0f - (x / TILE_SIZE));
+    gridY = (int)(32.0f - (y / TILE_SIZE));
 }
 
 bool LoadTile(int mapId, int gridX, int gridY) {
-    // [!] ИСПРАВЛЕНО: Истинные координаты тайлов Detour в TrinityCore
-    int navX = 63 - gridY;
-    int navY = 63 - gridX;
-    
-    if (g_NavMesh->getTileAt(navX, navY, 0)) return true; 
+    // Теперь координаты тайлов Detour идеально совпадают с сеткой WoW
+    if (g_NavMesh->getTileAt(gridX, gridY, 0)) return true; 
 
     char filename[512];
     sprintf_s(filename, "E:\\Cheats\\WoW Inject\\mmaps\\%03d%02d%02d.mmtile", mapId, gridX, gridY);
@@ -105,7 +105,7 @@ bool LoadTile(int mapId, int gridX, int gridY) {
     
     if (dtStatusSucceed(status)) {
         g_LoadedTiles.push_back(std::string(filename));
-        std::cout << "[+] Loaded NavMesh Tile: " << gridX << "_" << gridY << " (Detour: " << navX << "," << navY << ")\n";
+        std::cout << "[+] Loaded NavMesh Tile: " << gridX << "_" << gridY << "\n";
         return true;
     } else {
         dtFree(data);
@@ -135,8 +135,8 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
     WoWToRecast(start, startPos);
     WoWToRecast(end, endPos);
     
-    // [!] ИСПРАВЛЕНО: Огромный радиус поиска (50 ярдов по X/Z, 100 ярдов по высоте Y)
-    float extents[3] = { 50.0f, 100.0f, 50.0f };
+    // Радиус поиска: 10 ярдов по горизонтали, 20 ярдов по вертикали (высоте)
+    float extents[3] = { 10.0f, 20.0f, 10.0f };
 
     dtPolyRef startRef = 0, endRef = 0;
     g_NavQuery->findNearestPoly(startPos, extents, &g_Filter, &startRef, 0);
@@ -177,7 +177,7 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
 }
 
 int main() {
-    std::cout << "--- WoW NavMesh Server (True Coordinates) ---\n";
+    std::cout << "--- WoW NavMesh Server (TrinityCore Edition) ---\n";
     InitNavMesh();
 
     SECURITY_DESCRIPTOR sd;
@@ -199,7 +199,6 @@ int main() {
                 PathRequest req;
                 DWORD bytesRead;
                 if (ReadFile(hPipe, &req, sizeof(PathRequest), &bytesRead, NULL)) {
-                    // Теперь выводим и Z координату для удобства дебага
                     std::cout << "[+] Request: " << req.start.x << "," << req.start.y << "," << req.start.z 
                               << " -> " << req.end.x << "," << req.end.y << "," << req.end.z << "\n";
                     
