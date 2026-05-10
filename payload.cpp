@@ -20,6 +20,9 @@
 #define CTM_LOOT                6
 #define CTM_ATTACK              11 
 
+#define WM_TOGGLE_BOT           (WM_APP + 1337)
+#define WM_EJECT_BOT            (WM_APP + 1338)
+
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
 #pragma strict_gs_check(off)
@@ -75,12 +78,8 @@ std::vector<Vector3> RequestPathFromServer(Vector3 start, Vector3 end) {
                 path.resize(count);
                 ReadFile(hPipe, path.data(), count * sizeof(Vector3), &bytesRead, NULL);
             }
-        } else {
-            Log("[-] Failed to write to PathServer pipe.");
         }
         CloseHandle(hPipe);
-    } else {
-        Log("[-] Failed to open PathServer pipe. Error: %d", GetLastError());
     }
     return path;
 }
@@ -104,6 +103,19 @@ struct BotTask {
 std::vector<BotTask> g_Profile;
 int g_CurrentTaskIndex = 0;
 std::string g_CurrentProfileName = "";
+
+// [!] СИСТЕМА СОХРАНЕНИЯ ПРОГРЕССА
+void AdvanceTask() {
+    g_CurrentTaskIndex++;
+    g_CurrentPath.clear();
+    
+    std::ofstream progFile("C:\\WoWBot\\progress.txt");
+    if (progFile.is_open()) {
+        progFile << g_CurrentProfileName << "\n" << g_CurrentTaskIndex;
+        progFile.close();
+    }
+    Log("[TASK] Advanced to step %d", g_CurrentTaskIndex);
+}
 
 std::string GetProfilePathFromGUI() {
     std::ifstream config("C:\\WoWBot\\settings.ini");
@@ -165,6 +177,21 @@ void LoadProfile(const std::string& filename) {
             g_Profile.push_back(task);
         }
     }
+    
+    // Восстанавливаем прогресс после реинжекта
+    std::ifstream progRead("C:\\WoWBot\\progress.txt");
+    if (progRead.is_open()) {
+        std::string savedProfile;
+        int savedIdx;
+        std::getline(progRead, savedProfile);
+        progRead >> savedIdx;
+        if (savedProfile == g_CurrentProfileName && savedIdx < g_Profile.size()) {
+            g_CurrentTaskIndex = savedIdx;
+            Log("[+] Progress restored! Resuming from step %d", g_CurrentTaskIndex);
+        }
+        progRead.close();
+    }
+    
     Log("[+] Profile loaded! Total tasks: %d", g_Profile.size());
 }
 
@@ -227,7 +254,6 @@ uint64_t FindNpcGuidById(int npcId, float& outX, float& outY, float& outZ) {
     return 0;
 }
 
-// [!] ИСПРАВЛЕНО: Шаг 16 байт (4 поля по 4 байта) для 3.3.5a
 bool HasQuest(uintptr_t pLocalDesc, int questId) {
     for (int i = 0; i < 25; i++) {
         int qId = *(int*)(pLocalDesc + 0xA34 + (i * 16)); 
@@ -247,8 +273,8 @@ void CompleteKill() {
             g_Profile[g_CurrentTaskIndex].killsDone++;
             Log("[GRIND] Kill %d / %d", g_Profile[g_CurrentTaskIndex].killsDone, g_Profile[g_CurrentTaskIndex].count);
             if (g_Profile[g_CurrentTaskIndex].killsDone >= g_Profile[g_CurrentTaskIndex].count) {
-                g_CurrentTaskIndex++;
-                Log("[TASK] Grind complete! Moving to next task.");
+                AdvanceTask();
+                Log("[TASK] Grind complete!");
             }
         }
     }
@@ -322,9 +348,6 @@ void BotPulse() {
     static DWORD lootTimer = 0;
     static DWORD deathTime = 0;
 
-    // ==========================================
-    // РЕЖИМ БОЯ И ЛУТА
-    // ==========================================
     if (hasTarget) {
         ProgrammaticTarget(g_BotTarget);
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
@@ -409,9 +432,6 @@ void BotPulse() {
         return; 
     } 
     
-    // ==========================================
-    // РАДАР (САМООБОРОНА + ГРИНД)
-    // ==========================================
     uint64_t bestGuid = 0;
     float bestDist = 25.0f; 
 
@@ -456,11 +476,8 @@ void BotPulse() {
         return;
     }
 
-    // ==========================================
-    // РЕЖИМ ЗАДАЧ (КВЕСТЫ И НАВИГАЦИЯ)
-    // ==========================================
     if (g_Profile.empty() || g_CurrentTaskIndex >= g_Profile.size()) {
-        Log("[IDLE] Profile finished or not loaded. Waiting...");
+        Log("[IDLE] Profile finished or waiting...");
         return;
     }
 
@@ -474,7 +491,6 @@ void BotPulse() {
         static DWORD stuckTimer = 0;
         if (abs(distToWaypoint - lastDist) < 0.5f) {
             if (GetTickCount() - stuckTimer > 3000) {
-                Log("[!] STUCK ON WALL! Jumping...");
                 ExecuteLua("JumpOrAscendStart();");
                 stuckTimer = GetTickCount(); 
             }
@@ -489,15 +505,12 @@ void BotPulse() {
         }
 
         if (distToWaypoint < 2.0f) {
-            Log("[TASK] Reached waypoint %d!", g_CurrentTaskIndex);
-            g_CurrentTaskIndex++; 
-            g_CurrentPath.clear();
+            AdvanceTask();
         } else {
             if (!g_CurrentPath.empty() && g_PathIndex < g_CurrentPath.size()) {
                 Vector3 nextPt = g_CurrentPath[g_PathIndex];
                 if (GetDistance3D(myX, myY, myZ, nextPt.x, nextPt.y, nextPt.z) < 1.5f) g_PathIndex++;
                 else ActionCTM(pLocal, CTM_MOVE, 0, nextPt.x, nextPt.y, nextPt.z);
-                Log("[TASK] Navigating to Waypoint %d... Dist: %.1f", g_CurrentTaskIndex, distToWaypoint);
             } else {
                 ActionCTM(pLocal, CTM_MOVE, 0, task.x, task.y, task.z); 
             }
@@ -505,9 +518,8 @@ void BotPulse() {
     }
     else if (task.type == TASK_ACCEPT_QUEST) {
         if (HasQuest(pLocalDesc, task.questId)) {
-            Log("[TASK] Quest %d is already in log! Skipping entire task...", task.questId);
-            g_CurrentTaskIndex++;
-            g_CurrentPath.clear();
+            Log("[TASK] Quest %d is already in log! Skipping...", task.questId);
+            AdvanceTask();
             return;
         }
 
@@ -522,7 +534,6 @@ void BotPulse() {
                 static DWORD stuckTimer = 0;
                 if (abs(distToWaypoint - lastDist) < 0.5f) {
                     if (GetTickCount() - stuckTimer > 3000) {
-                        Log("[!] STUCK ON WALL! Jumping...");
                         ExecuteLua("JumpOrAscendStart();");
                         stuckTimer = GetTickCount(); 
                     }
@@ -540,14 +551,13 @@ void BotPulse() {
                         Vector3 nextPt = g_CurrentPath[g_PathIndex];
                         if (GetDistance3D(myX, myY, myZ, nextPt.x, nextPt.y, nextPt.z) < 1.5f) g_PathIndex++;
                         else ActionCTM(pLocal, CTM_MOVE, 0, nextPt.x, nextPt.y, nextPt.z);
-                        Log("[TASK] Navigating to NPC %d spawn point... Dist: %.1f", task.npcId, distToWaypoint);
+                        Log("[TASK] Navigating to NPC %d spawn... Dist: %.1f", task.npcId, distToWaypoint);
                     } else {
                         ActionCTM(pLocal, CTM_MOVE, 0, task.x, task.y, task.z);
                     }
                     return;
                 }
             }
-            Log("[TASK] Looking for NPC %d...", task.npcId);
             return;
         }
 
@@ -559,7 +569,6 @@ void BotPulse() {
             static DWORD stuckTimerNpc = 0;
             if (abs(distToNpc - lastDistNpc) < 0.5f) {
                 if (GetTickCount() - stuckTimerNpc > 3000) {
-                    Log("[!] STUCK ON WALL! Jumping...");
                     ExecuteLua("JumpOrAscendStart();");
                     stuckTimerNpc = GetTickCount(); 
                 }
@@ -581,30 +590,24 @@ void BotPulse() {
             } else {
                 ActionCTM(pLocal, CTM_MOVE, npcGuid, npcX, npcY, npcZ);
             }
-            Log("[TASK] Approaching NPC %d... Dist: %.1f", task.npcId, distToNpc);
-            taskTimer = 0;
         } else {
             if (taskTimer == 0) {
                 ExecuteLua("MoveForwardStop();");
                 *(uint64_t*)ADDR_MOUSEOVER_GUID = npcGuid;
                 ExecuteLua("InteractUnit('mouseover')"); 
                 taskTimer = GetTickCount();
-                Log("[TASK] Opening Dialog with NPC...");
             }
             else if (GetTickCount() - taskTimer > 1500) {
                 ExecuteLua("SelectGossipAvailableQuest(1); SelectAvailableQuest(1); AcceptQuest();");
-                Log("[TASK] Quest Accepted!");
-                g_CurrentTaskIndex++;
-                g_CurrentPath.clear();
+                AdvanceTask();
                 taskTimer = 0;
             }
         }
     }
     else if (task.type == TASK_TURN_IN_QUEST) {
         if (!HasQuest(pLocalDesc, task.questId)) {
-            Log("[TASK] Quest %d is not in log (already turned in?). Skipping entire task...", task.questId);
-            g_CurrentTaskIndex++;
-            g_CurrentPath.clear();
+            Log("[TASK] Quest %d is not in log. Skipping...", task.questId);
+            AdvanceTask();
             return;
         }
 
@@ -619,7 +622,6 @@ void BotPulse() {
                 static DWORD stuckTimer = 0;
                 if (abs(distToWaypoint - lastDist) < 0.5f) {
                     if (GetTickCount() - stuckTimer > 3000) {
-                        Log("[!] STUCK ON WALL! Jumping...");
                         ExecuteLua("JumpOrAscendStart();");
                         stuckTimer = GetTickCount(); 
                     }
@@ -637,14 +639,13 @@ void BotPulse() {
                         Vector3 nextPt = g_CurrentPath[g_PathIndex];
                         if (GetDistance3D(myX, myY, myZ, nextPt.x, nextPt.y, nextPt.z) < 1.5f) g_PathIndex++;
                         else ActionCTM(pLocal, CTM_MOVE, 0, nextPt.x, nextPt.y, nextPt.z);
-                        Log("[TASK] Navigating to NPC %d spawn point... Dist: %.1f", task.npcId, distToWaypoint);
+                        Log("[TASK] Navigating to NPC %d spawn... Dist: %.1f", task.npcId, distToWaypoint);
                     } else {
                         ActionCTM(pLocal, CTM_MOVE, 0, task.x, task.y, task.z);
                     }
                     return;
                 }
             }
-            Log("[TASK] Looking for NPC %d...", task.npcId);
             return;
         }
 
@@ -656,7 +657,6 @@ void BotPulse() {
             static DWORD stuckTimerNpc = 0;
             if (abs(distToNpc - lastDistNpc) < 0.5f) {
                 if (GetTickCount() - stuckTimerNpc > 3000) {
-                    Log("[!] STUCK ON WALL! Jumping...");
                     ExecuteLua("JumpOrAscendStart();");
                     stuckTimerNpc = GetTickCount(); 
                 }
@@ -678,30 +678,21 @@ void BotPulse() {
             } else {
                 ActionCTM(pLocal, CTM_MOVE, npcGuid, npcX, npcY, npcZ);
             }
-            Log("[TASK] Approaching NPC %d... Dist: %.1f", task.npcId, distToNpc);
-            taskTimer = 0;
         } else {
             if (taskTimer == 0) {
                 ExecuteLua("MoveForwardStop();");
                 *(uint64_t*)ADDR_MOUSEOVER_GUID = npcGuid;
                 ExecuteLua("InteractUnit('mouseover')"); 
                 taskTimer = GetTickCount();
-                Log("[TASK] Opening Dialog with NPC...");
             }
             else if (GetTickCount() - taskTimer > 1500) {
                 ExecuteLua("SelectGossipActiveQuest(1); SelectActiveQuest(1); CompleteQuest(); GetQuestReward(1);");
-                Log("[TASK] Quest Turned In!");
-                g_CurrentTaskIndex++;
-                g_CurrentPath.clear();
+                AdvanceTask();
                 taskTimer = 0;
             }
         }
     }
-    else if (task.type == TASK_GRIND) {
-        Log("[TASK] Grinding mode active. Looking for mob ID %d... (%d/%d)", task.npcId, task.killsDone, task.count);
-    }
     else if (task.type == TASK_LOAD_PROFILE) {
-        Log("[SYSTEM] Loading next profile: %s", task.nextProfile);
         std::string currentPath = GetProfilePathFromGUI();
         size_t lastSlash = currentPath.find_last_of("\\/");
         if (lastSlash != std::string::npos) {
@@ -723,66 +714,51 @@ DWORD WINAPI EjectThread(LPVOID) {
     return 0;
 }
 
+// [!] СИСТЕМА УПРАВЛЕНИЯ ИЗ GUI (IPC)
+void UpdateStatusFile() {
+    std::ofstream statFile("C:\\WoWBot\\status.txt");
+    if (statFile.is_open()) {
+        statFile << (g_Active ? "1" : "0");
+        statFile.close();
+    }
+}
+
 LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    // Входящие команды от Инжектора (GUI)
+    if (uMsg == WM_TOGGLE_BOT) {
+        g_Active = !g_Active;
+        UpdateStatusFile();
+        Log("[!] BOT STATUS: %s", g_Active ? "ACTIVE" : "PAUSED");
+        if (!g_Active) {
+            g_BotTarget = 0; 
+            g_CurrentPath.clear();
+            ExecuteLua("ClearTarget(); CloseLoot(); MoveForwardStop();");
+        } else {
+            std::string profileToLoad = GetProfilePathFromGUI();
+            if (!profileToLoad.empty() && (g_CurrentProfileName != profileToLoad || g_Profile.empty())) {
+                LoadProfile(profileToLoad);
+            }
+        }
+        return 1;
+    }
+    if (uMsg == WM_EJECT_BOT) {
+        g_Active = false;
+        std::remove("C:\\WoWBot\\status.txt"); 
+        Log("[!] EJECTING BOT...");
+        CreateThread(0, 0, EjectThread, 0, 0, 0);
+        return 1;
+    }
+
     if (uMsg == WM_TIMER && wParam == 1337) {
         if (GetAsyncKeyState(VK_END) & 0x8000) {
-            g_Active = false;
-            Log("[!] EJECTING BOT...");
-            CreateThread(0, 0, EjectThread, 0, 0, 0);
-            return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
-        }
-
-        static bool f9Pressed = false;
-        if (GetAsyncKeyState(VK_F9) & 0x8000) {
-            if (!f9Pressed) {
-                f9Pressed = true;
-                uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
-                uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
-                if (mgr) {
-                    uint64_t localGuid = *(uint64_t*)(mgr + 0xC0);
-                    uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
-                    while (cur && (cur & 1) == 0) {
-                        if (*(uint64_t*)(cur + 0x30) == localGuid) {
-                            float x = *(float*)(cur + 0x798);
-                            float y = *(float*)(cur + 0x79C);
-                            float z = *(float*)(cur + 0x7A0);
-                            
-                            CreateDirectoryA("C:\\WoWBot", NULL);
-                            std::ofstream outfile("C:\\WoWBot\\RecordedProfile.txt", std::ios_base::app);
-                            outfile << "GOTO " << x << " " << y << " " << z << "\n";
-                            outfile.close();
-                            
-                            Beep(1000, 100);
-                            Log("[+] Waypoint Saved: %.2f %.2f %.2f", x, y, z);
-                            break;
-                        }
-                        cur = *(uintptr_t*)(cur + 0x3C);
-                    }
-                }
-            }
-        } else {
-            f9Pressed = false;
+            SendMessageA(hWnd, WM_EJECT_BOT, 0, 0);
         }
 
         static bool isPressed = false;
         if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
             if (!isPressed) {
                 isPressed = true;
-                g_Active = !g_Active;
-                Beep(g_Active ? 800 : 400, 100);
-                Log("[!] BOT STATUS: %s", g_Active ? "ACTIVE" : "PAUSED");
-                
-                if (g_Active) {
-                    std::string profileToLoad = GetProfilePathFromGUI();
-                    if (!profileToLoad.empty() && (g_CurrentProfileName != profileToLoad || g_Profile.empty())) {
-                        LoadProfile(profileToLoad);
-                    }
-                } else { 
-                    g_BotTarget = 0; 
-                    g_CurrentPath.clear();
-                    ExecuteLua("ClearTarget(); CloseLoot();");
-                    g_Blacklist.clear(); 
-                }
+                SendMessageA(hWnd, WM_TOGGLE_BOT, 0, 0);
             }
         } else {
             isPressed = false;
@@ -805,11 +781,11 @@ DWORD WINAPI Setup(LPVOID) {
     std::ofstream logFile("C:\\WoWBot\\bot_log.txt", std::ios_base::trunc);
     logFile.close();
 
-    Log("--- Bot Core Loaded ---");
     g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
     if (!g_WoWHwnd) return 0;
     oWndProc = (WNDPROC)SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(g_WoWHwnd, 1337, 50, NULL); 
+    UpdateStatusFile(); // Сообщаем GUI, что бот загружен (пауза по умолчанию)
     return 0;
 }
 
