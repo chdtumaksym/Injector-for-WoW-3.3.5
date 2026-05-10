@@ -2,7 +2,6 @@
 #include <iostream>
 #include <vector>
 #include <string>
-#include <fstream>
 
 // [!] ПОДКЛЮЧАЕМ БИБЛИОТЕКУ DETOUR [!]
 #include "DetourNavMesh.h"
@@ -18,22 +17,29 @@ struct PathRequest {
 // Глобальные объекты навигации
 dtNavMesh* g_NavMesh = nullptr;
 dtNavMeshQuery* g_NavQuery = nullptr;
+dtQueryFilter g_Filter;
 
 // Инициализация движка Detour
 void InitNavMesh() {
     g_NavMesh = dtAllocNavMesh();
     g_NavQuery = dtAllocNavMeshQuery();
     
+    // Настраиваем фильтры (какие поверхности бот может пересекать)
+    g_Filter.setIncludeFlags(0xFFFF); // Разрешаем ходить везде, где есть сетка
+    g_Filter.setExcludeFlags(0);
+    
     std::cout << "[+] Detour NavMesh Engine Initialized!\n";
-    std::cout << "[!] Note: Map loading logic will be added in Phase 2.\n";
+    std::cout << "[!] Waiting for map binary parser...\n";
 }
 
-// Функция расчета пути (Пока что возвращает прямую линию, так как карты еще не загружены)
+// Функция расчета пути
 std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
     std::vector<Vector3> path;
     
-    // В следующем этапе здесь будет вызов g_NavQuery->findPath(...)
-    // А пока просто отдаем прямую линию, чтобы не сломать бота
+    // TODO: Здесь будет реальный поиск пути через g_NavQuery->findPath()
+    // Как только мы напишем загрузчик .mmap файлов!
+    
+    // Пока отдаем прямую линию, чтобы бот не стоял на месте
     Vector3 mid1 = { start.x + (end.x - start.x) * 0.33f, start.y + (end.y - start.y) * 0.33f, start.z + (end.z - start.z) * 0.33f };
     Vector3 mid2 = { start.x + (end.x - start.x) * 0.66f, start.y + (end.y - start.y) * 0.66f, start.z + (end.z - start.z) * 0.66f };
     
@@ -47,7 +53,7 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
 int main() {
     std::cout << "--- WoW NavMesh Server (Phase 2: Detour Integration) ---\n";
     
-    InitNavMesh(); // Запускаем движок навигации
+    InitNavMesh(); 
 
     std::cout << "[+] Waiting for Bot DLL to connect...\n";
 
