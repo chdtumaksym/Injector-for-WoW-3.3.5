@@ -8,6 +8,9 @@
 #include <sstream>
 #include <string>
 
+// ==========================================
+// --- АДРЕСА ПАМЯТИ WoW 3.3.5a (12340) ---
+// ==========================================
 #define ADDR_S_CUR_MGR          0x00C79CE0
 #define OFFSET_OBJECT_MANAGER   0x2ED0
 #define ADDR_CLICK_TO_MOVE      0x00727400 
@@ -27,13 +30,23 @@ typedef void(__fastcall* tClickToMove)(uintptr_t ecx, uintptr_t edx, int type, u
 typedef void(__cdecl* tLuaExecute)(const char* code, const char* fileName, int state);
 
 bool g_Active = false;
-WNDPROC oWndProc = nullptr;
 HWND g_WoWHwnd = NULL;
 HINSTANCE g_hModule = NULL; 
 
 std::vector<uint64_t> g_Blacklist; 
 uint64_t g_BotTarget = 0; 
 
+// --- ТАЙМЕРЫ ПАЛАДИНА ---
+DWORD g_GCD = 0; 
+DWORD g_LastHeal = 0;
+DWORD g_LastDevotion = 0;
+DWORD g_LastSeal = 0;
+DWORD g_LastBlessing = 0;
+DWORD g_LastJudgement = 0;
+
+// ==========================================
+// --- СИСТЕМА ПРОФИЛЕЙ ---
+// ==========================================
 enum TaskType { TASK_GOTO, TASK_ACCEPT_QUEST, TASK_TURN_IN_QUEST, TASK_GRIND, TASK_LOAD_PROFILE };
 
 struct BotTask {
@@ -111,6 +124,9 @@ void LoadProfile(const std::string& filename) {
     printf("[+] Profile loaded! Total tasks: %d\n", g_Profile.size());
 }
 
+// ==========================================
+// --- БАЗОВЫЕ ФУНКЦИИ ---
+// ==========================================
 float GetDistance3D(float x1, float y1, float z1, float x2, float y2, float z2) {
     return sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2) + pow(z2 - z1, 2));
 }
@@ -141,6 +157,22 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
         lastGuid = guid; lastType = type;
         lastX = x; lastY = y; lastZ = z;
     }
+}
+
+bool TryCast(int vkKey, DWORD& lastCastTime, DWORD cooldown, DWORD castTime = 1500) {
+    if (GetTickCount() < g_GCD) return false; 
+    if (GetTickCount() - lastCastTime < cooldown) return false; 
+
+    UINT scanCode = MapVirtualKey(vkKey, MAPVK_VK_TO_VSC);
+    LPARAM lParamDown = (scanCode << 16) | 1;
+    LPARAM lParamUp = (scanCode << 16) | (1 << 30) | (1 << 31) | 1;
+
+    PostMessage(g_WoWHwnd, WM_KEYDOWN, vkKey, lParamDown);
+    PostMessage(g_WoWHwnd, WM_KEYUP, vkKey, lParamUp);
+
+    lastCastTime = GetTickCount();
+    g_GCD = GetTickCount() + castTime; 
+    return true;
 }
 
 uint64_t FindNpcGuidById(int npcId, float& outX, float& outY, float& outZ) {
@@ -185,6 +217,9 @@ void CompleteKill() {
     }
 }
 
+// ==========================================
+// --- ЯДРО БОТА ---
+// ==========================================
 void BotPulse() {
     uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
     uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
@@ -214,10 +249,17 @@ void BotPulse() {
     int myMaxHp = *(int*)(pLocalDesc + 0x80); 
     if (myMaxHp <= 0) myMaxHp = 1; 
     float myHpPercent = ((float)myHp / (float)myMaxHp) * 100.0f;
+    
+    uint32_t myFlags = *(uint32_t*)(pLocalDesc + 0xEC); 
+    bool inCombat = (myFlags & 0x80000) != 0; 
+    int myFaction = *(int*)(pLocalDesc + 0xDC);
 
+    // --- 1. ВЫЖИВАНИЕ ---
     if (myHpPercent < 40.0f) {
         ExecuteLua("MoveForwardStop(); MoveBackwardStop();"); 
-        printf("[SURVIVAL] HP %.1f%%! Pausing tasks to heal...\n", myHpPercent);
+        if (TryCast('1', g_LastHeal, 0, 3000)) { 
+            printf("[SURVIVAL] HP %.1f%%! Casting Holy Light...\n", myHpPercent);
+        }
         return; 
     }
 
@@ -249,10 +291,20 @@ void BotPulse() {
         if (!hasTarget) g_BotTarget = 0; 
     }
 
+    // --- 2. СИСТЕМА БАФОВ ---
+    if (!inCombat && !hasTarget) {
+        if (TryCast('2', g_LastDevotion, 3600000)) { printf("[BUFF] Casting Devotion Aura\n"); return; }
+        if (TryCast('3', g_LastSeal, 1680000)) { printf("[BUFF] Casting Seal of Righteousness\n"); return; }
+        if (TryCast('4', g_LastBlessing, 540000)) { printf("[BUFF] Casting Blessing of Might\n"); return; }
+    }
+
     static bool isLooting = false;
     static DWORD lootTimer = 0;
     static DWORD deathTime = 0;
 
+    // ==========================================
+    // РЕЖИМ БОЯ И ЛУТА (ПРИОРИТЕТ)
+    // ==========================================
     if (hasTarget) {
         ProgrammaticTarget(g_BotTarget);
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
@@ -269,12 +321,16 @@ void BotPulse() {
                     ExecuteLua("InteractUnit('mouseover'); StartAttack();");
                     lastAtk = GetTickCount();
                 }
+                if (TryCast('5', g_LastJudgement, 10500)) {
+                    printf("\n[COMBAT] Casting Judgement!\n");
+                }
             }
         } 
         else {
             if (targetDynFlags & 1) { 
                 if (dist > 4.5f && !isLooting) {
                     ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
+                    printf("[LOOT] Running to Corpse... Dist: %.1f        \r", dist);
                 } else {
                     if (!isLooting) {
                         uint64_t ctmGuid = g_BotTarget;
@@ -282,6 +338,7 @@ void BotPulse() {
                         ((tClickToMove)ADDR_CLICK_TO_MOVE)(pLocal, 0, CTM_LOOT, &ctmGuid, ctmPos, 0.5f);
                         isLooting = true;
                         lootTimer = GetTickCount();
+                        printf("[LOOT] Looting Corpse... Waiting 3 sec.       \r");
                     }
 
                     static DWORD lastLoot = 0;
@@ -294,17 +351,22 @@ void BotPulse() {
                     if (GetTickCount() - lootTimer > 3000) {
                         CompleteKill(); 
                         isLooting = false;
+                        printf("\n[+] Corpse processed.\n");
                     }
                 }
             } else {
                 if (isLooting) {
                     CompleteKill(); 
                     isLooting = false;
+                    printf("\n[+] Loot collected successfully!\n");
                 } else {
                     if (deathTime == 0) deathTime = GetTickCount();
                     if (GetTickCount() - deathTime > 1500) {
                         CompleteKill(); 
                         deathTime = 0;
+                        printf("\n[-] Corpse empty. Moving on.\n");
+                    } else {
+                        printf("[LOOT] Waiting for server flag...        \r");
                     }
                 }
             }
@@ -312,6 +374,9 @@ void BotPulse() {
         return; 
     } 
     
+    // ==========================================
+    // РАДАР (САМООБОРОНА + ГРИНД)
+    // ==========================================
     uint64_t bestGuid = 0;
     float bestDist = 25.0f; 
 
@@ -332,12 +397,15 @@ void BotPulse() {
 
                     bool isTapped = (mobDynFlags & 0x4) != 0;       
 
-                    if (isGrindTask && entryId == targetNpcId && hp > 0 && !isTapped) {
-                        float mX = *(float*)(cur + 0x798);
-                        float mY = *(float*)(cur + 0x79C);
-                        float mZ = *(float*)(cur + 0x7A0);
-                        float dist = GetDistance3D(myX, myY, myZ, mX, mY, mZ);
-                        
+                    float mX = *(float*)(cur + 0x798);
+                    float mY = *(float*)(cur + 0x79C);
+                    float mZ = *(float*)(cur + 0x7A0);
+                    float dist = GetDistance3D(myX, myY, myZ, mX, mY, mZ);
+
+                    bool isValidGrindTarget = (isGrindTask && entryId == targetNpcId && !isTapped);
+                    bool isAttackingUs = (inCombat && dist < 10.0f); 
+
+                    if (hp > 0 && (isValidGrindTarget || isAttackingUs)) {
                         if (dist < bestDist && dist > 0.1f) {
                             bestDist = dist;
                             bestGuid = guid;
@@ -352,10 +420,15 @@ void BotPulse() {
     if (bestGuid) {
         g_BotTarget = bestGuid; 
         ProgrammaticTarget(g_BotTarget);
+        printf("\n[!] Enemy detected! Interrupting task to fight.\n");
         return;
     }
 
+    // ==========================================
+    // РЕЖИМ ЗАДАЧ (КВЕСТЫ И НАВИГАЦИЯ)
+    // ==========================================
     if (g_Profile.empty() || g_CurrentTaskIndex >= g_Profile.size()) {
+        if (GetTickCount() > g_GCD) g_GCD = 0;
         printf("[IDLE] Profile finished or not loaded. Waiting...      \r");
         return;
     }
@@ -383,7 +456,6 @@ void BotPulse() {
         }
 
         ProgrammaticTarget(npcGuid);
-
         float distToNpc = GetDistance3D(myX, myY, myZ, npcX, npcY, npcZ);
         
         if (distToNpc > 4.5f) {
@@ -425,31 +497,38 @@ void BotPulse() {
     }
 }
 
-void SafeBotPulse() {
-    __try { BotPulse(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-}
+// ==========================================
+// --- ПОТОК ВЫГРУЗКИ И КЛАВИАТУРЫ ---
+// ==========================================
+DWORD WINAPI BotThread(LPVOID) {
+    AllocConsole(); 
+    freopen("CONOUT$", "w", stdout);
+    printf("--- Bot v162: The Ultimate Core ---\n");
+    printf("[+] Background Thread (Immortal Keys): RESTORED.\n");
+    printf("[+] Detailed Combat/Loot Logs: RESTORED.\n");
+    printf("[+] Questing Framework: INTEGRATED.\n");
+    printf("[!] Press [F9] to save Waypoint.\n");
+    printf("[!] Press [INSERT] to Start/Pause.\n");
+    printf("[!] Press [END] to Unload the Bot.\n\n");
 
-DWORD WINAPI EjectThread(LPVOID) {
-    SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)oWndProc); 
-    KillTimer(g_WoWHwnd, 1337);
-    Sleep(100);
-    FreeConsole();
-    FreeLibraryAndExitThread(g_hModule, 0); 
-    return 0;
-}
+    bool isInsertPressed = false;
+    bool isF9Pressed = false;
+    DWORD lastPulse = 0;
 
-LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    if (uMsg == WM_TIMER && wParam == 1337) {
+    while (true) {
+        // [!] КНОПКА END (ВЫГРУЗКА)
         if (GetAsyncKeyState(VK_END) & 0x8000) {
             g_Active = false;
-            CreateThread(0, 0, EjectThread, 0, 0, 0);
-            return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
+            printf("\n[!] EJECTING BOT... You can close this console.\n");
+            Sleep(100);
+            FreeConsole();
+            FreeLibraryAndExitThread(g_hModule, 0);
         }
 
-        static bool f9Pressed = false;
+        // [!] КНОПКА F9 (РЕКОРДЕР)
         if (GetAsyncKeyState(VK_F9) & 0x8000) {
-            if (!f9Pressed) {
-                f9Pressed = true;
+            if (!isF9Pressed) {
+                isF9Pressed = true;
                 uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
                 uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
                 if (mgr) {
@@ -475,13 +554,13 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
                 }
             }
         } else {
-            f9Pressed = false;
+            isF9Pressed = false;
         }
 
-        static bool isPressed = false;
+        // [!] КНОПКА INSERT (СТАРТ/ПАУЗА)
         if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
-            if (!isPressed) {
-                isPressed = true;
+            if (!isInsertPressed) {
+                isInsertPressed = true;
                 g_Active = !g_Active;
                 Beep(g_Active ? 800 : 400, 100);
                 printf("\n\n[!] BOT STATUS: %s\n", g_Active ? "ACTIVE" : "PAUSED");
@@ -500,37 +579,28 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
                 }
             }
         } else {
-            isPressed = false;
+            isInsertPressed = false;
         }
 
-        static DWORD lastTick = 0;
-        static bool isPulsing = false; 
-        if (g_Active && !isPulsing && (GetTickCount() - lastTick > 150)) {
-            isPulsing = true;
-            SafeBotPulse(); 
-            lastTick = GetTickCount();
-            isPulsing = false;
+        // [!] ВЫЗОВ ЛОГИКИ (150мс)
+        if (g_Active && (GetTickCount() - lastPulse > 150)) {
+            __try {
+                BotPulse();
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            lastPulse = GetTickCount();
         }
+
+        Sleep(50); // Экономим CPU
     }
-    return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
-}
-
-DWORD WINAPI Setup(LPVOID) {
-    AllocConsole(); 
-    freopen("CONOUT$", "w", stdout);
-    printf("--- Bot Core Loaded ---\n");
-    g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
-    if (!g_WoWHwnd) return 0;
-    oWndProc = (WNDPROC)SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)HookedWndProc);
-    SetTimer(g_WoWHwnd, 1337, 50, NULL); 
     return 0;
 }
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
     if (r == DLL_PROCESS_ATTACH) {
         g_hModule = h; 
+        g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
         DisableThreadLibraryCalls(h);
-        CreateThread(0, 0, Setup, 0, 0, 0);
+        CreateThread(0, 0, BotThread, 0, 0, 0);
     }
     return TRUE;
 }
