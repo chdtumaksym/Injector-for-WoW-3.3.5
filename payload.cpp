@@ -38,25 +38,14 @@ DWORD g_GCD = 0;
 
 struct Vector3 { float x, y, z; };
 
-// ==========================================
-// --- СВЯЗЬ С ВНЕШНИМ СЕРВЕРОМ NAVMESH ---
-// ==========================================
-void Log(const char* format, ...); // Forward declaration
-
 std::vector<Vector3> RequestPathFromServer(Vector3 start, Vector3 end) {
     std::vector<Vector3> path;
-    
-    // [!] ФИКС: Ждем, пока сервер откроет канал (таймаут 100мс)
-    if (!WaitNamedPipeA("\\\\.\\pipe\\WoWNavMeshPipe", 100)) {
-        return path;
-    }
+    if (!WaitNamedPipeA("\\\\.\\pipe\\WoWNavMeshPipe", 100)) return path;
 
     HANDLE hPipe = CreateFileA("\\\\.\\pipe\\WoWNavMeshPipe", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-    
     if (hPipe != INVALID_HANDLE_VALUE) {
         struct { Vector3 s; Vector3 e; } req = { start, end };
         DWORD bytesWritten, bytesRead;
-        
         WriteFile(hPipe, &req, sizeof(req), &bytesWritten, NULL);
         
         int count = 0;
@@ -65,8 +54,6 @@ std::vector<Vector3> RequestPathFromServer(Vector3 start, Vector3 end) {
             ReadFile(hPipe, path.data(), count * sizeof(Vector3), &bytesRead, NULL);
         }
         CloseHandle(hPipe);
-    } else {
-        Log("[-] Failed to connect to PathServer! Error: %d", GetLastError());
     }
     return path;
 }
@@ -75,9 +62,6 @@ std::vector<Vector3> g_CurrentPath;
 int g_PathIndex = 0;
 uint64_t g_PathTargetGuid = 0;
 
-// ==========================================
-// --- СИСТЕМА ЛОГИРОВАНИЯ ---
-// ==========================================
 void Log(const char* format, ...) {
     char buffer[512];
     va_list args;
@@ -98,9 +82,6 @@ void Log(const char* format, ...) {
     }
 }
 
-// ==========================================
-// --- СИСТЕМА ПРОФИЛЕЙ ---
-// ==========================================
 enum TaskType { TASK_GOTO, TASK_ACCEPT_QUEST, TASK_TURN_IN_QUEST, TASK_GRIND, TASK_LOAD_PROFILE };
 
 struct BotTask {
@@ -237,6 +218,17 @@ uint64_t FindNpcGuidById(int npcId, float& outX, float& outY, float& outZ) {
     return 0;
 }
 
+// [!] ЧТЕНИЕ ЖУРНАЛА КВЕСТОВ ИЗ ПАМЯТИ [!]
+bool HasQuest(uintptr_t pLocalDesc, int questId) {
+    // В 3.3.5a журнал квестов начинается со смещения 0x1394 в дескрипторе игрока
+    // Всего 25 слотов, каждый слот занимает 16 байт (4 uint32)
+    for (int i = 0; i < 25; i++) {
+        int qId = *(int*)(pLocalDesc + 0x1394 + (i * 16));
+        if (qId == questId) return true;
+    }
+    return false;
+}
+
 void CompleteKill() {
     g_Blacklist.push_back(g_BotTarget);
     g_BotTarget = 0; 
@@ -335,9 +327,6 @@ void BotPulse() {
     static DWORD lootTimer = 0;
     static DWORD deathTime = 0;
 
-    // ==========================================
-    // РЕЖИМ БОЯ И ЛУТА (ПРИОРИТЕТ)
-    // ==========================================
     if (hasTarget) {
         ProgrammaticTarget(g_BotTarget);
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
@@ -427,9 +416,6 @@ void BotPulse() {
         return; 
     } 
     
-    // ==========================================
-    // РАДАР (САМООБОРОНА + ГРИНД)
-    // ==========================================
     uint64_t bestGuid = 0;
     float bestDist = 25.0f; 
 
@@ -474,9 +460,6 @@ void BotPulse() {
         return;
     }
 
-    // ==========================================
-    // РЕЖИМ ЗАДАЧ (КВЕСТЫ И НАВИГАЦИЯ)
-    // ==========================================
     if (g_Profile.empty() || g_CurrentTaskIndex >= g_Profile.size()) {
         Log("[IDLE] Profile finished or not loaded. Waiting...");
         return;
@@ -522,7 +505,14 @@ void BotPulse() {
             }
         }
     }
-    else if (task.type == TASK_ACCEPT_QUEST || task.type == TASK_TURN_IN_QUEST) {
+    else if (task.type == TASK_ACCEPT_QUEST) {
+        // [!] УМНАЯ ПРОВЕРКА: Если квест уже есть в журнале - пропускаем задачу!
+        if (HasQuest(pLocalDesc, task.questId)) {
+            Log("[TASK] Quest %d is already in log! Skipping...", task.questId);
+            g_CurrentTaskIndex++;
+            return;
+        }
+
         float npcX = 0, npcY = 0, npcZ = 0;
         uint64_t npcGuid = FindNpcGuidById(task.npcId, npcX, npcY, npcZ);
         
@@ -559,13 +549,53 @@ void BotPulse() {
                 Log("[TASK] Opening Dialog with NPC...");
             }
             else if (GetTickCount() - taskTimer > 1500) {
-                if (task.type == TASK_ACCEPT_QUEST) {
-                    ExecuteLua("SelectGossipAvailableQuest(1); SelectAvailableQuest(1); AcceptQuest();");
-                    Log("[TASK] Quest Accepted!");
-                } else {
-                    ExecuteLua("SelectGossipActiveQuest(1); SelectActiveQuest(1); CompleteQuest(); GetQuestReward(1);");
-                    Log("[TASK] Quest Turned In!");
-                }
+                ExecuteLua("SelectGossipAvailableQuest(1); SelectAvailableQuest(1); AcceptQuest();");
+                Log("[TASK] Quest Accepted!");
+                g_CurrentTaskIndex++;
+                g_CurrentPath.clear();
+                taskTimer = 0;
+            }
+        }
+    }
+    else if (task.type == TASK_TURN_IN_QUEST) {
+        float npcX = 0, npcY = 0, npcZ = 0;
+        uint64_t npcGuid = FindNpcGuidById(task.npcId, npcX, npcY, npcZ);
+        
+        if (!npcGuid) {
+            Log("[TASK] Looking for NPC %d...", task.npcId);
+            return;
+        }
+
+        ProgrammaticTarget(npcGuid);
+        float distToNpc = GetDistance3D(myX, myY, myZ, npcX, npcY, npcZ);
+        
+        if (distToNpc > 4.5f) {
+            if (g_PathTargetGuid != npcGuid || g_CurrentPath.empty()) {
+                g_CurrentPath = RequestPathFromServer({myX, myY, myZ}, {npcX, npcY, npcZ});
+                g_PathIndex = 0;
+                g_PathTargetGuid = npcGuid;
+            }
+            
+            if (!g_CurrentPath.empty() && g_PathIndex < g_CurrentPath.size()) {
+                Vector3 nextPt = g_CurrentPath[g_PathIndex];
+                if (GetDistance3D(myX, myY, myZ, nextPt.x, nextPt.y, nextPt.z) < 1.5f) g_PathIndex++;
+                else ActionCTM(pLocal, CTM_MOVE, 0, nextPt.x, nextPt.y, nextPt.z);
+            } else {
+                ActionCTM(pLocal, CTM_MOVE, npcGuid, npcX, npcY, npcZ);
+            }
+            Log("[TASK] Approaching NPC %d... Dist: %.1f", task.npcId, distToNpc);
+            taskTimer = 0;
+        } else {
+            if (taskTimer == 0) {
+                ExecuteLua("MoveForwardStop();");
+                *(uint64_t*)ADDR_MOUSEOVER_GUID = npcGuid;
+                ExecuteLua("InteractUnit('mouseover')"); 
+                taskTimer = GetTickCount();
+                Log("[TASK] Opening Dialog with NPC...");
+            }
+            else if (GetTickCount() - taskTimer > 1500) {
+                ExecuteLua("SelectGossipActiveQuest(1); SelectActiveQuest(1); CompleteQuest(); GetQuestReward(1);");
+                Log("[TASK] Quest Turned In!");
                 g_CurrentTaskIndex++;
                 g_CurrentPath.clear();
                 taskTimer = 0;
