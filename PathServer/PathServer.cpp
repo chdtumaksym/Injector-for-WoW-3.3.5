@@ -1,4 +1,3 @@
---- START OF FILE PathServer.cpp ---
 #define NOMINMAX 
 #include <windows.h>
 #include <iostream>
@@ -168,7 +167,7 @@ int main() {
     std::cout << "--- WoW NavMesh Server (True Coordinates) ---\n";
     InitNavMesh();
 
-    // [!] ИСПРАВЛЕНО: Создаем Null DACL, чтобы любой процесс (даже без прав Админа) мог подключиться к пайпу
+    // Создаем Null DACL, чтобы любой процесс мог подключиться к пайпу
     SECURITY_DESCRIPTOR sd;
     InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
     SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
@@ -178,7 +177,6 @@ int main() {
     sa.bInheritHandle = FALSE;
 
     while (true) {
-        // [!] ИСПРАВЛЕНО: Используем PIPE_TYPE_BYTE для совместимости с CreateFileA в боте
         HANDLE hPipe = CreateNamedPipeA(
             "\\\\.\\pipe\\WoWNavMeshPipe", PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
@@ -208,4 +206,3 @@ int main() {
     }
     return 0;
 }
---- END OF FILE PathServer.cpp ---
