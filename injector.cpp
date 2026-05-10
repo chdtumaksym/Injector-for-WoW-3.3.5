@@ -12,7 +12,6 @@
 #include <string>
 #include <filesystem>
 
-// Идентификаторы для общения с DLL
 #define WM_TOGGLE_BOT (WM_APP + 1337)
 #define WM_EJECT_BOT  (WM_APP + 1338)
 
@@ -102,7 +101,6 @@ bool ManualMapInject(DWORD pid, const char* dllPath, std::string& guiLog) {
     HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!hProc) return false;
 
-    // Очищаем старый статус перед новым инжектом
     std::remove("C:\\WoWBot\\status.txt");
 
     auto* pNt = reinterpret_cast<IMAGE_NT_HEADERS*>(buf.data() + reinterpret_cast<IMAGE_DOS_HEADER*>(buf.data())->e_lfanew);
@@ -284,14 +282,20 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
         if (done) break;
 
-        // Читаем статус прямо из файла (простой IPC)
+        // Читаем статус через Named Mutex (Истинная проверка наличия DLL в памяти)
         int botStatus = -1; // -1: Not injected, 0: Paused, 1: Active
         HWND hwndWow = FindWindowA(NULL, "World of Warcraft");
         if (hwndWow) {
-            std::ifstream stat("C:\\WoWBot\\status.txt");
-            if (stat.is_open()) {
-                stat >> botStatus;
-                stat.close();
+            HANDLE hMutex = OpenMutexA(MUTEX_ALL_ACCESS, FALSE, "WoWBot_Active_Mutex");
+            if (hMutex) {
+                CloseHandle(hMutex);
+                std::ifstream stat("C:\\WoWBot\\status.txt");
+                if (stat.is_open()) {
+                    stat >> botStatus;
+                    stat.close();
+                }
+            } else {
+                std::remove("C:\\WoWBot\\status.txt");
             }
         }
 
@@ -306,7 +310,6 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         ImGui::TextColored(ImVec4(0.85f, 0.50f, 0.10f, 1.0f), "WoW 3.3.5 Bot - CS2 Edition");
         ImGui::SameLine(ImGui::GetWindowWidth() - 150);
         
-        // Индикатор статуса
         ImGui::Text("Status: "); ImGui::SameLine();
         if (botStatus == 1) ImGui::TextColored(ImVec4(0, 1, 0, 1), "ACTIVE");
         else if (botStatus == 0) ImGui::TextColored(ImVec4(1, 1, 0, 1), "PAUSED");
@@ -327,7 +330,6 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
         ImGui::Spacing(); ImGui::Spacing();
 
-        // [!] НОВЫЕ КНОПКИ УПРАВЛЕНИЯ
         if (botStatus == -1) {
             if (ImGui::Button("INJECT BOT", ImVec2(-1, 40))) {
                 if (!profiles.empty()) {
@@ -371,11 +373,9 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
         ImGui::Spacing();
         
-        // [!] ИСПРАВЛЕН КРАШ ЛОГОВ (Используем TextUnformatted вместо InputTextMultiline)
         ImGui::BeginChild("LogRegion", ImVec2(0, 0), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
         ImGui::TextUnformatted(liveLog.c_str());
         
-        // Автоскролл
         if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 10.0f) {
             ImGui::SetScrollHereY(1.0f);
         }
