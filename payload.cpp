@@ -227,9 +227,10 @@ uint64_t FindNpcGuidById(int npcId, float& outX, float& outY, float& outZ) {
     return 0;
 }
 
+// [!] ИСПРАВЛЕНО: Шаг 16 байт (4 поля по 4 байта) для 3.3.5a
 bool HasQuest(uintptr_t pLocalDesc, int questId) {
     for (int i = 0; i < 25; i++) {
-        int qId = *(int*)(pLocalDesc + 0xA34 + (i * 20)); 
+        int qId = *(int*)(pLocalDesc + 0xA34 + (i * 16)); 
         if (qId == questId) return true;
     }
     return false;
