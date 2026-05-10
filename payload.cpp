@@ -23,6 +23,7 @@
 
 #define WM_PULSE_BOT            (WM_APP + 1000)
 
+// ТВОЯ ПАПКА
 #define CHEAT_FOLDER "E:\\Cheats\\WoW Inject\\"
 
 #pragma runtime_checks("", off)
@@ -105,6 +106,9 @@ int g_CurrentTaskIndex = 0;
 std::string g_CurrentProfileName = "";
 
 void AdvanceTask() {
+    // [!] Глобальная очистка всех забагованных окон при переходе к следующему шагу
+    ExecuteLua("CloseGossip(); CloseQuest(); HideUIPanel(QuestFrame);");
+    
     g_CurrentTaskIndex++;
     g_CurrentPath.clear();
     
@@ -253,13 +257,13 @@ uint64_t FindNpcGuidById(int npcId, float& outX, float& outY, float& outZ) {
     return 0;
 }
 
-// [!] ИДЕАЛЬНЫЙ СКАНЕР ПАМЯТИ КВЕСТОВ
-// Сканирует всю область журнала в дескрипторе игрока. 100% защита от смещений репаков.
+//[!] ИСТИННЫЙ АДРЕС ЖУРНАЛА КВЕСТОВ ДЛЯ WotLK 3.3.5a (12340)
 bool HasQuest(uintptr_t pLocalDesc, int questId) {
-    for (int offset = 0x900; offset < 0xD00; offset += 4) {
-        if (*(int*)(pLocalDesc + offset) == questId) {
-            return true;
-        }
+    // В 3.3.5a квесты начинаются с поля 3165 (0x3174)
+    // Максимум 25 квестов, каждый занимает 5 полей (20 байт)
+    for (int i = 0; i < 25; i++) {
+        int qId = *(int*)(pLocalDesc + 0x3174 + (i * 20)); 
+        if (qId == questId) return true;
     }
     return false;
 }
@@ -553,18 +557,6 @@ void BotPulse() {
             if (task.x != 0.0f || task.y != 0.0f) {
                 float distToWaypoint = GetDistance3D(myX, myY, myZ, task.x, task.y, task.z);
                 
-                static float lastDist = 0;
-                static DWORD stuckTimer = 0;
-                if (abs(distToWaypoint - lastDist) < 0.5f) {
-                    if (GetTickCount() - stuckTimer > 3000) {
-                        ExecuteLua("JumpOrAscendStart();");
-                        stuckTimer = GetTickCount(); 
-                    }
-                } else {
-                    lastDist = distToWaypoint;
-                    stuckTimer = GetTickCount();
-                }
-
                 if (distToWaypoint > 2.0f) {
                     if (g_CurrentPath.empty()) {
                         g_CurrentPath = RequestPathFromServer({myX, myY, myZ}, {task.x, task.y, task.z});
@@ -620,13 +612,11 @@ void BotPulse() {
                     
                     if (HasQuest(pLocalDesc, task.questId)) {
                         Log("[TASK] Quest Accepted successfully!");
-                        ExecuteLua("CloseGossip(); HideUIPanel(QuestFrame);");
                         AdvanceTask();
                         taskState = 0;
                     }
                     else if (GetTickCount() - taskTimer > 10000) {
                         Log("[!] Timeout interacting with NPC. Escaping...");
-                        ExecuteLua("CloseGossip(); HideUIPanel(QuestFrame); CloseQuest();");
                         AdvanceTask();
                         taskState = 0;
                     }
@@ -699,19 +689,17 @@ void BotPulse() {
                         "if QuestFrameGreetingPanel and QuestFrameGreetingPanel:IsVisible() then SelectActiveQuest(1) end "
                         "if QuestFrameProgressPanel and QuestFrameProgressPanel:IsVisible() then CompleteQuest() end "
                         "if QuestFrameRewardPanel and QuestFrameRewardPanel:IsVisible() then "
-                        "  if GetNumQuestChoices() > 0 then GetQuestReward(1) else GetQuestReward() end "
+                        "  GetQuestReward(1); GetQuestReward(0); GetQuestReward(); "
                         "end"
                     );
 
                     if (!HasQuest(pLocalDesc, task.questId)) {
                         Log("[TASK] Quest Turned In successfully!");
-                        ExecuteLua("CloseGossip(); HideUIPanel(QuestFrame);");
                         AdvanceTask();
                         taskState = 0;
                     }
                     else if (GetTickCount() - taskTimer > 10000) {
                         Log("[!] Timeout interacting with NPC. Escaping...");
-                        ExecuteLua("CloseGossip(); HideUIPanel(QuestFrame); CloseQuest();");
                         AdvanceTask();
                         taskState = 0;
                     }
@@ -786,7 +774,6 @@ DWORD WINAPI BotThread(LPVOID) {
             if (cmd == 0 && g_Active) ToggleBot();
             if (cmd == 2) TriggerEject();
             if (cmd == 3) {
-                // Команда сброса из GUI
                 std::remove(CHEAT_FOLDER "progress.txt");
                 g_CurrentTaskIndex = 0;
                 g_CurrentPath.clear();
