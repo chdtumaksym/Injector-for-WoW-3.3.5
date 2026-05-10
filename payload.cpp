@@ -1,3 +1,4 @@
+--- START OF FILE payload.cpp ---
 #include <windows.h>
 #include <cmath>
 #include <stdint.h>
@@ -38,30 +39,6 @@ DWORD g_GCD = 0;
 
 struct Vector3 { float x, y, z; };
 
-std::vector<Vector3> RequestPathFromServer(Vector3 start, Vector3 end) {
-    std::vector<Vector3> path;
-    if (!WaitNamedPipeA("\\\\.\\pipe\\WoWNavMeshPipe", 100)) return path;
-
-    HANDLE hPipe = CreateFileA("\\\\.\\pipe\\WoWNavMeshPipe", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-    if (hPipe != INVALID_HANDLE_VALUE) {
-        struct { Vector3 s; Vector3 e; } req = { start, end };
-        DWORD bytesWritten, bytesRead;
-        WriteFile(hPipe, &req, sizeof(req), &bytesWritten, NULL);
-        
-        int count = 0;
-        if (ReadFile(hPipe, &count, sizeof(int), &bytesRead, NULL) && count > 0) {
-            path.resize(count);
-            ReadFile(hPipe, path.data(), count * sizeof(Vector3), &bytesRead, NULL);
-        }
-        CloseHandle(hPipe);
-    }
-    return path;
-}
-
-std::vector<Vector3> g_CurrentPath;
-int g_PathIndex = 0;
-uint64_t g_PathTargetGuid = 0;
-
 void Log(const char* format, ...) {
     char buffer[512];
     va_list args;
@@ -81,6 +58,37 @@ void Log(const char* format, ...) {
         logFile.close();
     }
 }
+
+std::vector<Vector3> RequestPathFromServer(Vector3 start, Vector3 end) {
+    std::vector<Vector3> path;
+    if (!WaitNamedPipeA("\\\\.\\pipe\\WoWNavMeshPipe", 500)) {
+        Log("[-] PathServer pipe timeout or not found.");
+        return path;
+    }
+
+    HANDLE hPipe = CreateFileA("\\\\.\\pipe\\WoWNavMeshPipe", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (hPipe != INVALID_HANDLE_VALUE) {
+        struct { Vector3 s; Vector3 e; } req = { start, end };
+        DWORD bytesWritten, bytesRead;
+        if (WriteFile(hPipe, &req, sizeof(req), &bytesWritten, NULL)) {
+            int count = 0;
+            if (ReadFile(hPipe, &count, sizeof(int), &bytesRead, NULL) && count > 0) {
+                path.resize(count);
+                ReadFile(hPipe, path.data(), count * sizeof(Vector3), &bytesRead, NULL);
+            }
+        } else {
+            Log("[-] Failed to write to PathServer pipe.");
+        }
+        CloseHandle(hPipe);
+    } else {
+        Log("[-] Failed to open PathServer pipe. Error: %d", GetLastError());
+    }
+    return path;
+}
+
+std::vector<Vector3> g_CurrentPath;
+int g_PathIndex = 0;
+uint64_t g_PathTargetGuid = 0;
 
 enum TaskType { TASK_GOTO, TASK_ACCEPT_QUEST, TASK_TURN_IN_QUEST, TASK_GRIND, TASK_LOAD_PROFILE };
 
@@ -143,11 +151,13 @@ void LoadProfile(const std::string& filename) {
         else if (command == "ACCEPT_QUEST") {
             task.type = TASK_ACCEPT_QUEST;
             iss >> task.npcId >> task.questId;
+            if (!(iss >> task.x >> task.y >> task.z)) { task.x = task.y = task.z = 0.0f; }
             g_Profile.push_back(task);
         }
         else if (command == "TURN_IN_QUEST") {
             task.type = TASK_TURN_IN_QUEST;
             iss >> task.npcId >> task.questId;
+            if (!(iss >> task.x >> task.y >> task.z)) { task.x = task.y = task.z = 0.0f; }
             g_Profile.push_back(task);
         }
         else if (command == "LOAD_PROFILE") {
@@ -218,10 +228,9 @@ uint64_t FindNpcGuidById(int npcId, float& outX, float& outY, float& outZ) {
     return 0;
 }
 
-//[!] ИСПРАВЛЕНО: Истинный адрес журнала квестов в 3.3.5a (0xA34)
 bool HasQuest(uintptr_t pLocalDesc, int questId) {
     for (int i = 0; i < 25; i++) {
-        int qId = *(int*)(pLocalDesc + 0xA34 + (i * 20)); // 5 полей по 4 байта = 20 байт на квест
+        int qId = *(int*)(pLocalDesc + 0xA34 + (i * 20)); 
         if (qId == questId) return true;
     }
     return false;
@@ -275,18 +284,6 @@ void BotPulse() {
     if (myMaxHp <= 0) myMaxHp = 1; 
     float myHpPercent = ((float)myHp / (float)myMaxHp) * 100.0f;
     
-    uint32_t myFlags = *(uint32_t*)(pLocalDesc + 0xEC); 
-    bool inCombat = (myFlags & 0x80000) != 0; 
-    int myFaction = *(int*)(pLocalDesc + 0xDC);
-    
-    int myLevel = *(int*)(pLocalDesc + 0xD8);
-    static int lastLevel = 0;
-
-    if (myLevel != lastLevel) {
-        if (lastLevel != 0) Log("\n[LEVEL UP] Congratulations! You are now level %d!\n", myLevel);
-        lastLevel = myLevel;
-    }
-
     if (myHpPercent < 40.0f) {
         ExecuteLua("MoveForwardStop(); MoveBackwardStop();"); 
         Log("[SURVIVAL] HP %.1f%%! Pausing tasks to heal...", myHpPercent);
@@ -326,7 +323,7 @@ void BotPulse() {
     static DWORD deathTime = 0;
 
     // ==========================================
-    // РЕЖИМ БОЯ И ЛУТА (ПРИОРИТЕТ)
+    // РЕЖИМ БОЯ И ЛУТА
     // ==========================================
     if (hasTarget) {
         ProgrammaticTarget(g_BotTarget);
@@ -345,18 +342,13 @@ void BotPulse() {
                 
                 if (!g_CurrentPath.empty() && g_PathIndex < g_CurrentPath.size()) {
                     Vector3 nextPt = g_CurrentPath[g_PathIndex];
-                    float distToPt = GetDistance3D(myX, myY, myZ, nextPt.x, nextPt.y, nextPt.z);
-                    
-                    if (distToPt < 1.5f) g_PathIndex++;
+                    if (GetDistance3D(myX, myY, myZ, nextPt.x, nextPt.y, nextPt.z) < 1.5f) g_PathIndex++;
                     else ActionCTM(pLocal, CTM_MOVE, 0, nextPt.x, nextPt.y, nextPt.z);
-                    
-                    Log("[COMBAT] Navigating to target... Dist: %.1f", dist);
                 } else {
                     ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ); 
                 }
             } else {
                 ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
-                Log("[COMBAT] Attacking... Dist: %.1f", dist);
                 static DWORD lastAtk = 0;
                 if (GetTickCount() - lastAtk > 1500) {
                     ExecuteLua("InteractUnit('mouseover'); StartAttack();");
@@ -480,7 +472,6 @@ void BotPulse() {
         
         static float lastDist = 0;
         static DWORD stuckTimer = 0;
-        
         if (abs(distToWaypoint - lastDist) < 0.5f) {
             if (GetTickCount() - stuckTimer > 3000) {
                 Log("[!] STUCK ON WALL! Jumping...");
@@ -513,10 +504,10 @@ void BotPulse() {
         }
     }
     else if (task.type == TASK_ACCEPT_QUEST) {
-        // [!] ИСПРАВЛЕНО: Пропускаем, если квест уже взят
         if (HasQuest(pLocalDesc, task.questId)) {
-            Log("[TASK] Quest %d is already in log! Skipping...", task.questId);
+            Log("[TASK] Quest %d is already in log! Skipping entire task...", task.questId);
             g_CurrentTaskIndex++;
+            g_CurrentPath.clear();
             return;
         }
 
@@ -524,6 +515,38 @@ void BotPulse() {
         uint64_t npcGuid = FindNpcGuidById(task.npcId, npcX, npcY, npcZ);
         
         if (!npcGuid) {
+            if (task.x != 0.0f || task.y != 0.0f) {
+                float distToWaypoint = GetDistance3D(myX, myY, myZ, task.x, task.y, task.z);
+                
+                static float lastDist = 0;
+                static DWORD stuckTimer = 0;
+                if (abs(distToWaypoint - lastDist) < 0.5f) {
+                    if (GetTickCount() - stuckTimer > 3000) {
+                        Log("[!] STUCK ON WALL! Jumping...");
+                        ExecuteLua("JumpOrAscendStart();");
+                        stuckTimer = GetTickCount(); 
+                    }
+                } else {
+                    lastDist = distToWaypoint;
+                    stuckTimer = GetTickCount();
+                }
+
+                if (distToWaypoint > 2.0f) {
+                    if (g_CurrentPath.empty()) {
+                        g_CurrentPath = RequestPathFromServer({myX, myY, myZ}, {task.x, task.y, task.z});
+                        g_PathIndex = 0;
+                    }
+                    if (!g_CurrentPath.empty() && g_PathIndex < g_CurrentPath.size()) {
+                        Vector3 nextPt = g_CurrentPath[g_PathIndex];
+                        if (GetDistance3D(myX, myY, myZ, nextPt.x, nextPt.y, nextPt.z) < 1.5f) g_PathIndex++;
+                        else ActionCTM(pLocal, CTM_MOVE, 0, nextPt.x, nextPt.y, nextPt.z);
+                        Log("[TASK] Navigating to NPC %d spawn point... Dist: %.1f", task.npcId, distToWaypoint);
+                    } else {
+                        ActionCTM(pLocal, CTM_MOVE, 0, task.x, task.y, task.z);
+                    }
+                    return;
+                }
+            }
             Log("[TASK] Looking for NPC %d...", task.npcId);
             return;
         }
@@ -565,10 +588,10 @@ void BotPulse() {
         }
     }
     else if (task.type == TASK_TURN_IN_QUEST) {
-        // [!] ИСПРАВЛЕНО: Пропускаем, если квеста нет в журнале (уже сдан)
         if (!HasQuest(pLocalDesc, task.questId)) {
-            Log("[TASK] Quest %d is not in log (already turned in?). Skipping...", task.questId);
+            Log("[TASK] Quest %d is not in log (already turned in?). Skipping entire task...", task.questId);
             g_CurrentTaskIndex++;
+            g_CurrentPath.clear();
             return;
         }
 
@@ -576,6 +599,38 @@ void BotPulse() {
         uint64_t npcGuid = FindNpcGuidById(task.npcId, npcX, npcY, npcZ);
         
         if (!npcGuid) {
+            if (task.x != 0.0f || task.y != 0.0f) {
+                float distToWaypoint = GetDistance3D(myX, myY, myZ, task.x, task.y, task.z);
+                
+                static float lastDist = 0;
+                static DWORD stuckTimer = 0;
+                if (abs(distToWaypoint - lastDist) < 0.5f) {
+                    if (GetTickCount() - stuckTimer > 3000) {
+                        Log("[!] STUCK ON WALL! Jumping...");
+                        ExecuteLua("JumpOrAscendStart();");
+                        stuckTimer = GetTickCount(); 
+                    }
+                } else {
+                    lastDist = distToWaypoint;
+                    stuckTimer = GetTickCount();
+                }
+
+                if (distToWaypoint > 2.0f) {
+                    if (g_CurrentPath.empty()) {
+                        g_CurrentPath = RequestPathFromServer({myX, myY, myZ}, {task.x, task.y, task.z});
+                        g_PathIndex = 0;
+                    }
+                    if (!g_CurrentPath.empty() && g_PathIndex < g_CurrentPath.size()) {
+                        Vector3 nextPt = g_CurrentPath[g_PathIndex];
+                        if (GetDistance3D(myX, myY, myZ, nextPt.x, nextPt.y, nextPt.z) < 1.5f) g_PathIndex++;
+                        else ActionCTM(pLocal, CTM_MOVE, 0, nextPt.x, nextPt.y, nextPt.z);
+                        Log("[TASK] Navigating to NPC %d spawn point... Dist: %.1f", task.npcId, distToWaypoint);
+                    } else {
+                        ActionCTM(pLocal, CTM_MOVE, 0, task.x, task.y, task.z);
+                    }
+                    return;
+                }
+            }
             Log("[TASK] Looking for NPC %d...", task.npcId);
             return;
         }
@@ -740,3 +795,4 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
     }
     return TRUE;
 }
+--- END OF FILE payload.cpp ---
