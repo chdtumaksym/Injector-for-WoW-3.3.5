@@ -48,13 +48,14 @@ void InitNavMesh() {
     dtNavMeshParams params;
     memset(&params, 0, sizeof(params));
     
-    // Истинный центр координат TrinityCore (-32 * 533.33333)
-    params.orig[0] = -17066.6666f;
+    // [!] ИСПРАВЛЕНО: Идеально точный размер тайла без погрешностей float
+    float tileSize = 1600.0f / 3.0f; 
+    params.orig[0] = -32.0f * tileSize;
     params.orig[1] = 0.0f;
-    params.orig[2] = -17066.6666f;
+    params.orig[2] = -32.0f * tileSize;
     
-    params.tileWidth = 533.33333f;
-    params.tileHeight = 533.33333f;
+    params.tileWidth = tileSize;
+    params.tileHeight = tileSize;
     params.maxTiles = 16384;     
     params.maxPolys = 1 << 22;   
     
@@ -67,11 +68,18 @@ void InitNavMesh() {
 }
 
 void GetGridCoordinates(float x, float y, int& gridX, int& gridY) {
-    gridX = (int)(32.0f - (x / 533.33333f));
-    gridY = (int)(32.0f - (y / 533.33333f));
+    float tileSize = 1600.0f / 3.0f;
+    gridX = (int)(32.0f - (x / tileSize));
+    gridY = (int)(32.0f - (y / tileSize));
 }
 
 bool LoadTile(int mapId, int gridX, int gridY) {
+    // [!] ИСПРАВЛЕНО: Истинные координаты тайлов Detour в TrinityCore
+    int navX = 63 - gridY;
+    int navY = 63 - gridX;
+    
+    if (g_NavMesh->getTileAt(navX, navY, 0)) return true; 
+
     char filename[512];
     sprintf_s(filename, "E:\\Cheats\\WoW Inject\\mmaps\\%03d%02d%02d.mmtile", mapId, gridX, gridY);
 
@@ -97,7 +105,7 @@ bool LoadTile(int mapId, int gridX, int gridY) {
     
     if (dtStatusSucceed(status)) {
         g_LoadedTiles.push_back(std::string(filename));
-        std::cout << "[+] Loaded NavMesh Tile: " << gridX << "_" << gridY << "\n";
+        std::cout << "[+] Loaded NavMesh Tile: " << gridX << "_" << gridY << " (Detour: " << navX << "," << navY << ")\n";
         return true;
     } else {
         dtFree(data);
@@ -127,15 +135,17 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
     WoWToRecast(start, startPos);
     WoWToRecast(end, endPos);
     
-    // Оптимальный радиус поиска полигона (чтобы не цеплять крыши)
-    float extents[3] = { 10.0f, 10.0f, 10.0f };
+    // [!] ИСПРАВЛЕНО: Огромный радиус поиска (50 ярдов по X/Z, 100 ярдов по высоте Y)
+    float extents[3] = { 50.0f, 100.0f, 50.0f };
 
     dtPolyRef startRef = 0, endRef = 0;
     g_NavQuery->findNearestPoly(startPos, extents, &g_Filter, &startRef, 0);
     g_NavQuery->findNearestPoly(endPos, extents, &g_Filter, &endRef, 0);
 
     if (!startRef || !endRef) {
-        std::cout << "[-] WARNING: Could not find NavMesh polygon. Using straight line.\n";
+        if (!startRef) std::cout << "[-] WARNING: Could not find NavMesh polygon for START.\n";
+        if (!endRef) std::cout << "[-] WARNING: Could not find NavMesh polygon for END.\n";
+        std::cout << "[-] Using straight line.\n";
         path.push_back(end); 
         return path;
     }
@@ -159,7 +169,7 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
         }
         std::cout << "[+] Path found! Waypoints: " << straightPathCount << "\n";
     } else {
-        std::cout << "[-] WARNING: Path calculation failed. Using straight line.\n";
+        std::cout << "[-] WARNING: Path calculation failed (No path between polys). Using straight line.\n";
         path.push_back(end);
     }
 
@@ -189,8 +199,12 @@ int main() {
                 PathRequest req;
                 DWORD bytesRead;
                 if (ReadFile(hPipe, &req, sizeof(PathRequest), &bytesRead, NULL)) {
-                    std::cout << "[+] Request: " << req.start.x << "," << req.start.y << " -> " << req.end.x << "," << req.end.y << "\n";
+                    // Теперь выводим и Z координату для удобства дебага
+                    std::cout << "[+] Request: " << req.start.x << "," << req.start.y << "," << req.start.z 
+                              << " -> " << req.end.x << "," << req.end.y << "," << req.end.z << "\n";
+                    
                     std::vector<Vector3> path = CalculatePath(req.start, req.end);
+                    
                     DWORD bytesWritten;
                     int count = path.size();
                     WriteFile(hPipe, &count, sizeof(int), &bytesWritten, NULL);
