@@ -5,16 +5,17 @@
 #include <tchar.h>
 #include <windows.h>
 #include <tlhelp32.h>
-#include <commdlg.h> // Для окна "Сохранить как..."
+#include <commdlg.h> 
 #include <iostream>
 #include <fstream>
 #include <vector>
 #include <string>
 #include <filesystem>
 
-// ==========================================
-// --- MANUAL MAPPING ---
-// ==========================================
+// Идентификаторы для общения с DLL
+#define WM_TOGGLE_BOT (WM_APP + 1337)
+#define WM_EJECT_BOT  (WM_APP + 1338)
+
 struct MANUAL_MAPPING_DATA {
     typedef HMODULE(WINAPI* pLoadLibraryA)(LPCSTR);
     typedef FARPROC(WINAPI* pGetProcAddress)(HMODULE, LPCSTR);
@@ -99,19 +100,15 @@ bool ManualMapInject(DWORD pid, const char* dllPath, std::string& guiLog) {
     f.close();
 
     HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-    if (!hProc) {
-        guiLog += "[-] Error: Cannot open WoW.exe process!\n";
-        return false;
-    }
+    if (!hProc) return false;
+
+    // Очищаем старый статус перед новым инжектом
+    std::remove("C:\\WoWBot\\status.txt");
 
     auto* pNt = reinterpret_cast<IMAGE_NT_HEADERS*>(buf.data() + reinterpret_cast<IMAGE_DOS_HEADER*>(buf.data())->e_lfanew);
     BYTE* pTarget = (BYTE*)VirtualAllocEx(hProc, nullptr, pNt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 
-    if (!pTarget) {
-        guiLog += "[-] Error: Memory allocation failed!\n";
-        CloseHandle(hProc);
-        return false;
-    }
+    if (!pTarget) { CloseHandle(hProc); return false; }
 
     WriteProcessMemory(hProc, pTarget, buf.data(), pNt->OptionalHeader.SizeOfHeaders, nullptr);
     auto* pSec = IMAGE_FIRST_SECTION(pNt);
@@ -132,20 +129,16 @@ bool ManualMapInject(DWORD pid, const char* dllPath, std::string& guiLog) {
 
     HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0, (LPTHREAD_START_ROUTINE)pRemCode, pRemData, 0, nullptr);
     if (hThread) {
-        guiLog += "[+] Manual Map Successful!\n[!] Go to game and press INSERT to start.\n";
+        guiLog += "[+] Bot Successfully Injected!\n";
         CloseHandle(hThread);
         CloseHandle(hProc);
         return true;
     }
     
-    guiLog += "[-] Error: CreateRemoteThread failed!\n";
     CloseHandle(hProc);
     return false;
 }
 
-// ==========================================
-// --- DIRECTX 11 & GUI ---
-// ==========================================
 static ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
 static IDXGISwapChain* g_pSwapChain = nullptr;
@@ -231,16 +224,13 @@ void SetupCS2Style() {
 std::string ReadBotLog() {
     std::ifstream logFile("C:\\WoWBot\\bot_log.txt");
     if (!logFile.is_open()) return "Waiting for bot to start...\n";
-    
     std::string content((std::istreambuf_iterator<char>(logFile)), std::istreambuf_iterator<char>());
     return content;
 }
 
-// Функция для вызова окна "Сохранить как..."
 void SaveLogToFile(HWND hwndOwner, const std::string& logData) {
     OPENFILENAMEA ofn;
     char szFile[260] = { 0 };
-    
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = hwndOwner;
@@ -253,32 +243,27 @@ void SaveLogToFile(HWND hwndOwner, const std::string& logData) {
 
     if (GetSaveFileNameA(&ofn) == TRUE) {
         std::ofstream out(ofn.lpstrFile);
-        if (out.is_open()) {
-            out << logData;
-            out.close();
-        }
+        if (out.is_open()) out << logData;
     }
 }
 
 int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"WoWBotClass", nullptr };
     RegisterClassExW(&wc);
-    HWND hwnd = CreateWindowW(wc.lpszClassName, L"WoW 3.3.5 Bot Launcher", WS_OVERLAPPEDWINDOW, 100, 100, 650, 500, nullptr, nullptr, wc.hInstance, nullptr);
+    HWND hwnd = CreateWindowW(wc.lpszClassName, L"WoW 3.3.5 Bot Launcher", WS_OVERLAPPEDWINDOW, 100, 100, 700, 550, nullptr, nullptr, wc.hInstance, nullptr);
 
-    if (!CreateDeviceD3D(hwnd)) { CleanupDeviceD3D(); UnregisterClassW(wc.lpszClassName, wc.hInstance); return 1; }
+    if (!CreateDeviceD3D(hwnd)) { CleanupDeviceD3D(); return 1; }
     ShowWindow(hwnd, SW_SHOWDEFAULT); UpdateWindow(hwnd);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO(); (void)io;
     SetupCS2Style();
-
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
     std::vector<std::string> profiles;
     int selectedProfile = 0;
-    std::string guiLog = "Waiting for action...\n";
+    std::string guiLog = "";
 
     char currentDir[MAX_PATH];
     GetCurrentDirectoryA(MAX_PATH, currentDir);
@@ -286,9 +271,7 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     
     if (std::filesystem::exists(profilesDir)) {
         for (const auto& entry : std::filesystem::directory_iterator(profilesDir)) {
-            if (entry.path().extension() == ".txt") {
-                profiles.push_back(entry.path().filename().string());
-            }
+            if (entry.path().extension() == ".txt") profiles.push_back(entry.path().filename().string());
         }
     }
 
@@ -301,15 +284,34 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
         if (done) break;
 
+        // Читаем статус прямо из файла (простой IPC)
+        int botStatus = -1; // -1: Not injected, 0: Paused, 1: Active
+        HWND hwndWow = FindWindowA(NULL, "World of Warcraft");
+        if (hwndWow) {
+            std::ifstream stat("C:\\WoWBot\\status.txt");
+            if (stat.is_open()) {
+                stat >> botStatus;
+                stat.close();
+            }
+        }
+
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
         ImGui::SetNextWindowPos(ImVec2(0, 0));
-        ImGui::SetNextWindowSize(io.DisplaySize);
+        ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
         ImGui::Begin("Main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize);
 
         ImGui::TextColored(ImVec4(0.85f, 0.50f, 0.10f, 1.0f), "WoW 3.3.5 Bot - CS2 Edition");
+        ImGui::SameLine(ImGui::GetWindowWidth() - 150);
+        
+        // Индикатор статуса
+        ImGui::Text("Status: "); ImGui::SameLine();
+        if (botStatus == 1) ImGui::TextColored(ImVec4(0, 1, 0, 1), "ACTIVE");
+        else if (botStatus == 0) ImGui::TextColored(ImVec4(1, 1, 0, 1), "PAUSED");
+        else ImGui::TextColored(ImVec4(1, 0, 0, 1), "NOT INJECTED");
+
         ImGui::Separator();
         ImGui::Spacing();
 
@@ -325,51 +327,61 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
         ImGui::Spacing(); ImGui::Spacing();
 
-        if (ImGui::Button("INJECT BOT", ImVec2(-1, 40))) {
-            if (profiles.empty()) {
-                guiLog += "[-] Error: No profiles found in /Profiles folder!\n";
-            } else {
-                CreateDirectoryA("C:\\WoWBot", NULL);
-                std::string fullPath = profilesDir + "\\" + profiles[selectedProfile];
-                std::ofstream settingsFile("C:\\WoWBot\\settings.ini");
-                settingsFile << fullPath;
-                settingsFile.close();
+        // [!] НОВЫЕ КНОПКИ УПРАВЛЕНИЯ
+        if (botStatus == -1) {
+            if (ImGui::Button("INJECT BOT", ImVec2(-1, 40))) {
+                if (!profiles.empty()) {
+                    CreateDirectoryA("C:\\WoWBot", NULL);
+                    std::string fullPath = profilesDir + "\\" + profiles[selectedProfile];
+                    std::ofstream settingsFile("C:\\WoWBot\\settings.ini");
+                    settingsFile << fullPath;
+                    settingsFile.close();
 
-                DWORD procId = GetProcessId("Wow.exe");
-                if (!procId) {
-                    guiLog += "[-] Error: Wow.exe not found! Open the game first.\n";
-                } else {
-                    std::string dllPath = std::string(currentDir) + "\\bot_payload.dll";
-                    guiLog += "[*] Injecting into WoW.exe (PID: " + std::to_string(procId) + ")...\n";
-                    ManualMapInject(procId, dllPath.c_str(), guiLog);
+                    DWORD procId = GetProcessId("Wow.exe");
+                    if (!procId) guiLog += "[-] Error: Wow.exe not found!\n";
+                    else {
+                        std::string dllPath = std::string(currentDir) + "\\bot_payload.dll";
+                        ManualMapInject(procId, dllPath.c_str(), guiLog);
+                    }
                 }
+            }
+        } else {
+            if (ImGui::Button(botStatus == 1 ? "PAUSE BOT (INSERT)" : "START BOT (INSERT)", ImVec2(ImGui::GetWindowWidth() / 2 - 12, 40))) {
+                PostMessageA(hwndWow, WM_TOGGLE_BOT, 0, 0);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("EJECT BOT (END)", ImVec2(ImGui::GetWindowWidth() / 2 - 12, 40))) {
+                PostMessageA(hwndWow, WM_EJECT_BOT, 0, 0);
             }
         }
 
         ImGui::Spacing();
         ImGui::Separator();
-        ImGui::Spacing();
 
         std::string liveLog = ReadBotLog();
 
-        // Кнопки управления логами
-        if (ImGui::Button("Copy to Clipboard")) {
-            ImGui::SetClipboardText(liveLog.c_str());
-        }
+        if (ImGui::Button("Copy to Clipboard")) ImGui::SetClipboardText(liveLog.c_str());
         ImGui::SameLine();
-        if (ImGui::Button("Save to File...")) {
-            SaveLogToFile(hwnd, liveLog);
+        if (ImGui::Button("Save to File...")) SaveLogToFile(hwnd, liveLog);
+        ImGui::SameLine();
+        if (ImGui::Button("Clear Progress")) {
+            std::remove("C:\\WoWBot\\progress.txt");
+            guiLog += "[!] Progress file cleared.\n";
         }
 
         ImGui::Spacing();
-        ImGui::Text("Bot Live Log:");
         
-        // Многострочное текстовое поле (можно выделять и копировать вручную)
-        ImGui::InputTextMultiline("##LogRegion", (char*)liveLog.c_str(), liveLog.size(), 
-            ImVec2(-FLT_MIN, -FLT_MIN), ImGuiInputTextFlags_ReadOnly);
+        // [!] ИСПРАВЛЕН КРАШ ЛОГОВ (Используем TextUnformatted вместо InputTextMultiline)
+        ImGui::BeginChild("LogRegion", ImVec2(0, 0), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+        ImGui::TextUnformatted(liveLog.c_str());
+        
+        // Автоскролл
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 10.0f) {
+            ImGui::SetScrollHereY(1.0f);
+        }
+        ImGui::EndChild();
 
         ImGui::End();
-
         ImGui::Render();
         const float clear_color_with_alpha[4] = { 0.1f, 0.1f, 0.1f, 1.0f };
         g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
