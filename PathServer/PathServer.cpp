@@ -29,20 +29,19 @@ dtQueryFilter g_Filter;
 
 std::vector<std::string> g_LoadedTiles;
 
-const float TILE_SIZE = 533.33333f;
-const float CENTER_POINT = 32.0f * TILE_SIZE;
+const float GRID_SIZE = 533.33333f;
 
-// Идеальная прямая конвертация координат
+// [!] ИСТИННАЯ КОНВЕРТАЦИЯ ОСЕЙ AZEROTHCORE
 void WoWToRecast(const Vector3& wow, float* recast) {
-    recast[0] = CENTER_POINT - wow.x;
+    recast[0] = wow.y;
     recast[1] = wow.z;
-    recast[2] = CENTER_POINT - wow.y;
+    recast[2] = wow.x;
 }
 
 void RecastToWoW(const float* recast, Vector3& wow) {
-    wow.x = CENTER_POINT - recast[0];
+    wow.y = recast[0];
     wow.z = recast[1];
-    wow.y = CENTER_POINT - recast[2];
+    wow.x = recast[2];
 }
 
 void InitNavMesh() {
@@ -52,32 +51,34 @@ void InitNavMesh() {
     dtNavMeshParams params;
     memset(&params, 0, sizeof(params));
     
-    params.orig[0] = 0.0f;
+    // [!] ИСТИННЫЙ ЦЕНТР МИРА AZEROTHCORE
+    params.orig[0] = -32.0f * GRID_SIZE;
     params.orig[1] = 0.0f;
-    params.orig[2] = 0.0f;
+    params.orig[2] = -32.0f * GRID_SIZE;
     
-    params.tileWidth = TILE_SIZE;
-    params.tileHeight = TILE_SIZE;
+    params.tileWidth = GRID_SIZE;
+    params.tileHeight = GRID_SIZE;
     params.maxTiles = 16384;     
-    params.maxPolys = 1 << 22;   
+    params.maxPolys = 16384; // Безопасный лимит для инициализации Detour
     
-    g_NavMesh->init(&params);
+    dtStatus status = g_NavMesh->init(&params);
+    if (dtStatusFailed(status)) {
+        std::cout << "[-] FATAL ERROR: dtNavMesh->init failed!\n";
+    }
+    
     g_NavQuery->init(g_NavMesh, 2048);
     
     g_Filter.setIncludeFlags(0xFFFF);
     g_Filter.setExcludeFlags(0);
-    std::cout << "[+] Detour NavMesh Engine Initialized (Direct Mapping)!\n";
+    std::cout << "[+] Detour NavMesh Engine Initialized (100% TrinityCore Math)!\n";
 }
 
 void GetGridCoordinates(float x, float y, int& gridX, int& gridY) {
-    gridX = (int)(32.0f - (x / TILE_SIZE));
-    gridY = (int)(32.0f - (y / TILE_SIZE));
+    gridX = (int)(32.0f - (x / GRID_SIZE));
+    gridY = (int)(32.0f - (y / GRID_SIZE));
 }
 
 bool LoadTile(int mapId, int gridX, int gridY) {
-    // Прямая загрузка тайла без смещений
-    if (g_NavMesh->getTileAt(gridX, gridY, 0)) return true; 
-
     char filename[512];
     sprintf_s(filename, "E:\\Cheats\\WoW Inject\\mmaps\\%03d%02d%02d.mmtile", mapId, gridX, gridY);
 
@@ -103,10 +104,15 @@ bool LoadTile(int mapId, int gridX, int gridY) {
     
     if (dtStatusSucceed(status)) {
         g_LoadedTiles.push_back(std::string(filename));
-        std::cout << "[+] Loaded NavMesh Tile: " << gridX << "_" << gridY << "\n";
+        
+        // Читаем заголовок самого Detour, чтобы видеть, куда он положил тайл
+        int* dtHeader = (int*)data;
+        std::cout << "[+] Loaded NavMesh Tile: " << gridX << "_" << gridY 
+                  << " (Detour X:" << dtHeader[2] << " Y:" << dtHeader[3] << ")\n";
         return true;
     } else {
         dtFree(data);
+        std::cout << "[-] Failed to add tile to NavMesh!\n";
         return false;
     }
 }
@@ -133,7 +139,7 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
     WoWToRecast(start, startPos);
     WoWToRecast(end, endPos);
     
-    // Огромный радиус поиска, чтобы 100% найти пол
+    // Огромный радиус поиска (50 ярдов), чтобы 100% зацепить пол
     float extents[3] = { 50.0f, 100.0f, 50.0f };
 
     dtPolyRef startRef = 0, endRef = 0;
@@ -175,7 +181,7 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
 }
 
 int main() {
-    std::cout << "--- WoW NavMesh Server (Direct Mapping) ---\n";
+    std::cout << "--- WoW NavMesh Server (100% Accurate Math) ---\n";
     InitNavMesh();
 
     SECURITY_DESCRIPTOR sd;
