@@ -47,12 +47,15 @@ void InitNavMesh() {
     
     dtNavMeshParams params;
     memset(&params, 0, sizeof(params));
-    params.orig[0] = 0.0f;
+    
+    // Истинный центр координат TrinityCore (-32 * 533.33333)
+    params.orig[0] = -17066.6666f;
     params.orig[1] = 0.0f;
-    params.orig[2] = 0.0f;
+    params.orig[2] = -17066.6666f;
+    
     params.tileWidth = 533.33333f;
     params.tileHeight = 533.33333f;
-    params.maxTiles = 1024;     
+    params.maxTiles = 16384;     
     params.maxPolys = 1 << 22;   
     
     g_NavMesh->init(&params);
@@ -69,13 +72,12 @@ void GetGridCoordinates(float x, float y, int& gridX, int& gridY) {
 }
 
 bool LoadTile(int mapId, int gridX, int gridY) {
-    int navX = 32 - gridY;
-    int navY = 32 - gridX;
-    
-    if (g_NavMesh->getTileAt(navX, navY, 0)) return true; 
-
     char filename[512];
     sprintf_s(filename, "E:\\Cheats\\WoW Inject\\mmaps\\%03d%02d%02d.mmtile", mapId, gridX, gridY);
+
+    if (std::find(g_LoadedTiles.begin(), g_LoadedTiles.end(), filename) != g_LoadedTiles.end()) {
+        return true;
+    }
 
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) return false;
@@ -125,7 +127,8 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
     WoWToRecast(start, startPos);
     WoWToRecast(end, endPos);
     
-    float extents[3] = { 50.0f, 50.0f, 50.0f };
+    // Оптимальный радиус поиска полигона (чтобы не цеплять крыши)
+    float extents[3] = { 10.0f, 10.0f, 10.0f };
 
     dtPolyRef startRef = 0, endRef = 0;
     g_NavQuery->findNearestPoly(startPos, extents, &g_Filter, &startRef, 0);
@@ -167,7 +170,6 @@ int main() {
     std::cout << "--- WoW NavMesh Server (True Coordinates) ---\n";
     InitNavMesh();
 
-    // Создаем Null DACL, чтобы любой процесс мог подключиться к пайпу
     SECURITY_DESCRIPTOR sd;
     InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
     SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
@@ -193,14 +195,11 @@ int main() {
                     int count = path.size();
                     WriteFile(hPipe, &count, sizeof(int), &bytesWritten, NULL);
                     WriteFile(hPipe, path.data(), count * sizeof(Vector3), &bytesWritten, NULL);
-                } else {
-                    std::cout << "[-] ReadFile failed. Error: " << GetLastError() << "\n";
                 }
             }
             FlushFileBuffers(hPipe);
             DisconnectNamedPipe(hPipe);
         } else {
-            std::cout << "[-] Failed to create pipe. Error: " << GetLastError() << "\n";
             Sleep(1000);
         }
     }
