@@ -85,10 +85,10 @@ void __stdcall ShellCode(MANUAL_MAPPING_DATA* pData) {
 void __stdcall ShellCodeEnd() {}
 #pragma optimize("", on)
 
-bool ManualMapInject(DWORD pid, const char* dllPath, char* logBuffer) {
+bool ManualMapInject(DWORD pid, const char* dllPath, std::string& guiLog) {
     std::ifstream f(dllPath, std::ios::binary | std::ios::ate);
     if (!f.is_open()) {
-        strcpy(logBuffer, "[-] Error: bot_payload.dll not found in folder!\n");
+        guiLog += "[-] Error: bot_payload.dll not found in folder!\n";
         return false;
     }
     auto sz = f.tellg();
@@ -99,7 +99,7 @@ bool ManualMapInject(DWORD pid, const char* dllPath, char* logBuffer) {
 
     HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!hProc) {
-        strcpy(logBuffer, "[-] Error: Cannot open WoW.exe process!\n");
+        guiLog += "[-] Error: Cannot open WoW.exe process!\n";
         return false;
     }
 
@@ -107,7 +107,7 @@ bool ManualMapInject(DWORD pid, const char* dllPath, char* logBuffer) {
     BYTE* pTarget = (BYTE*)VirtualAllocEx(hProc, nullptr, pNt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 
     if (!pTarget) {
-        strcpy(logBuffer, "[-] Error: Memory allocation failed!\n");
+        guiLog += "[-] Error: Memory allocation failed!\n";
         CloseHandle(hProc);
         return false;
     }
@@ -131,13 +131,13 @@ bool ManualMapInject(DWORD pid, const char* dllPath, char* logBuffer) {
 
     HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0, (LPTHREAD_START_ROUTINE)pRemCode, pRemData, 0, nullptr);
     if (hThread) {
-        strcpy(logBuffer, "[+] Manual Map Successful!\n[!] Go to game and press INSERT to start.");
+        guiLog += "[+] Manual Map Successful!\n[!] Go to game and press INSERT to start.\n";
         CloseHandle(hThread);
         CloseHandle(hProc);
         return true;
     }
     
-    strcpy(logBuffer, "[-] Error: CreateRemoteThread failed!\n");
+    guiLog += "[-] Error: CreateRemoteThread failed!\n";
     CloseHandle(hProc);
     return false;
 }
@@ -245,7 +245,7 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     std::vector<std::string> profiles;
     int selectedProfile = 0;
-    char logBuffer[512] = "Waiting for action...\n";
+    std::string guiLog = "Waiting for action...\n";
 
     char currentDir[MAX_PATH];
     GetCurrentDirectoryA(MAX_PATH, currentDir);
@@ -294,31 +294,33 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
         if (ImGui::Button("INJECT BOT", ImVec2(-1, 40))) {
             if (profiles.empty()) {
-                strcpy(logBuffer, "[-] Error: No profiles found in /Profiles folder!\n");
+                guiLog += "[-] Error: No profiles found in /Profiles folder!\n";
             } else {
-                // 1. Создаем общую папку для связи с DLL
                 CreateDirectoryA("C:\\WoWBot", NULL);
-                
-                // 2. Сохраняем путь к профилю
                 std::string fullPath = profilesDir + "\\" + profiles[selectedProfile];
                 std::ofstream settingsFile("C:\\WoWBot\\settings.ini");
                 settingsFile << fullPath;
                 settingsFile.close();
 
-                // 3. Инжектим bot_payload.dll
                 DWORD procId = GetProcessId("Wow.exe");
                 if (!procId) {
-                    strcpy(logBuffer, "[-] Error: Wow.exe not found! Open the game first.\n");
+                    guiLog += "[-] Error: Wow.exe not found! Open the game first.\n";
                 } else {
                     std::string dllPath = std::string(currentDir) + "\\bot_payload.dll";
-                    ManualMapInject(procId, dllPath.c_str(), logBuffer);
+                    guiLog += "[*] Injecting into WoW.exe (PID: " + std::to_string(procId) + ")...\n";
+                    ManualMapInject(procId, dllPath.c_str(), guiLog);
                 }
             }
         }
 
         ImGui::Spacing();
         ImGui::Text("Status Log:");
-        ImGui::InputTextMultiline("##log", logBuffer, sizeof(logBuffer), ImVec2(-1, -1), ImGuiInputTextFlags_ReadOnly);
+        
+        ImGui::BeginChild("LogRegion", ImVec2(0, 0), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+        ImGui::TextUnformatted(guiLog.c_str());
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+            ImGui::SetScrollHereY(1.0f);
+        ImGui::EndChild();
 
         ImGui::End();
 
