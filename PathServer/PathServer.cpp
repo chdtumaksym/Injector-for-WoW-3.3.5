@@ -29,20 +29,20 @@ dtQueryFilter g_Filter;
 
 std::vector<std::string> g_LoadedTiles;
 
-// Истинные константы из исходников AzerothCore / TrinityCore
-const float GRID_SIZE = 533.33333f;
+const float TILE_SIZE = 533.33333f;
+const float CENTER_POINT = 32.0f * TILE_SIZE;
 
-// [!] ИСПРАВЛЕНО: Правильная конвертация осей (X -> X, Y -> Z, Z -> Y)
+// Идеальная прямая конвертация координат
 void WoWToRecast(const Vector3& wow, float* recast) {
-    recast[0] = wow.x;
+    recast[0] = CENTER_POINT - wow.x;
     recast[1] = wow.z;
-    recast[2] = wow.y;
+    recast[2] = CENTER_POINT - wow.y;
 }
 
 void RecastToWoW(const float* recast, Vector3& wow) {
-    wow.x = recast[0];
-    wow.y = recast[2];
+    wow.x = CENTER_POINT - recast[0];
     wow.z = recast[1];
+    wow.y = CENTER_POINT - recast[2];
 }
 
 void InitNavMesh() {
@@ -52,13 +52,12 @@ void InitNavMesh() {
     dtNavMeshParams params;
     memset(&params, 0, sizeof(params));
     
-    // Точный центр координат AzerothCore
-    params.orig[0] = -32.0f * GRID_SIZE;
+    params.orig[0] = 0.0f;
     params.orig[1] = 0.0f;
-    params.orig[2] = -32.0f * GRID_SIZE;
+    params.orig[2] = 0.0f;
     
-    params.tileWidth = GRID_SIZE;
-    params.tileHeight = GRID_SIZE;
+    params.tileWidth = TILE_SIZE;
+    params.tileHeight = TILE_SIZE;
     params.maxTiles = 16384;     
     params.maxPolys = 1 << 22;   
     
@@ -67,15 +66,18 @@ void InitNavMesh() {
     
     g_Filter.setIncludeFlags(0xFFFF);
     g_Filter.setExcludeFlags(0);
-    std::cout << "[+] Detour NavMesh Engine Initialized (100% Accurate Math)!\n";
+    std::cout << "[+] Detour NavMesh Engine Initialized (Direct Mapping)!\n";
 }
 
 void GetGridCoordinates(float x, float y, int& gridX, int& gridY) {
-    gridX = (int)(32.0f - (x / GRID_SIZE));
-    gridY = (int)(32.0f - (y / GRID_SIZE));
+    gridX = (int)(32.0f - (x / TILE_SIZE));
+    gridY = (int)(32.0f - (y / TILE_SIZE));
 }
 
 bool LoadTile(int mapId, int gridX, int gridY) {
+    // Прямая загрузка тайла без смещений
+    if (g_NavMesh->getTileAt(gridX, gridY, 0)) return true; 
+
     char filename[512];
     sprintf_s(filename, "E:\\Cheats\\WoW Inject\\mmaps\\%03d%02d%02d.mmtile", mapId, gridX, gridY);
 
@@ -131,8 +133,8 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
     WoWToRecast(start, startPos);
     WoWToRecast(end, endPos);
     
-    // Радиус поиска: 15 ярдов по горизонтали, 30 ярдов по высоте
-    float extents[3] = { 15.0f, 30.0f, 15.0f };
+    // Огромный радиус поиска, чтобы 100% найти пол
+    float extents[3] = { 50.0f, 100.0f, 50.0f };
 
     dtPolyRef startRef = 0, endRef = 0;
     g_NavQuery->findNearestPoly(startPos, extents, &g_Filter, &startRef, 0);
@@ -165,7 +167,7 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
         }
         std::cout << "[+] Path found! Waypoints: " << straightPathCount << "\n";
     } else {
-        std::cout << "[-] WARNING: Path calculation failed (No path between polys). Using straight line.\n";
+        std::cout << "[-] WARNING: Path calculation failed. Using straight line.\n";
         path.push_back(end);
     }
 
@@ -173,7 +175,7 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
 }
 
 int main() {
-    std::cout << "--- WoW NavMesh Server (AzerothCore Edition) ---\n";
+    std::cout << "--- WoW NavMesh Server (Direct Mapping) ---\n";
     InitNavMesh();
 
     SECURITY_DESCRIPTOR sd;
