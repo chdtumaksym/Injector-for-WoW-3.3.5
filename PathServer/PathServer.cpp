@@ -5,10 +5,6 @@
 #include <fstream>
 #include <iomanip>
 
-// Подключаем Detour
-#include "DetourNavMesh.h"
-#include "DetourNavMeshQuery.h"
-
 struct Vector3 { float x, y, z; };
 
 struct PathRequest {
@@ -16,29 +12,14 @@ struct PathRequest {
     Vector3 end;
 };
 
-// Заголовок файла .mmtile (Формат TrinityCore/AzerothCore)
-#pragma pack(push, 1)
-struct MmapTileHeader {
-    uint32_t mmapMagic;
-    uint32_t dtVersion;
-    uint32_t mmapVersion;
-    uint32_t size;
-    char usesLiquids;
-    char padding[3];
-};
-#pragma pack(pop)
-
-// Функция перевода координат WoW в координаты сетки (Grid)
 void GetGridCoordinates(float x, float y, int& gridX, int& gridY) {
     const float TILE_SIZE = 533.33333f;
     gridX = (int)(32.0f - (x / TILE_SIZE));
     gridY = (int)(32.0f - (y / TILE_SIZE));
 }
 
-// Функция загрузки тайла с жесткого диска
 bool LoadTileHeader(int mapId, int gridX, int gridY) {
     char filename[512];
-    // [!] ИЗМЕНЕН ПУТЬ К ПАПКЕ MMAPS НА ДИСК E:\ [!]
     sprintf_s(filename, "E:\\Cheats\\WoW Inject\\mmaps\\%03d%02d%02d.mmtile", mapId, gridX, gridY);
 
     std::ifstream file(filename, std::ios::binary);
@@ -47,42 +28,40 @@ bool LoadTileHeader(int mapId, int gridX, int gridY) {
         return false;
     }
 
-    MmapTileHeader header;
-    file.read((char*)&header, sizeof(MmapTileHeader));
+    uint32_t magic = 0;
+    file.read((char*)&magic, sizeof(uint32_t));
 
-    // Проверяем магическое число 'MMAP' (в hex это 0x4D41504D)
-    if (header.mmapMagic == 0x4D41504D || header.mmapMagic == 0x50414D4D) {
-        std::cout << "[+] SUCCESS: Loaded Tile " << gridX << "_" << gridY << " | Detour Version: " << header.dtVersion << " | Size: " << header.size << " bytes\n";
+    std::cout << "[*] Checking Tile " << gridX << "_" << gridY << " | Magic: 0x" << std::hex << magic << std::dec << "\n";
+
+    if (magic == 0x4D4D4150 || magic == 0x50414D4D) {
+        std::cout << "[+] SUCCESS: Detected TrinityCore/AzerothCore Format!\n";
+        return true;
+    } else if (magic == 0x444E4156 || magic == 0x56414E44) {
+        std::cout << "[+] SUCCESS: Detected RAW Detour Format!\n";
         return true;
     } else {
-        std::cout << "[-] ERROR: Invalid Tile Magic in " << filename << "\n";
+        std::cout << "[-] ERROR: Unknown Tile Format! Please send this Magic code to the developer.\n";
         return false;
     }
 }
 
 std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
     std::vector<Vector3> path;
-    
-    // 1. Высчитываем, в каком квадрате мы находимся
     int gridX, gridY;
     GetGridCoordinates(start.x, start.y, gridX, gridY);
-    
-    // 2. Пытаемся прочитать файл карты для этого квадрата (MapID 0 = Восточные Королевства)
     LoadTileHeader(0, gridX, gridY);
 
-    // Пока отдаем прямую линию, чтобы бот продолжал бегать
     Vector3 mid1 = { start.x + (end.x - start.x) * 0.33f, start.y + (end.y - start.y) * 0.33f, start.z + (end.z - start.z) * 0.33f };
     Vector3 mid2 = { start.x + (end.x - start.x) * 0.66f, start.y + (end.y - start.y) * 0.66f, start.z + (end.z - start.z) * 0.66f };
     
     path.push_back(mid1);
     path.push_back(mid2);
     path.push_back(end);
-
     return path;
 }
 
 int main() {
-    std::cout << "--- WoW NavMesh Server (Phase 2: Map Parser) ---\n";
+    std::cout << "--- WoW NavMesh Server (Phase 2: Magic Detector) ---\n";
     std::cout << "[+] Waiting for Bot DLL to connect...\n";
 
     while (true) {
@@ -98,10 +77,8 @@ int main() {
             if (connected) {
                 PathRequest req;
                 DWORD bytesRead;
-                
                 if (ReadFile(hPipe, &req, sizeof(PathRequest), &bytesRead, NULL)) {
                     std::cout << "\n[*] Path requested from: " << req.start.x << ", " << req.start.y << "\n";
-                    
                     std::vector<Vector3> path = CalculatePath(req.start, req.end);
                     
                     DWORD bytesWritten;
