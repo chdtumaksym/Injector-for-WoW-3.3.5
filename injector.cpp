@@ -332,7 +332,7 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
         ImGui::Spacing(); ImGui::Separator();
 
-        // [!] ВОЗВРАЩЕНЫ КНОПКИ ЛОГОВ + ИСПРАВЛЕН CLEAR PROGRESS
+        // [!] ВОТ КНОПКИ ЛОГОВ (И ПРАВИЛЬНЫЙ CLEAR PROGRESS С СИГНАЛОМ)
         std::string liveLog = ReadBotLog();
         if (ImGui::Button("Copy to Clipboard")) ImGui::SetClipboardText(liveLog.c_str());
         ImGui::SameLine();
@@ -340,7 +340,7 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         ImGui::SameLine();
         if (ImGui::Button("Clear Progress")) {
             std::remove(CHEAT_FOLDER "progress.txt");
-            if (botStatus != -1) SendCommand(3); // Сигнал боту сбросить ОЗУ
+            if (botStatus != -1) SendCommand(3); // Команда 3 - сброс ОЗУ бота
             guiLog += "[!] Progress file cleared.\n";
         }
 
