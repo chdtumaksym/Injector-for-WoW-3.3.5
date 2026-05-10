@@ -218,12 +218,10 @@ uint64_t FindNpcGuidById(int npcId, float& outX, float& outY, float& outZ) {
     return 0;
 }
 
-// [!] ЧТЕНИЕ ЖУРНАЛА КВЕСТОВ ИЗ ПАМЯТИ [!]
+//[!] ИСПРАВЛЕНО: Истинный адрес журнала квестов в 3.3.5a (0xA34)
 bool HasQuest(uintptr_t pLocalDesc, int questId) {
-    // В 3.3.5a журнал квестов начинается со смещения 0x1394 в дескрипторе игрока
-    // Всего 25 слотов, каждый слот занимает 16 байт (4 uint32)
     for (int i = 0; i < 25; i++) {
-        int qId = *(int*)(pLocalDesc + 0x1394 + (i * 16));
+        int qId = *(int*)(pLocalDesc + 0xA34 + (i * 20)); // 5 полей по 4 байта = 20 байт на квест
         if (qId == questId) return true;
     }
     return false;
@@ -327,6 +325,9 @@ void BotPulse() {
     static DWORD lootTimer = 0;
     static DWORD deathTime = 0;
 
+    // ==========================================
+    // РЕЖИМ БОЯ И ЛУТА (ПРИОРИТЕТ)
+    // ==========================================
     if (hasTarget) {
         ProgrammaticTarget(g_BotTarget);
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
@@ -416,6 +417,9 @@ void BotPulse() {
         return; 
     } 
     
+    // ==========================================
+    // РАДАР (САМООБОРОНА + ГРИНД)
+    // ==========================================
     uint64_t bestGuid = 0;
     float bestDist = 25.0f; 
 
@@ -460,6 +464,9 @@ void BotPulse() {
         return;
     }
 
+    // ==========================================
+    // РЕЖИМ ЗАДАЧ (КВЕСТЫ И НАВИГАЦИЯ)
+    // ==========================================
     if (g_Profile.empty() || g_CurrentTaskIndex >= g_Profile.size()) {
         Log("[IDLE] Profile finished or not loaded. Waiting...");
         return;
@@ -506,7 +513,7 @@ void BotPulse() {
         }
     }
     else if (task.type == TASK_ACCEPT_QUEST) {
-        // [!] УМНАЯ ПРОВЕРКА: Если квест уже есть в журнале - пропускаем задачу!
+        // [!] ИСПРАВЛЕНО: Пропускаем, если квест уже взят
         if (HasQuest(pLocalDesc, task.questId)) {
             Log("[TASK] Quest %d is already in log! Skipping...", task.questId);
             g_CurrentTaskIndex++;
@@ -558,6 +565,13 @@ void BotPulse() {
         }
     }
     else if (task.type == TASK_TURN_IN_QUEST) {
+        // [!] ИСПРАВЛЕНО: Пропускаем, если квеста нет в журнале (уже сдан)
+        if (!HasQuest(pLocalDesc, task.questId)) {
+            Log("[TASK] Quest %d is not in log (already turned in?). Skipping...", task.questId);
+            g_CurrentTaskIndex++;
+            return;
+        }
+
         float npcX = 0, npcY = 0, npcZ = 0;
         uint64_t npcGuid = FindNpcGuidById(task.npcId, npcX, npcY, npcZ);
         
