@@ -1,4 +1,3 @@
---- START OF FILE payload.cpp ---
 #include <windows.h>
 #include <cmath>
 #include <stdint.h>
@@ -555,6 +554,19 @@ void BotPulse() {
         float distToNpc = GetDistance3D(myX, myY, myZ, npcX, npcY, npcZ);
         
         if (distToNpc > 4.5f) {
+            static float lastDistNpc = 0;
+            static DWORD stuckTimerNpc = 0;
+            if (abs(distToNpc - lastDistNpc) < 0.5f) {
+                if (GetTickCount() - stuckTimerNpc > 3000) {
+                    Log("[!] STUCK ON WALL! Jumping...");
+                    ExecuteLua("JumpOrAscendStart();");
+                    stuckTimerNpc = GetTickCount(); 
+                }
+            } else {
+                lastDistNpc = distToNpc;
+                stuckTimerNpc = GetTickCount();
+            }
+
             if (g_PathTargetGuid != npcGuid || g_CurrentPath.empty()) {
                 g_CurrentPath = RequestPathFromServer({myX, myY, myZ}, {npcX, npcY, npcZ});
                 g_PathIndex = 0;
@@ -639,6 +651,19 @@ void BotPulse() {
         float distToNpc = GetDistance3D(myX, myY, myZ, npcX, npcY, npcZ);
         
         if (distToNpc > 4.5f) {
+            static float lastDistNpc = 0;
+            static DWORD stuckTimerNpc = 0;
+            if (abs(distToNpc - lastDistNpc) < 0.5f) {
+                if (GetTickCount() - stuckTimerNpc > 3000) {
+                    Log("[!] STUCK ON WALL! Jumping...");
+                    ExecuteLua("JumpOrAscendStart();");
+                    stuckTimerNpc = GetTickCount(); 
+                }
+            } else {
+                lastDistNpc = distToNpc;
+                stuckTimerNpc = GetTickCount();
+            }
+
             if (g_PathTargetGuid != npcGuid || g_CurrentPath.empty()) {
                 g_CurrentPath = RequestPathFromServer({myX, myY, myZ}, {npcX, npcY, npcZ});
                 g_PathIndex = 0;
@@ -795,4 +820,3 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
     }
     return TRUE;
 }
---- END OF FILE payload.cpp ---
