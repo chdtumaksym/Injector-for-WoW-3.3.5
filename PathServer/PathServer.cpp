@@ -1,3 +1,4 @@
+#define NOMINMAX // [!] ФИКС ОШИБКИ КОМПИЛЯЦИИ C2589
 #include <windows.h>
 #include <iostream>
 #include <vector>
@@ -5,6 +6,7 @@
 #include <fstream>
 #include <algorithm>
 
+// Подключаем правильный Detour
 #include "DetourNavMesh.h"
 #include "DetourNavMeshQuery.h"
 
@@ -95,6 +97,7 @@ bool LoadTile(int mapId, int gridX, int gridY) {
     dtStatus status = g_NavMesh->addTile(data, header.size, DT_TILE_FREE_DATA, 0, &tileRef);
     
     if (dtStatusSucceed(status)) {
+        g_LoadedTiles.push_back(std::string(filename));
         std::cout << "[+] Loaded NavMesh Tile: " << gridX << "_" << gridY << "\n";
         return true;
     } else {
@@ -110,8 +113,7 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
     GetGridCoordinates(start.x, start.y, startGridX, startGridY);
     GetGridCoordinates(end.x, end.y, endGridX, endGridY);
     
-    // [!] УМНАЯ ЗАГРУЗКА КАРТ [!]
-    // Загружаем все квадраты между стартом и финишем, чтобы путь не обрывался на границах!
+    //[!] УМНАЯ ЗАГРУЗКА КАРТ [!]
     int minX = std::min(startGridX, endGridX) - 1;
     int maxX = std::max(startGridX, endGridX) + 1;
     int minY = std::min(startGridY, endGridY) - 1;
@@ -127,7 +129,6 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
     WoWToRecast(start, startPos);
     WoWToRecast(end, endPos);
     
-    // Радиус поиска полигона (50 метров), чтобы бот находил землю даже если прыгает
     float extents[3] = { 50.0f, 50.0f, 50.0f };
 
     dtPolyRef startRef = 0, endRef = 0;
