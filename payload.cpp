@@ -34,7 +34,6 @@ HINSTANCE g_hModule = NULL;
 std::vector<uint64_t> g_Blacklist; 
 uint64_t g_BotTarget = 0; 
 
-// ДОБАВЛЕН TASK_LOAD_PROFILE
 enum TaskType { TASK_GOTO, TASK_ACCEPT_QUEST, TASK_TURN_IN_QUEST, TASK_GRIND, TASK_LOAD_PROFILE };
 
 struct BotTask {
@@ -44,7 +43,7 @@ struct BotTask {
     int questId;
     int count;
     int killsDone;
-    char nextProfile[256]; // Для загрузки следующего файла
+    char nextProfile[256]; 
 };
 
 std::vector<BotTask> g_Profile;
@@ -90,7 +89,7 @@ void LoadProfile(const std::string& filename) {
         } 
         else if (command == "GRIND") {
             task.type = TASK_GRIND;
-            iss >> task.count >> task.npcId; // ТЕПЕРЬ ЧИТАЕМ ID МОБА!
+            iss >> task.count >> task.npcId; 
             g_Profile.push_back(task);
         }
         else if (command == "ACCEPT_QUEST") {
@@ -142,6 +141,29 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
         lastGuid = guid; lastType = type;
         lastX = x; lastY = y; lastZ = z;
     }
+}
+
+// Функция для поиска GUID нужного NPC по его ID
+uint64_t FindNpcGuidById(int npcId) {
+    uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
+    uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
+    if (!mgr) return 0;
+
+    uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
+    while (cur && (cur & 1) == 0) {
+        int type = *(int*)(cur + 0x14);
+        if (type == 3) { // Если это NPC
+            uintptr_t desc = *(uintptr_t*)(cur + 0x8);
+            if (desc) {
+                int entryId = *(int*)(desc + 0xC); // Читаем ID
+                if (entryId == npcId) {
+                    return *(uint64_t*)(cur + 0x30); // Возвращаем его GUID
+                }
+            }
+        }
+        cur = *(uintptr_t*)(cur + 0x3C);
+    }
+    return 0;
 }
 
 void BotPulse() {
@@ -289,9 +311,6 @@ void BotPulse() {
         return; 
     } 
     
-    // ==========================================
-    // НОВАЯ ЛОГИКА ПОИСКА ЦЕЛЕЙ (ФИКС ЛОШАДИ)
-    // ==========================================
     uint64_t bestGuid = 0;
     float bestDist = 25.0f; 
 
@@ -301,18 +320,17 @@ void BotPulse() {
     cur = *(uintptr_t*)(mgr + 0xAC);
     while (cur && (cur & 1) == 0) {
         int type = *(int*)(cur + 0x14);
-        if (type == 3) { // Если это NPC/Моб
+        if (type == 3) { 
             uint64_t guid = *(uint64_t*)(cur + 0x30);
             if (std::find(g_Blacklist.begin(), g_Blacklist.end(), guid) == g_Blacklist.end()) {
                 uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                 if (desc) {
                     int hp = *(int*)(desc + 0x60); 
                     uint32_t mobDynFlags = *(uint32_t*)(desc + 0x13C);
-                    int entryId = *(int*)(desc + 0xC); // ЧИТАЕМ ID МОБА ИЗ ПАМЯТИ!
+                    int entryId = *(int*)(desc + 0xC); 
 
                     bool isTapped = (mobDynFlags & 0x4) != 0;       
 
-                    // Атакуем ТОЛЬКО если у нас задача GRIND и ID моба совпадает с нужным!
                     if (isGrindTask && entryId == targetNpcId && hp > 0 && !isTapped) {
                         float mX = *(float*)(cur + 0x798);
                         float mY = *(float*)(cur + 0x79C);
@@ -357,6 +375,14 @@ void BotPulse() {
     else if (task.type == TASK_ACCEPT_QUEST) {
         if (taskTimer == 0) {
             printf("\n[TASK] Accepting Quest %d from NPC %d...\n", task.questId, task.npcId);
+            
+            uint64_t npcGuid = FindNpcGuidById(task.npcId);
+            if (npcGuid) {
+                *(uint64_t*)ADDR_MOUSEOVER_GUID = npcGuid;
+                ExecuteLua("InteractUnit('mouseover'); SelectGossipAvailableQuest(1); SelectAvailableQuest(1); AcceptQuest();");
+            } else {
+                printf("[-] NPC %d not found nearby!\n", task.npcId);
+            }
             taskTimer = GetTickCount();
         }
         if (GetTickCount() - taskTimer > 2000) {
@@ -367,6 +393,14 @@ void BotPulse() {
     else if (task.type == TASK_TURN_IN_QUEST) {
         if (taskTimer == 0) {
             printf("\n[TASK] Turning in Quest %d to NPC %d...\n", task.questId, task.npcId);
+            
+            uint64_t npcGuid = FindNpcGuidById(task.npcId);
+            if (npcGuid) {
+                *(uint64_t*)ADDR_MOUSEOVER_GUID = npcGuid;
+                ExecuteLua("InteractUnit('mouseover'); SelectGossipActiveQuest(1); SelectActiveQuest(1); CompleteQuest(); GetQuestReward(1);");
+            } else {
+                printf("[-] NPC %d not found nearby!\n", task.npcId);
+            }
             taskTimer = GetTickCount();
         }
         if (GetTickCount() - taskTimer > 2000) {
@@ -379,8 +413,6 @@ void BotPulse() {
     }
     else if (task.type == TASK_LOAD_PROFILE) {
         printf("\n[SYSTEM] Loading next profile: %s\n", task.nextProfile);
-        
-        // Формируем полный путь к новому профилю (ищем в той же папке, где лежал старый)
         std::string currentPath = GetProfilePathFromGUI();
         size_t lastSlash = currentPath.find_last_of("\\/");
         if (lastSlash != std::string::npos) {
