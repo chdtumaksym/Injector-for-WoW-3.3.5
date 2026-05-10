@@ -15,9 +15,11 @@
 #define ADDR_MOUSEOVER_GUID     0x00BD07A0 
 #define ADDR_LUA_EXECUTE        0x00819210 
 
+// ТИПЫ CLICK-TO-MOVE
 #define CTM_MOVE                4 
-#define CTM_LOOT                6
-#define CTM_ATTACK              11 
+#define CTM_INTERACT            5  // Взаимодействие с NPC (Квесты/Вендоры)
+#define CTM_LOOT                6  // Лут
+#define CTM_ATTACK              11 // Атака
 
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
@@ -89,7 +91,9 @@ void LoadProfile(const std::string& filename) {
         } 
         else if (command == "GRIND") {
             task.type = TASK_GRIND;
-            iss >> task.count >> task.npcId; 
+            task.npcId = 0; // По умолчанию 0, если ID не указан
+            iss >> task.count;
+            if (iss >> task.npcId) {} // Пытаемся прочитать ID моба
             g_Profile.push_back(task);
         }
         else if (command == "ACCEPT_QUEST") {
@@ -143,11 +147,11 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
     }
 }
 
-// Функция для поиска GUID нужного NPC по его ID
-uint64_t FindNpcGuidById(int npcId) {
+// Функция для поиска координат и GUID нужного NPC по его ID
+bool FindNpcById(int npcId, uint64_t& outGuid, float& outX, float& outY, float& outZ) {
     uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
     uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
-    if (!mgr) return 0;
+    if (!mgr) return false;
 
     uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
     while (cur && (cur & 1) == 0) {
@@ -155,15 +159,19 @@ uint64_t FindNpcGuidById(int npcId) {
         if (type == 3) { // Если это NPC
             uintptr_t desc = *(uintptr_t*)(cur + 0x8);
             if (desc) {
-                int entryId = *(int*)(desc + 0xC); // Читаем ID
+                int entryId = *(int*)(desc + 0xC); 
                 if (entryId == npcId) {
-                    return *(uint64_t*)(cur + 0x30); // Возвращаем его GUID
+                    outGuid = *(uint64_t*)(cur + 0x30);
+                    outX = *(float*)(cur + 0x798);
+                    outY = *(float*)(cur + 0x79C);
+                    outZ = *(float*)(cur + 0x7A0);
+                    return true;
                 }
             }
         }
         cur = *(uintptr_t*)(cur + 0x3C);
     }
-    return 0;
+    return false;
 }
 
 void BotPulse() {
@@ -195,6 +203,7 @@ void BotPulse() {
     int myMaxHp = *(int*)(pLocalDesc + 0x80); 
     if (myMaxHp <= 0) myMaxHp = 1; 
     float myHpPercent = ((float)myHp / (float)myMaxHp) * 100.0f;
+    int myFaction = *(int*)(pLocalDesc + 0xDC);
 
     if (myHpPercent < 40.0f) {
         ExecuteLua("MoveForwardStop(); MoveBackwardStop();"); 
@@ -312,7 +321,7 @@ void BotPulse() {
     } 
     
     uint64_t bestGuid = 0;
-    float bestDist = 25.0f; 
+    float bestDist = 40.0f; // УВЕЛИЧЕН РАДИУС ПОИСКА МОБОВ ДО 40 МЕТРОВ
 
     bool isGrindTask = (!g_Profile.empty() && g_CurrentTaskIndex < g_Profile.size() && g_Profile[g_CurrentTaskIndex].type == TASK_GRIND);
     int targetNpcId = isGrindTask ? g_Profile[g_CurrentTaskIndex].npcId : 0;
@@ -326,12 +335,22 @@ void BotPulse() {
                 uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                 if (desc) {
                     int hp = *(int*)(desc + 0x60); 
+                    int mobFaction = *(int*)(desc + 0xDC);
+                    uint32_t mobFlags = *(uint32_t*)(desc + 0xEC);
                     uint32_t mobDynFlags = *(uint32_t*)(desc + 0x13C);
                     int entryId = *(int*)(desc + 0xC); 
 
                     bool isTapped = (mobDynFlags & 0x4) != 0;       
+                    bool isUnattackable = (mobFlags & 0x102) != 0; 
 
-                    if (isGrindTask && entryId == targetNpcId && hp > 0 && !isTapped) {
+                    bool isEnemy = false;
+                    if (targetNpcId > 0) {
+                        isEnemy = (entryId == targetNpcId); // Ищем конкретного моба
+                    } else {
+                        isEnemy = (myFaction != mobFaction); // Если ID не указан, бьем чужую фракцию
+                    }
+
+                    if (isGrindTask && isEnemy && hp > 0 && !isTapped && !isUnattackable) {
                         float mX = *(float*)(cur + 0x798);
                         float mY = *(float*)(cur + 0x79C);
                         float mZ = *(float*)(cur + 0x7A0);
@@ -360,7 +379,6 @@ void BotPulse() {
     }
 
     BotTask& task = g_Profile[g_CurrentTaskIndex];
-    static DWORD taskTimer = 0; 
 
     if (task.type == TASK_GOTO) {
         float distToWaypoint = GetDistance3D(myX, myY, myZ, task.x, task.y, task.z);
@@ -372,44 +390,66 @@ void BotPulse() {
             printf("[TASK] Moving to Waypoint %d... Dist: %.1f      \r", g_CurrentTaskIndex, distToWaypoint);
         }
     }
-    else if (task.type == TASK_ACCEPT_QUEST) {
-        if (taskTimer == 0) {
-            printf("\n[TASK] Accepting Quest %d from NPC %d...\n", task.questId, task.npcId);
-            
-            uint64_t npcGuid = FindNpcGuidById(task.npcId);
-            if (npcGuid) {
-                *(uint64_t*)ADDR_MOUSEOVER_GUID = npcGuid;
-                ExecuteLua("InteractUnit('mouseover'); SelectGossipAvailableQuest(1); SelectAvailableQuest(1); AcceptQuest();");
+    // ==========================================
+    // НОВАЯ ЛОГИКА КВЕСТОВ (STATE MACHINE + CTM)
+    // ==========================================
+    else if (task.type == TASK_ACCEPT_QUEST || task.type == TASK_TURN_IN_QUEST) {
+        static int qState = 0;
+        static DWORD qTimer = 0;
+        
+        if (qState == 0) {
+            printf("\n[TASK] %s Quest %d with NPC %d...\n", 
+                task.type == TASK_ACCEPT_QUEST ? "Accepting" : "Turning in", 
+                task.questId, task.npcId);
+            qState = 1;
+        }
+        else if (qState == 1) {
+            uint64_t npcGuid = 0; float nX, nY, nZ;
+            if (FindNpcById(task.npcId, npcGuid, nX, nY, nZ)) {
+                float dist = GetDistance3D(myX, myY, myZ, nX, nY, nZ);
+                if (dist > 4.5f) {
+                    // Бежим к NPC через CTM_INTERACT
+                    ActionCTM(pLocal, CTM_INTERACT, npcGuid, nX, nY, nZ);
+                } else {
+                    // Подошли вплотную. Останавливаемся и открываем окно
+                    ExecuteLua("MoveForwardStop(); MoveBackwardStop();");
+                    ActionCTM(pLocal, CTM_INTERACT, npcGuid, nX, nY, nZ);
+                    ProgrammaticTarget(npcGuid); // Берем в таргет для надежности
+                    qTimer = GetTickCount();
+                    qState = 2;
+                }
             } else {
-                printf("[-] NPC %d not found nearby!\n", task.npcId);
+                printf("[-] NPC %d not found nearby! Skipping...\n", task.npcId);
+                g_CurrentTaskIndex++;
+                qState = 0;
             }
-            taskTimer = GetTickCount();
         }
-        if (GetTickCount() - taskTimer > 2000) {
-            g_CurrentTaskIndex++;
-            taskTimer = 0;
-        }
-    }
-    else if (task.type == TASK_TURN_IN_QUEST) {
-        if (taskTimer == 0) {
-            printf("\n[TASK] Turning in Quest %d to NPC %d...\n", task.questId, task.npcId);
-            
-            uint64_t npcGuid = FindNpcGuidById(task.npcId);
-            if (npcGuid) {
-                *(uint64_t*)ADDR_MOUSEOVER_GUID = npcGuid;
-                ExecuteLua("InteractUnit('mouseover'); SelectGossipActiveQuest(1); SelectActiveQuest(1); CompleteQuest(); GetQuestReward(1);");
-            } else {
-                printf("[-] NPC %d not found nearby!\n", task.npcId);
+        else if (qState == 2) {
+            // Ждем 1.5 секунды, пока откроется окно диалога
+            if (GetTickCount() - qTimer > 1500) { 
+                if (task.type == TASK_ACCEPT_QUEST) {
+                    ExecuteLua("SelectGossipAvailableQuest(1); SelectAvailableQuest(1); AcceptQuest();");
+                } else {
+                    ExecuteLua("SelectGossipActiveQuest(1); SelectActiveQuest(1); CompleteQuest(); GetQuestReward(1);");
+                }
+                qTimer = GetTickCount();
+                qState = 3;
             }
-            taskTimer = GetTickCount();
         }
-        if (GetTickCount() - taskTimer > 2000) {
-            g_CurrentTaskIndex++;
-            taskTimer = 0;
+        else if (qState == 3) {
+            // Ждем 1 секунду после нажатия кнопки "Принять", чтобы сервер засчитал квест
+            if (GetTickCount() - qTimer > 1000) { 
+                g_CurrentTaskIndex++;
+                qState = 0;
+            }
         }
     }
     else if (task.type == TASK_GRIND) {
-        printf("[TASK] Grinding mode active. Looking for mob ID %d... (%d/%d)      \r", task.npcId, task.killsDone, task.count);
+        if (task.npcId > 0) {
+            printf("[TASK] Grinding mode active. Looking for mob ID %d... (%d/%d)      \r", task.npcId, task.killsDone, task.count);
+        } else {
+            printf("[TASK] Grinding mode active. Looking for ANY enemy... (%d/%d)      \r", task.killsDone, task.count);
+        }
     }
     else if (task.type == TASK_LOAD_PROFILE) {
         printf("\n[SYSTEM] Loading next profile: %s\n", task.nextProfile);
