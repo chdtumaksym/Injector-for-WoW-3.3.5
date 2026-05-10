@@ -54,6 +54,7 @@ void Log(const char* format, ...) {
     lastMsg = newMsg;
 
     CreateDirectoryA("C:\\WoWBot", NULL);
+    // [!] ИСПРАВЛЕНО: app вместо trunc, чтобы лог не стирался при реинжекте
     std::ofstream logFile("C:\\WoWBot\\bot_log.txt", std::ios_base::app);
     if (logFile.is_open()) {
         logFile << newMsg << "\n";
@@ -104,7 +105,6 @@ std::vector<BotTask> g_Profile;
 int g_CurrentTaskIndex = 0;
 std::string g_CurrentProfileName = "";
 
-// [!] СИСТЕМА СОХРАНЕНИЯ ПРОГРЕССА
 void AdvanceTask() {
     g_CurrentTaskIndex++;
     g_CurrentPath.clear();
@@ -178,7 +178,6 @@ void LoadProfile(const std::string& filename) {
         }
     }
     
-    // Восстанавливаем прогресс после реинжекта
     std::ifstream progRead("C:\\WoWBot\\progress.txt");
     if (progRead.is_open()) {
         std::string savedProfile;
@@ -312,6 +311,15 @@ void BotPulse() {
     
     if (myHpPercent < 40.0f) {
         ExecuteLua("MoveForwardStop(); MoveBackwardStop();"); 
+        
+        // [!] УНИВЕРСАЛЬНАЯ РОТАЦИЯ ХИЛА
+        ExecuteLua(
+            "local p='player'; "
+            "if not UnitCastingInfo(p) then "
+            "  CastSpellByName('Holy Light'); CastSpellByName('Flash Heal'); "
+            "  CastSpellByName('Healing Touch'); CastSpellByName('Lesser Healing Wave'); "
+            "end"
+        );
         Log("[SURVIVAL] HP %.1f%%! Pausing tasks to heal...", myHpPercent);
         return; 
     }
@@ -373,8 +381,24 @@ void BotPulse() {
             } else {
                 ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
                 static DWORD lastAtk = 0;
-                if (GetTickCount() - lastAtk > 1500) {
-                    ExecuteLua("InteractUnit('mouseover'); StartAttack();");
+                if (GetTickCount() - lastAtk > 1000) {
+                    
+                    // [!] УНИВЕРСАЛЬНАЯ БОЕВАЯ РОТАЦИЯ 1-10 УРОВНЯ
+                    ExecuteLua(
+                        "InteractUnit('mouseover'); StartAttack(); "
+                        "local p='player'; "
+                        "if not UnitBuff(p, 'Devotion Aura') then CastSpellByName('Devotion Aura') end "
+                        "if not UnitBuff(p, 'Seal of Righteousness') then CastSpellByName('Seal of Righteousness') end "
+                        "if not UnitBuff(p, 'Power Word: Fortitude') then CastSpellByName('Power Word: Fortitude') end "
+                        "if not UnitBuff(p, 'Mark of the Wild') then CastSpellByName('Mark of the Wild') end "
+                        "if not UnitBuff(p, 'Demon Armor') then CastSpellByName('Demon Armor') end "
+                        "if not UnitCastingInfo(p) then "
+                        "  CastSpellByName('Judgement'); CastSpellByName('Crusader Strike'); "
+                        "  CastSpellByName('Sinister Strike'); CastSpellByName('Eviscerate'); "
+                        "  CastSpellByName('Fireball'); CastSpellByName('Frostbolt'); "
+                        "  CastSpellByName('Smite'); CastSpellByName('Lightning Bolt'); CastSpellByName('Wrath'); "
+                        "end"
+                    );
                     lastAtk = GetTickCount();
                 }
             }
@@ -483,6 +507,7 @@ void BotPulse() {
 
     BotTask& task = g_Profile[g_CurrentTaskIndex];
     static DWORD taskTimer = 0; 
+    static int taskState = 0; // Для многоступенчатых диалогов
 
     if (task.type == TASK_GOTO) {
         float distToWaypoint = GetDistance3D(myX, myY, myZ, task.x, task.y, task.z);
@@ -551,7 +576,6 @@ void BotPulse() {
                         Vector3 nextPt = g_CurrentPath[g_PathIndex];
                         if (GetDistance3D(myX, myY, myZ, nextPt.x, nextPt.y, nextPt.z) < 1.5f) g_PathIndex++;
                         else ActionCTM(pLocal, CTM_MOVE, 0, nextPt.x, nextPt.y, nextPt.z);
-                        Log("[TASK] Navigating to NPC %d spawn... Dist: %.1f", task.npcId, distToWaypoint);
                     } else {
                         ActionCTM(pLocal, CTM_MOVE, 0, task.x, task.y, task.z);
                     }
@@ -565,18 +589,7 @@ void BotPulse() {
         float distToNpc = GetDistance3D(myX, myY, myZ, npcX, npcY, npcZ);
         
         if (distToNpc > 4.5f) {
-            static float lastDistNpc = 0;
-            static DWORD stuckTimerNpc = 0;
-            if (abs(distToNpc - lastDistNpc) < 0.5f) {
-                if (GetTickCount() - stuckTimerNpc > 3000) {
-                    ExecuteLua("JumpOrAscendStart();");
-                    stuckTimerNpc = GetTickCount(); 
-                }
-            } else {
-                lastDistNpc = distToNpc;
-                stuckTimerNpc = GetTickCount();
-            }
-
+            taskState = 0; // Сбрасываем диалог пока бежим
             if (g_PathTargetGuid != npcGuid || g_CurrentPath.empty()) {
                 g_CurrentPath = RequestPathFromServer({myX, myY, myZ}, {npcX, npcY, npcZ});
                 g_PathIndex = 0;
@@ -591,16 +604,20 @@ void BotPulse() {
                 ActionCTM(pLocal, CTM_MOVE, npcGuid, npcX, npcY, npcZ);
             }
         } else {
-            if (taskTimer == 0) {
+            // [!] МНОГОСТУПЕНЧАТЫЙ ДИАЛОГ ВЗЯТИЯ КВЕСТА
+            if (taskState == 0) {
                 ExecuteLua("MoveForwardStop();");
                 *(uint64_t*)ADDR_MOUSEOVER_GUID = npcGuid;
                 ExecuteLua("InteractUnit('mouseover')"); 
                 taskTimer = GetTickCount();
+                taskState = 1;
+                Log("[TASK] Opening Dialog...");
             }
-            else if (GetTickCount() - taskTimer > 1500) {
+            else if (taskState == 1 && GetTickCount() - taskTimer > 1000) {
                 ExecuteLua("SelectGossipAvailableQuest(1); SelectAvailableQuest(1); AcceptQuest();");
+                Log("[TASK] Quest Accepted!");
                 AdvanceTask();
-                taskTimer = 0;
+                taskState = 0;
             }
         }
     }
@@ -618,18 +635,6 @@ void BotPulse() {
             if (task.x != 0.0f || task.y != 0.0f) {
                 float distToWaypoint = GetDistance3D(myX, myY, myZ, task.x, task.y, task.z);
                 
-                static float lastDist = 0;
-                static DWORD stuckTimer = 0;
-                if (abs(distToWaypoint - lastDist) < 0.5f) {
-                    if (GetTickCount() - stuckTimer > 3000) {
-                        ExecuteLua("JumpOrAscendStart();");
-                        stuckTimer = GetTickCount(); 
-                    }
-                } else {
-                    lastDist = distToWaypoint;
-                    stuckTimer = GetTickCount();
-                }
-
                 if (distToWaypoint > 2.0f) {
                     if (g_CurrentPath.empty()) {
                         g_CurrentPath = RequestPathFromServer({myX, myY, myZ}, {task.x, task.y, task.z});
@@ -639,7 +644,6 @@ void BotPulse() {
                         Vector3 nextPt = g_CurrentPath[g_PathIndex];
                         if (GetDistance3D(myX, myY, myZ, nextPt.x, nextPt.y, nextPt.z) < 1.5f) g_PathIndex++;
                         else ActionCTM(pLocal, CTM_MOVE, 0, nextPt.x, nextPt.y, nextPt.z);
-                        Log("[TASK] Navigating to NPC %d spawn... Dist: %.1f", task.npcId, distToWaypoint);
                     } else {
                         ActionCTM(pLocal, CTM_MOVE, 0, task.x, task.y, task.z);
                     }
@@ -653,18 +657,7 @@ void BotPulse() {
         float distToNpc = GetDistance3D(myX, myY, myZ, npcX, npcY, npcZ);
         
         if (distToNpc > 4.5f) {
-            static float lastDistNpc = 0;
-            static DWORD stuckTimerNpc = 0;
-            if (abs(distToNpc - lastDistNpc) < 0.5f) {
-                if (GetTickCount() - stuckTimerNpc > 3000) {
-                    ExecuteLua("JumpOrAscendStart();");
-                    stuckTimerNpc = GetTickCount(); 
-                }
-            } else {
-                lastDistNpc = distToNpc;
-                stuckTimerNpc = GetTickCount();
-            }
-
+            taskState = 0; // Сбрасываем диалог пока бежим
             if (g_PathTargetGuid != npcGuid || g_CurrentPath.empty()) {
                 g_CurrentPath = RequestPathFromServer({myX, myY, myZ}, {npcX, npcY, npcZ});
                 g_PathIndex = 0;
@@ -679,16 +672,26 @@ void BotPulse() {
                 ActionCTM(pLocal, CTM_MOVE, npcGuid, npcX, npcY, npcZ);
             }
         } else {
-            if (taskTimer == 0) {
+            // [!] МНОГОСТУПЕНЧАТАЯ СДАЧА КВЕСТА С ЗАДЕРЖКОЙ СЕРВЕРА
+            if (taskState == 0) {
                 ExecuteLua("MoveForwardStop();");
                 *(uint64_t*)ADDR_MOUSEOVER_GUID = npcGuid;
                 ExecuteLua("InteractUnit('mouseover')"); 
                 taskTimer = GetTickCount();
+                taskState = 1;
             }
-            else if (GetTickCount() - taskTimer > 1500) {
-                ExecuteLua("SelectGossipActiveQuest(1); SelectActiveQuest(1); CompleteQuest(); GetQuestReward(1);");
+            else if (taskState == 1 && GetTickCount() - taskTimer > 1000) {
+                // Нажимаем "Продолжить" (Continue)
+                ExecuteLua("SelectGossipActiveQuest(1); SelectActiveQuest(1); CompleteQuest();");
+                taskTimer = GetTickCount();
+                taskState = 2;
+            }
+            else if (taskState == 2 && GetTickCount() - taskTimer > 1000) {
+                // Ждем 1 сек ответа от сервера и лутаем награду
+                ExecuteLua("if GetNumQuestChoices() > 0 then GetQuestReward(1) else GetQuestReward() end");
+                Log("[TASK] Quest Turned In!");
                 AdvanceTask();
-                taskTimer = 0;
+                taskState = 0;
             }
         }
     }
@@ -714,7 +717,6 @@ DWORD WINAPI EjectThread(LPVOID) {
     return 0;
 }
 
-// [!] СИСТЕМА УПРАВЛЕНИЯ ИЗ GUI (IPC)
 void UpdateStatusFile() {
     std::ofstream statFile("C:\\WoWBot\\status.txt");
     if (statFile.is_open()) {
@@ -724,7 +726,6 @@ void UpdateStatusFile() {
 }
 
 LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    // Входящие команды от Инжектора (GUI)
     if (uMsg == WM_TOGGLE_BOT) {
         g_Active = !g_Active;
         UpdateStatusFile();
@@ -778,14 +779,23 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 
 DWORD WINAPI Setup(LPVOID) {
     CreateDirectoryA("C:\\WoWBot", NULL);
-    std::ofstream logFile("C:\\WoWBot\\bot_log.txt", std::ios_base::trunc);
-    logFile.close();
+    
+    // Пишем разделитель при новом инжекте
+    std::ofstream logFile("C:\\WoWBot\\bot_log.txt", std::ios_base::app);
+    if (logFile.is_open()) {
+        logFile << "\n--- NEW INJECTION ---\n";
+        logFile.close();
+    }
 
     g_WoWHwnd = FindWindowA(NULL, "World of Warcraft");
     if (!g_WoWHwnd) return 0;
+    
+    // Безопасная установка хука
     oWndProc = (WNDPROC)SetWindowLongA(g_WoWHwnd, GWL_WNDPROC, (LONG)HookedWndProc);
     SetTimer(g_WoWHwnd, 1337, 50, NULL); 
-    UpdateStatusFile(); // Сообщаем GUI, что бот загружен (пауза по умолчанию)
+    
+    g_Active = false; // По умолчанию бот всегда на паузе после инжекта
+    UpdateStatusFile();
     return 0;
 }
 
