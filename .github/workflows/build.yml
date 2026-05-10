@@ -28,8 +28,8 @@ jobs:
           
           cl.exe /std:c++17 /O2 /EHsc injector.cpp imgui_src/imgui.cpp imgui_src/imgui_draw.cpp imgui_src/imgui_tables.cpp imgui_src/imgui_widgets.cpp imgui_src/backends/imgui_impl_win32.cpp imgui_src/backends/imgui_impl_dx11.cpp /I imgui_src /I imgui_src/backends /link /OUT:injector.exe d3d11.lib d3dcompiler.lib user32.lib advapi32.lib shell32.lib comdlg32.lib
           
-          # Компилируем сервер с правильными исходниками
-          cl.exe /std:c++17 /O2 /EHsc PathServer/PathServer.cpp tc_src/dep/recastnavigation/Detour/Source/*.cpp /I tc_src/dep/recastnavigation/Detour/Include /link /OUT:PathServer.exe
+          # Компилируем сервер с правильными исходниками и библиотекой advapi32.lib
+          cl.exe /std:c++17 /O2 /EHsc PathServer/PathServer.cpp tc_src/dep/recastnavigation/Detour/Source/*.cpp /I tc_src/dep/recastnavigation/Detour/Include /link /OUT:PathServer.exe advapi32.lib
 
       - name: Upload Finished Bot Suite
         uses: actions/upload-artifact@v4
