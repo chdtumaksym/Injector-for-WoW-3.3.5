@@ -5,6 +5,7 @@
 #include <tchar.h>
 #include <windows.h>
 #include <tlhelp32.h>
+#include <commdlg.h> // Для окна "Сохранить как..."
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -227,7 +228,6 @@ void SetupCS2Style() {
     style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.85f, 0.50f, 0.10f, 0.80f);
 }
 
-// Функция для чтения логов из файла, который пишет DLL
 std::string ReadBotLog() {
     std::ifstream logFile("C:\\WoWBot\\bot_log.txt");
     if (!logFile.is_open()) return "Waiting for bot to start...\n";
@@ -236,10 +236,34 @@ std::string ReadBotLog() {
     return content;
 }
 
+// Функция для вызова окна "Сохранить как..."
+void SaveLogToFile(HWND hwndOwner, const std::string& logData) {
+    OPENFILENAMEA ofn;
+    char szFile[260] = { 0 };
+    
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwndOwner;
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile);
+    ofn.lpstrFilter = "Text Files (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrDefExt = "txt";
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+
+    if (GetSaveFileNameA(&ofn) == TRUE) {
+        std::ofstream out(ofn.lpstrFile);
+        if (out.is_open()) {
+            out << logData;
+            out.close();
+        }
+    }
+}
+
 int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"WoWBotClass", nullptr };
     RegisterClassExW(&wc);
-    HWND hwnd = CreateWindowW(wc.lpszClassName, L"WoW 3.3.5 Bot Launcher", WS_OVERLAPPEDWINDOW, 100, 100, 600, 450, nullptr, nullptr, wc.hInstance, nullptr);
+    HWND hwnd = CreateWindowW(wc.lpszClassName, L"WoW 3.3.5 Bot Launcher", WS_OVERLAPPEDWINDOW, 100, 100, 650, 500, nullptr, nullptr, wc.hInstance, nullptr);
 
     if (!CreateDeviceD3D(hwnd)) { CleanupDeviceD3D(); UnregisterClassW(wc.lpszClassName, wc.hInstance); return 1; }
     ShowWindow(hwnd, SW_SHOWDEFAULT); UpdateWindow(hwnd);
@@ -323,17 +347,26 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
 
         ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        std::string liveLog = ReadBotLog();
+
+        // Кнопки управления логами
+        if (ImGui::Button("Copy to Clipboard")) {
+            ImGui::SetClipboardText(liveLog.c_str());
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Save to File...")) {
+            SaveLogToFile(hwnd, liveLog);
+        }
+
+        ImGui::Spacing();
         ImGui::Text("Bot Live Log:");
         
-        ImGui::BeginChild("LogRegion", ImVec2(0, 0), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
-        
-        // Читаем логи из файла, который пишет DLL
-        std::string liveLog = ReadBotLog();
-        ImGui::TextUnformatted(liveLog.c_str());
-        
-        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
-            ImGui::SetScrollHereY(1.0f);
-        ImGui::EndChild();
+        // Многострочное текстовое поле (можно выделять и копировать вручную)
+        ImGui::InputTextMultiline("##LogRegion", (char*)liveLog.c_str(), liveLog.size(), 
+            ImVec2(-FLT_MIN, -FLT_MIN), ImGuiInputTextFlags_ReadOnly);
 
         ImGui::End();
 
