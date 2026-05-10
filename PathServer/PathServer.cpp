@@ -37,9 +37,9 @@ void GetGridCoordinates(float x, float y, int& gridX, int& gridY) {
 
 // Функция загрузки тайла с жесткого диска
 bool LoadTileHeader(int mapId, int gridX, int gridY) {
-    char filename[256];
-    // Формируем имя файла, например: C:\WoWBot\mmaps\0004832.mmtile
-    sprintf_s(filename, "C:\\WoWBot\\mmaps\\%03d%02d%02d.mmtile", mapId, gridX, gridY);
+    char filename[512];
+    // [!] ИЗМЕНЕН ПУТЬ К ПАПКЕ MMAPS НА ДИСК E:\ [!]
+    sprintf_s(filename, "E:\\Cheats\\WoW Inject\\mmaps\\%03d%02d%02d.mmtile", mapId, gridX, gridY);
 
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
