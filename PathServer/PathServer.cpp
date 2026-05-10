@@ -3,6 +3,7 @@
 #include <vector>
 #include <string>
 #include <fstream>
+#include <map>
 #include "DetourNavMesh.h"
 #include "DetourNavMeshQuery.h"
 
@@ -23,17 +24,17 @@ struct MmapTileHeader {
 dtNavMesh* g_NavMesh = nullptr;
 dtNavMeshQuery* g_NavQuery = nullptr;
 dtQueryFilter g_Filter;
+std::map<int, bool> g_LoadedTiles;
 
-// --- МАТРИЦЫ ТРАНСФОРМАЦИИ КООРДИНАТ (WoW <-> Detour) ---
 void WoWToRecast(const Vector3& wow, float* recast) {
-    recast[0] = 32.0f * 533.33333f - wow.y;
+    recast[0] = wow.y;
     recast[1] = wow.z;
-    recast[2] = 32.0f * 533.33333f - wow.x;
+    recast[2] = wow.x;
 }
 
 void RecastToWoW(const float* recast, Vector3& wow) {
-    wow.x = 32.0f * 533.33333f - recast[2];
-    wow.y = 32.0f * 533.33333f - recast[0];
+    wow.x = recast[2];
+    wow.y = recast[0];
     wow.z = recast[1];
 }
 
@@ -43,13 +44,12 @@ void InitNavMesh() {
     
     dtNavMeshParams params;
     memset(&params, 0, sizeof(params));
-    // Ориджин для стандартных mmaps от Trinity/AzerothCore всегда 0,0,0
-    params.orig[0] = 0.0f;
+    params.orig[0] = -32.0f * 533.33333f;
     params.orig[1] = 0.0f;
-    params.orig[2] = 0.0f;
+    params.orig[2] = -32.0f * 533.33333f;
     params.tileWidth = 533.33333f;
     params.tileHeight = 533.33333f;
-    params.maxTiles = 256;     
+    params.maxTiles = 1024;     
     params.maxPolys = 65536;   
     
     g_NavMesh->init(&params);
@@ -66,11 +66,10 @@ void GetGridCoordinates(float x, float y, int& gridX, int& gridY) {
 }
 
 bool LoadTile(int mapId, int gridX, int gridY) {
-    // ВНИМАНИЕ: В Detour X и Y перевернуты относительно WoW!
-    if (g_NavMesh->getTileAt(gridY, gridX, 0)) return true;
+    int tileHash = (mapId << 16) | (gridX << 8) | gridY;
+    if (g_LoadedTiles[tileHash]) return true;
 
     char filename[512];
-    // Желательно в будущем брать путь из конфига, а не хардкодить диск E:
     sprintf_s(filename, "E:\\Cheats\\WoW Inject\\mmaps\\%03d%02d%02d.mmtile", mapId, gridX, gridY);
 
     std::ifstream file(filename, std::ios::binary);
@@ -88,6 +87,7 @@ bool LoadTile(int mapId, int gridX, int gridY) {
     dtStatus status = g_NavMesh->addTile(data, header.size, DT_TILE_FREE_DATA, 0, &tileRef);
     
     if (dtStatusSucceed(status)) {
+        g_LoadedTiles[tileHash] = true;
         std::cout << "[+] Loaded NavMesh Tile: " << gridX << "_" << gridY << "\n";
         return true;
     } else {
@@ -106,13 +106,11 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
     LoadTile(0, startGridX, startGridY);
     LoadTile(0, endGridX, endGridY);
 
-    // Конвертируем WoW -> Recast
     float startPos[3], endPos[3];
     WoWToRecast(start, startPos);
     WoWToRecast(end, endPos);
     
-    // Расширяем зону поиска полигона до 10 метров (если бот стоит на камне или заборе)
-    float extents[3] = { 10.0f, 10.0f, 10.0f };
+    float extents[3] = { 5.0f, 5.0f, 5.0f };
 
     dtPolyRef startRef = 0, endRef = 0;
     g_NavQuery->findNearestPoly(startPos, extents, &g_Filter, &startRef, 0);
@@ -136,7 +134,6 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
 
         g_NavQuery->findStraightPath(startPos, endPos, polys, polyCount, straightPath, straightPathFlags, straightPathPolys, &straightPathCount, 256, 0);
 
-        // Конвертируем обратно Recast -> WoW
         for (int i = 0; i < straightPathCount; ++i) {
             Vector3 pt;
             RecastToWoW(&straightPath[i*3], pt);
@@ -151,7 +148,7 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
 }
 
 int main() {
-    std::cout << "--- WoW NavMesh Server (Coordinates Fixed) ---\n";
+    std::cout << "--- WoW NavMesh Server (True TrinityCore Logic) ---\n";
     InitNavMesh();
 
     while (true) {
