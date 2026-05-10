@@ -26,12 +26,13 @@ struct MmapTileHeader {
 dtNavMesh* g_NavMesh = nullptr;
 dtNavMeshQuery* g_NavQuery = nullptr;
 dtQueryFilter g_Filter;
+bool g_IsNavMeshInitialized = false;
 
 std::vector<std::string> g_LoadedTiles;
 
 const float GRID_SIZE = 533.33333f;
 
-// [!] ИСТИННАЯ КОНВЕРТАЦИЯ ОСЕЙ AZEROTHCORE
+// Стандартная конвертация осей WoW -> Detour
 void WoWToRecast(const Vector3& wow, float* recast) {
     recast[0] = wow.y;
     recast[1] = wow.z;
@@ -42,35 +43,6 @@ void RecastToWoW(const float* recast, Vector3& wow) {
     wow.y = recast[0];
     wow.z = recast[1];
     wow.x = recast[2];
-}
-
-void InitNavMesh() {
-    g_NavMesh = dtAllocNavMesh();
-    g_NavQuery = dtAllocNavMeshQuery();
-    
-    dtNavMeshParams params;
-    memset(&params, 0, sizeof(params));
-    
-    // [!] ИСТИННЫЙ ЦЕНТР МИРА AZEROTHCORE
-    params.orig[0] = -32.0f * GRID_SIZE;
-    params.orig[1] = 0.0f;
-    params.orig[2] = -32.0f * GRID_SIZE;
-    
-    params.tileWidth = GRID_SIZE;
-    params.tileHeight = GRID_SIZE;
-    params.maxTiles = 16384;     
-    params.maxPolys = 16384; // Безопасный лимит для инициализации Detour
-    
-    dtStatus status = g_NavMesh->init(&params);
-    if (dtStatusFailed(status)) {
-        std::cout << "[-] FATAL ERROR: dtNavMesh->init failed!\n";
-    }
-    
-    g_NavQuery->init(g_NavMesh, 2048);
-    
-    g_Filter.setIncludeFlags(0xFFFF);
-    g_Filter.setExcludeFlags(0);
-    std::cout << "[+] Detour NavMesh Engine Initialized (100% TrinityCore Math)!\n";
 }
 
 void GetGridCoordinates(float x, float y, int& gridX, int& gridY) {
@@ -99,20 +71,45 @@ bool LoadTile(int mapId, int gridX, int gridY) {
 
     file.read((char*)data, header.size);
 
+    // [!] ДИНАМИЧЕСКИЙ ПАРСИНГ БИНАРНОГО ЗАГОЛОВКА DETOUR
+    // Мы читаем реальный центр мира прямо из файла mmtile, чтобы 100% попасть в сетку!
+    if (!g_IsNavMeshInitialized) {
+        g_NavMesh = dtAllocNavMesh();
+        g_NavQuery = dtAllocNavMeshQuery();
+        
+        int tileX = *(int*)(data + 8);
+        int tileY = *(int*)(data + 12);
+        float bminX = *(float*)(data + 72);
+        float bminZ = *(float*)(data + 80);
+
+        dtNavMeshParams params;
+        memset(&params, 0, sizeof(params));
+        
+        // Высчитываем идеальный origin для твоего конкретного репака
+        params.orig[0] = bminX - (tileX * GRID_SIZE);
+        params.orig[1] = 0.0f;
+        params.orig[2] = bminZ - (tileY * GRID_SIZE);
+        params.tileWidth = GRID_SIZE;
+        params.tileHeight = GRID_SIZE;
+        params.maxTiles = 16384;     
+        params.maxPolys = 1 << 22;   
+        
+        g_NavMesh->init(&params);
+        g_NavQuery->init(g_NavMesh, 2048);
+        g_IsNavMeshInitialized = true;
+        
+        std::cout << "[+] Dynamic Origin Set: X=" << params.orig[0] << " Z=" << params.orig[2] << "\n";
+    }
+
     dtTileRef tileRef = 0;
     dtStatus status = g_NavMesh->addTile(data, header.size, DT_TILE_FREE_DATA, 0, &tileRef);
     
     if (dtStatusSucceed(status)) {
         g_LoadedTiles.push_back(std::string(filename));
-        
-        // Читаем заголовок самого Detour, чтобы видеть, куда он положил тайл
-        int* dtHeader = (int*)data;
-        std::cout << "[+] Loaded NavMesh Tile: " << gridX << "_" << gridY 
-                  << " (Detour X:" << dtHeader[2] << " Y:" << dtHeader[3] << ")\n";
+        std::cout << "[+] Loaded NavMesh Tile: " << gridX << "_" << gridY << "\n";
         return true;
     } else {
         dtFree(data);
-        std::cout << "[-] Failed to add tile to NavMesh!\n";
         return false;
     }
 }
@@ -135,11 +132,13 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
         }
     }
 
+    if (!g_IsNavMeshInitialized) return path;
+
     float startPos[3], endPos[3];
     WoWToRecast(start, startPos);
     WoWToRecast(end, endPos);
     
-    // Огромный радиус поиска (50 ярдов), чтобы 100% зацепить пол
+    // Большой радиус поиска
     float extents[3] = { 50.0f, 100.0f, 50.0f };
 
     dtPolyRef startRef = 0, endRef = 0;
@@ -181,8 +180,10 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
 }
 
 int main() {
-    std::cout << "--- WoW NavMesh Server (100% Accurate Math) ---\n";
-    InitNavMesh();
+    std::cout << "--- WoW NavMesh Server (Dynamic Binary Parser) ---\n";
+    
+    g_Filter.setIncludeFlags(0xFFFF);
+    g_Filter.setExcludeFlags(0);
 
     SECURITY_DESCRIPTOR sd;
     InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
