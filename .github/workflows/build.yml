@@ -17,7 +17,6 @@ jobs:
         run: |
           git clone --depth 1 -b docking https://github.com/ocornut/imgui.git imgui_src
 
-      # [!] КАЧАЕМ БИБЛИОТЕКУ НАВИГАЦИИ [!]
       - name: Download RecastNavigation (Detour)
         run: |
           git clone --depth 1 https://github.com/recastnavigation/recastnavigation.git recast_src
@@ -27,10 +26,10 @@ jobs:
           # 1. Компилируем бота (DLL)
           cl.exe /std:c++17 /O2 /LD /EHsc payload.cpp /link /OUT:bot_payload.dll user32.lib
           
-          # 2. Компилируем инжектор (EXE)
-          cl.exe /std:c++17 /O2 /EHsc injector.cpp imgui_src/imgui.cpp imgui_src/imgui_draw.cpp imgui_src/imgui_tables.cpp imgui_src/imgui_widgets.cpp imgui_src/backends/imgui_impl_win32.cpp imgui_src/backends/imgui_impl_dx11.cpp /I imgui_src /I imgui_src/backends /link /OUT:injector.exe d3d11.lib d3dcompiler.lib user32.lib advapi32.lib shell32.lib
+          # 2. Компилируем инжектор (EXE) с ImGui, DirectX 11 и comdlg32.lib (для окна сохранения логов)
+          cl.exe /std:c++17 /O2 /EHsc injector.cpp imgui_src/imgui.cpp imgui_src/imgui_draw.cpp imgui_src/imgui_tables.cpp imgui_src/imgui_widgets.cpp imgui_src/backends/imgui_impl_win32.cpp imgui_src/backends/imgui_impl_dx11.cpp /I imgui_src /I imgui_src/backends /link /OUT:injector.exe d3d11.lib d3dcompiler.lib user32.lib advapi32.lib shell32.lib comdlg32.lib
           
-          # 3. [!] КОМПИЛИРУЕМ СЕРВЕР ВМЕСТЕ С БИБЛИОТЕКОЙ DETOUR [!]
+          # 3. Компилируем сервер навигации (EXE) вместе с библиотекой DETOUR
           cl.exe /std:c++17 /O2 /EHsc PathServer/PathServer.cpp recast_src/Detour/Source/*.cpp /I recast_src/Detour/Include /link /OUT:PathServer.exe
 
       - name: Upload Finished Bot Suite
