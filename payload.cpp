@@ -23,7 +23,7 @@
 
 #define WM_PULSE_BOT            (WM_APP + 1000)
 
-// [!] ТВОЯ ПАПКА С ЧИТОМ (БОЛЬШЕ НИКАКИХ C:\WoWBot)
+// ТВОЯ ПАПКА С ЧИТОМ
 #define CHEAT_FOLDER "E:\\Cheats\\WoW Inject\\"
 
 #pragma runtime_checks("", off)
@@ -42,6 +42,7 @@ HANDLE g_hMutex = NULL;
 
 std::vector<uint64_t> g_Blacklist; 
 uint64_t g_BotTarget = 0; 
+DWORD g_TaskDelay = 0; // [!] Задержка для синхронизации с сервером WoW
 
 struct Vector3 { float x, y, z; };
 
@@ -66,10 +67,7 @@ void Log(const char* format, ...) {
 
 std::vector<Vector3> RequestPathFromServer(Vector3 start, Vector3 end) {
     std::vector<Vector3> path;
-    if (!WaitNamedPipeA("\\\\.\\pipe\\WoWNavMeshPipe", 500)) {
-        Log("[-] PathServer pipe timeout or not found.");
-        return path;
-    }
+    if (!WaitNamedPipeA("\\\\.\\pipe\\WoWNavMeshPipe", 500)) return path;
 
     HANDLE hPipe = CreateFileA("\\\\.\\pipe\\WoWNavMeshPipe", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
     if (hPipe != INVALID_HANDLE_VALUE) {
@@ -116,6 +114,7 @@ void AdvanceTask() {
         progFile << g_CurrentProfileName << "\n" << g_CurrentTaskIndex;
         progFile.close();
     }
+    g_TaskDelay = GetTickCount(); // [!] Ждем 2 секунды, чтобы сервер WoW обновил квесты
     Log("[TASK] Advanced to step %d", g_CurrentTaskIndex);
 }
 
@@ -171,6 +170,11 @@ void LoadProfile(const std::string& filename) {
             task.type = TASK_TURN_IN_QUEST;
             iss >> task.npcId >> task.questId;
             if (!(iss >> task.x >> task.y >> task.z)) { task.x = task.y = task.z = 0.0f; }
+            g_Profile.push_back(task);
+        }
+        else if (command == "LOAD_PROFILE") {
+            task.type = TASK_LOAD_PROFILE;
+            iss >> task.nextProfile;
             g_Profile.push_back(task);
         }
     }
@@ -250,9 +254,10 @@ uint64_t FindNpcGuidById(int npcId, float& outX, float& outY, float& outZ) {
     return 0;
 }
 
+// [!] ИСПРАВЛЕНО: В WotLK 3.3.5 на 1 квест выделяется 24 байта (6 полей по 4 байта)
 bool HasQuest(uintptr_t pLocalDesc, int questId) {
     for (int i = 0; i < 25; i++) {
-        int qId = *(int*)(pLocalDesc + 0xA34 + (i * 16)); 
+        int qId = *(int*)(pLocalDesc + 0xA34 + (i * 24)); 
         if (qId == questId) return true;
     }
     return false;
@@ -270,7 +275,6 @@ void CompleteKill() {
             Log("[GRIND] Kill %d / %d", g_Profile[g_CurrentTaskIndex].killsDone, g_Profile[g_CurrentTaskIndex].count);
             if (g_Profile[g_CurrentTaskIndex].killsDone >= g_Profile[g_CurrentTaskIndex].count) {
                 AdvanceTask();
-                Log("[TASK] Grind complete!");
             }
         }
     }
@@ -377,15 +381,16 @@ void BotPulse() {
             } else {
                 ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
                 static DWORD lastAtk = 0;
-                if (GetTickCount() - lastAtk > 1000) {
+                if (GetTickCount() - lastAtk > 1500) {
+                    // [!] ИДЕАЛЬНАЯ АВТОРОТАЦИЯ ДЛЯ 3.3.5 С ПРОВЕРКОЙ БАФОВ (Функция HasB)
                     ExecuteLua(
+                        "local function HasB(b) for i=1,40 do local n=UnitBuff('player',i); if n==b then return true end end return false end; "
                         "InteractUnit('mouseover'); StartAttack(); "
-                        "local p='player'; "
-                        "if not UnitBuff(p, 'Devotion Aura') then CastSpellByName('Devotion Aura') end "
-                        "if not UnitBuff(p, 'Seal of Righteousness') then CastSpellByName('Seal of Righteousness') end "
-                        "if not UnitBuff(p, 'Power Word: Fortitude') then CastSpellByName('Power Word: Fortitude') end "
-                        "if not UnitBuff(p, 'Mark of the Wild') then CastSpellByName('Mark of the Wild') end "
-                        "if not UnitCastingInfo(p) then "
+                        "if not HasB('Devotion Aura') then CastSpellByName('Devotion Aura') end; "
+                        "if not HasB('Seal of Righteousness') then CastSpellByName('Seal of Righteousness') end; "
+                        "if not HasB('Power Word: Fortitude') then CastSpellByName('Power Word: Fortitude') end; "
+                        "if not HasB('Mark of the Wild') then CastSpellByName('Mark of the Wild') end; "
+                        "if not UnitCastingInfo('player') then "
                         "  CastSpellByName('Judgement'); CastSpellByName('Crusader Strike'); "
                         "  CastSpellByName('Sinister Strike'); CastSpellByName('Eviscerate'); "
                         "  CastSpellByName('Fireball'); CastSpellByName('Smite'); "
@@ -497,9 +502,11 @@ void BotPulse() {
         return;
     }
 
+    // [!] Блокируем новые задачи на 2 секунды после AdvanceTask(), чтобы сервер успел прислать квест
+    if (GetTickCount() - g_TaskDelay < 2000) return;
+
     BotTask& task = g_Profile[g_CurrentTaskIndex];
     static DWORD taskTimer = 0; 
-    static int taskState = 0; 
 
     if (task.type == TASK_GOTO) {
         float distToWaypoint = GetDistance3D(myX, myY, myZ, task.x, task.y, task.z);
@@ -547,18 +554,6 @@ void BotPulse() {
             if (task.x != 0.0f || task.y != 0.0f) {
                 float distToWaypoint = GetDistance3D(myX, myY, myZ, task.x, task.y, task.z);
                 
-                static float lastDist = 0;
-                static DWORD stuckTimer = 0;
-                if (abs(distToWaypoint - lastDist) < 0.5f) {
-                    if (GetTickCount() - stuckTimer > 3000) {
-                        ExecuteLua("JumpOrAscendStart();");
-                        stuckTimer = GetTickCount(); 
-                    }
-                } else {
-                    lastDist = distToWaypoint;
-                    stuckTimer = GetTickCount();
-                }
-
                 if (distToWaypoint > 2.0f) {
                     if (g_CurrentPath.empty()) {
                         g_CurrentPath = RequestPathFromServer({myX, myY, myZ}, {task.x, task.y, task.z});
@@ -568,7 +563,6 @@ void BotPulse() {
                         Vector3 nextPt = g_CurrentPath[g_PathIndex];
                         if (GetDistance3D(myX, myY, myZ, nextPt.x, nextPt.y, nextPt.z) < 1.5f) g_PathIndex++;
                         else ActionCTM(pLocal, CTM_MOVE, 0, nextPt.x, nextPt.y, nextPt.z);
-                        Log("[TASK] Navigating to NPC %d spawn... Dist: %.1f", task.npcId, distToWaypoint);
                     } else {
                         ActionCTM(pLocal, CTM_MOVE, 0, task.x, task.y, task.z);
                     }
@@ -582,7 +576,6 @@ void BotPulse() {
         float distToNpc = GetDistance3D(myX, myY, myZ, npcX, npcY, npcZ);
         
         if (distToNpc > 4.5f) {
-            taskState = 0; 
             if (g_PathTargetGuid != npcGuid || g_CurrentPath.empty()) {
                 g_CurrentPath = RequestPathFromServer({myX, myY, myZ}, {npcX, npcY, npcZ});
                 g_PathIndex = 0;
@@ -597,19 +590,18 @@ void BotPulse() {
                 ActionCTM(pLocal, CTM_MOVE, npcGuid, npcX, npcY, npcZ);
             }
         } else {
-            if (taskState == 0) {
+            // [!] УМНЫЙ МАКРОС ВЗЯТИЯ КВЕСТА: Сам определяет какое окно открыто
+            if (GetTickCount() - taskTimer > 1500) {
                 ExecuteLua("MoveForwardStop();");
                 *(uint64_t*)ADDR_MOUSEOVER_GUID = npcGuid;
-                ExecuteLua("InteractUnit('mouseover')"); 
+                ExecuteLua(
+                    "InteractUnit('mouseover'); "
+                    "if GossipFrame and GossipFrame:IsVisible() then for i=1,10 do SelectGossipAvailableQuest(i) end end "
+                    "if QuestFrameGreetingPanel and QuestFrameGreetingPanel:IsVisible() then for i=1,10 do SelectAvailableQuest(i) end end "
+                    "if QuestFrameDetailPanel and QuestFrameDetailPanel:IsVisible() then AcceptQuest() end"
+                );
                 taskTimer = GetTickCount();
-                taskState = 1;
-                Log("[TASK] Opening Dialog...");
-            }
-            else if (taskState == 1 && GetTickCount() - taskTimer > 1000) {
-                ExecuteLua("SelectGossipAvailableQuest(1); SelectAvailableQuest(1); AcceptQuest();");
-                Log("[TASK] Quest Accepted!");
-                AdvanceTask();
-                taskState = 0;
+                Log("[TASK] Attempting to Accept Quest...");
             }
         }
     }
@@ -649,7 +641,6 @@ void BotPulse() {
         float distToNpc = GetDistance3D(myX, myY, myZ, npcX, npcY, npcZ);
         
         if (distToNpc > 4.5f) {
-            taskState = 0; 
             if (g_PathTargetGuid != npcGuid || g_CurrentPath.empty()) {
                 g_CurrentPath = RequestPathFromServer({myX, myY, myZ}, {npcX, npcY, npcZ});
                 g_PathIndex = 0;
@@ -664,24 +655,30 @@ void BotPulse() {
                 ActionCTM(pLocal, CTM_MOVE, npcGuid, npcX, npcY, npcZ);
             }
         } else {
-            if (taskState == 0) {
+            // [!] УМНЫЙ МАКРОС СДАЧИ КВЕСТА: Автоматически прокликивает диалоги до победного конца
+            if (GetTickCount() - taskTimer > 1500) {
                 ExecuteLua("MoveForwardStop();");
                 *(uint64_t*)ADDR_MOUSEOVER_GUID = npcGuid;
-                ExecuteLua("InteractUnit('mouseover')"); 
+                ExecuteLua(
+                    "InteractUnit('mouseover'); "
+                    "if GossipFrame and GossipFrame:IsVisible() then for i=1,10 do SelectGossipActiveQuest(i) end end "
+                    "if QuestFrameGreetingPanel and QuestFrameGreetingPanel:IsVisible() then for i=1,10 do SelectActiveQuest(i) end end "
+                    "if QuestFrameProgressPanel and QuestFrameProgressPanel:IsVisible() then CompleteQuest() end "
+                    "if QuestFrameRewardPanel and QuestFrameRewardPanel:IsVisible() then "
+                    "  if GetNumQuestChoices() > 0 then GetQuestReward(1) else GetQuestReward() end "
+                    "end"
+                );
                 taskTimer = GetTickCount();
-                taskState = 1;
+                Log("[TASK] Attempting to Turn In Quest...");
             }
-            else if (taskState == 1 && GetTickCount() - taskTimer > 1000) {
-                ExecuteLua("SelectGossipActiveQuest(1); SelectActiveQuest(1); CompleteQuest();");
-                taskTimer = GetTickCount();
-                taskState = 2;
-            }
-            else if (taskState == 2 && GetTickCount() - taskTimer > 1000) {
-                ExecuteLua("if GetNumQuestChoices() > 0 then GetQuestReward(1) else GetQuestReward() end");
-                Log("[TASK] Quest Turned In!");
-                AdvanceTask();
-                taskState = 0;
-            }
+        }
+    }
+    else if (task.type == TASK_LOAD_PROFILE) {
+        std::string currentPath = GetProfilePathFromGUI();
+        size_t lastSlash = currentPath.find_last_of("\\/");
+        if (lastSlash != std::string::npos) {
+            std::string newPath = currentPath.substr(0, lastSlash + 1) + task.nextProfile;
+            LoadProfile(newPath);
         }
     }
 }
@@ -721,7 +718,6 @@ void TriggerEject() {
     Log("[!] EJECTING BOT...");
 }
 
-// [!] ФОНОВЫЙ ПОТОК УПРАВЛЕНИЯ (Решает проблему зависания таймеров)
 DWORD WINAPI BotThread(LPVOID) {
     while (g_ThreadRunning) {
         static bool insPressed = false;
@@ -760,7 +756,6 @@ DWORD WINAPI BotThread(LPVOID) {
 }
 
 LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    // Безопасный вызов Lua только в главном потоке WoW
     if (uMsg == WM_PULSE_BOT) {
         SafeBotPulse();
         return 1;
@@ -785,7 +780,6 @@ DWORD WINAPI Setup(LPVOID) {
     g_Active = false; 
     UpdateStatusFile();
     
-    // Запускаем фоновый поток (сердце бота)
     CreateThread(0, 0, BotThread, 0, 0, 0);
     return 0;
 }
