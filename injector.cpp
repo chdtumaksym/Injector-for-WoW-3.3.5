@@ -227,10 +227,19 @@ void SetupCS2Style() {
     style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.85f, 0.50f, 0.10f, 0.80f);
 }
 
+// Функция для чтения логов из файла, который пишет DLL
+std::string ReadBotLog() {
+    std::ifstream logFile("C:\\WoWBot\\bot_log.txt");
+    if (!logFile.is_open()) return "Waiting for bot to start...\n";
+    
+    std::string content((std::istreambuf_iterator<char>(logFile)), std::istreambuf_iterator<char>());
+    return content;
+}
+
 int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"WoWBotClass", nullptr };
     RegisterClassExW(&wc);
-    HWND hwnd = CreateWindowW(wc.lpszClassName, L"WoW 3.3.5 Bot Launcher", WS_OVERLAPPEDWINDOW, 100, 100, 500, 350, nullptr, nullptr, wc.hInstance, nullptr);
+    HWND hwnd = CreateWindowW(wc.lpszClassName, L"WoW 3.3.5 Bot Launcher", WS_OVERLAPPEDWINDOW, 100, 100, 600, 450, nullptr, nullptr, wc.hInstance, nullptr);
 
     if (!CreateDeviceD3D(hwnd)) { CleanupDeviceD3D(); UnregisterClassW(wc.lpszClassName, wc.hInstance); return 1; }
     ShowWindow(hwnd, SW_SHOWDEFAULT); UpdateWindow(hwnd);
@@ -314,10 +323,14 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
 
         ImGui::Spacing();
-        ImGui::Text("Status Log:");
+        ImGui::Text("Bot Live Log:");
         
         ImGui::BeginChild("LogRegion", ImVec2(0, 0), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
-        ImGui::TextUnformatted(guiLog.c_str());
+        
+        // Читаем логи из файла, который пишет DLL
+        std::string liveLog = ReadBotLog();
+        ImGui::TextUnformatted(liveLog.c_str());
+        
         if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
             ImGui::SetScrollHereY(1.0f);
         ImGui::EndChild();
