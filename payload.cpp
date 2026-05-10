@@ -36,8 +36,47 @@ std::vector<uint64_t> g_Blacklist;
 uint64_t g_BotTarget = 0; 
 DWORD g_GCD = 0; 
 
+struct Vector3 { float x, y, z; };
+
 // ==========================================
-// --- СИСТЕМА ЛОГИРОВАНИЯ В ФАЙЛ (ДЛЯ GUI) ---
+// --- СВЯЗЬ С ВНЕШНИМ СЕРВЕРОМ NAVMESH ---
+// ==========================================
+void Log(const char* format, ...); // Forward declaration
+
+std::vector<Vector3> RequestPathFromServer(Vector3 start, Vector3 end) {
+    std::vector<Vector3> path;
+    
+    // [!] ФИКС: Ждем, пока сервер откроет канал (таймаут 100мс)
+    if (!WaitNamedPipeA("\\\\.\\pipe\\WoWNavMeshPipe", 100)) {
+        return path;
+    }
+
+    HANDLE hPipe = CreateFileA("\\\\.\\pipe\\WoWNavMeshPipe", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    
+    if (hPipe != INVALID_HANDLE_VALUE) {
+        struct { Vector3 s; Vector3 e; } req = { start, end };
+        DWORD bytesWritten, bytesRead;
+        
+        WriteFile(hPipe, &req, sizeof(req), &bytesWritten, NULL);
+        
+        int count = 0;
+        if (ReadFile(hPipe, &count, sizeof(int), &bytesRead, NULL) && count > 0) {
+            path.resize(count);
+            ReadFile(hPipe, path.data(), count * sizeof(Vector3), &bytesRead, NULL);
+        }
+        CloseHandle(hPipe);
+    } else {
+        Log("[-] Failed to connect to PathServer! Error: %d", GetLastError());
+    }
+    return path;
+}
+
+std::vector<Vector3> g_CurrentPath;
+int g_PathIndex = 0;
+uint64_t g_PathTargetGuid = 0;
+
+// ==========================================
+// --- СИСТЕМА ЛОГИРОВАНИЯ ---
 // ==========================================
 void Log(const char* format, ...) {
     char buffer[512];
@@ -46,7 +85,6 @@ void Log(const char* format, ...) {
     vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
 
-    // Анти-спам: не пишем одну и ту же строчку 100 раз подряд
     static std::string lastMsg = "";
     std::string newMsg(buffer);
     if (newMsg == lastMsg) return; 
@@ -163,7 +201,6 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
 
     float diff = sqrt(pow(x - lastX, 2) + pow(y - lastY, 2) + pow(z - lastZ, 2));
 
-    // [!] ФИКС ПЕРЕХВАТА УПРАВЛЕНИЯ: Обновляем приказ каждые 1.5 сек, даже если координаты те же
     if (guid != lastGuid || type != lastType || diff > 1.5f || GetTickCount() - lastTime > 1500) {
         uint64_t ctmGuid = guid;
         float ctmPos[3] = { x, y, z };
@@ -203,6 +240,7 @@ uint64_t FindNpcGuidById(int npcId, float& outX, float& outY, float& outZ) {
 void CompleteKill() {
     g_Blacklist.push_back(g_BotTarget);
     g_BotTarget = 0; 
+    g_CurrentPath.clear(); 
     ExecuteLua("ClearTarget(); CloseLoot();"); 
 
     if (!g_Profile.empty() && g_CurrentTaskIndex < g_Profile.size()) {
@@ -246,6 +284,18 @@ void BotPulse() {
     int myMaxHp = *(int*)(pLocalDesc + 0x80); 
     if (myMaxHp <= 0) myMaxHp = 1; 
     float myHpPercent = ((float)myHp / (float)myMaxHp) * 100.0f;
+    
+    uint32_t myFlags = *(uint32_t*)(pLocalDesc + 0xEC); 
+    bool inCombat = (myFlags & 0x80000) != 0; 
+    int myFaction = *(int*)(pLocalDesc + 0xDC);
+    
+    int myLevel = *(int*)(pLocalDesc + 0xD8);
+    static int lastLevel = 0;
+
+    if (myLevel != lastLevel) {
+        if (lastLevel != 0) Log("\n[LEVEL UP] Congratulations! You are now level %d!\n", myLevel);
+        lastLevel = myLevel;
+    }
 
     if (myHpPercent < 40.0f) {
         ExecuteLua("MoveForwardStop(); MoveBackwardStop();"); 
@@ -278,13 +328,16 @@ void BotPulse() {
             }
             cur = *(uintptr_t*)(cur + 0x3C);
         }
-        if (!hasTarget) g_BotTarget = 0; 
+        if (!hasTarget) { g_BotTarget = 0; g_CurrentPath.clear(); }
     }
 
     static bool isLooting = false;
     static DWORD lootTimer = 0;
     static DWORD deathTime = 0;
 
+    // ==========================================
+    // РЕЖИМ БОЯ И ЛУТА (ПРИОРИТЕТ)
+    // ==========================================
     if (hasTarget) {
         ProgrammaticTarget(g_BotTarget);
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
@@ -292,10 +345,28 @@ void BotPulse() {
         if (targetHp > 0) {
             isLooting = false; 
             deathTime = 0;
-            ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
-            Log("[COMBAT] Attacking... Dist: %.1f", dist);
             
-            if (dist < 5.0f) {
+            if (dist > 5.0f) {
+                if (g_PathTargetGuid != g_BotTarget || g_CurrentPath.empty()) {
+                    g_CurrentPath = RequestPathFromServer({myX, myY, myZ}, {tX, tY, tZ});
+                    g_PathIndex = 0;
+                    g_PathTargetGuid = g_BotTarget;
+                }
+                
+                if (!g_CurrentPath.empty() && g_PathIndex < g_CurrentPath.size()) {
+                    Vector3 nextPt = g_CurrentPath[g_PathIndex];
+                    float distToPt = GetDistance3D(myX, myY, myZ, nextPt.x, nextPt.y, nextPt.z);
+                    
+                    if (distToPt < 1.5f) g_PathIndex++;
+                    else ActionCTM(pLocal, CTM_MOVE, 0, nextPt.x, nextPt.y, nextPt.z);
+                    
+                    Log("[COMBAT] Navigating to target... Dist: %.1f", dist);
+                } else {
+                    ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ); 
+                }
+            } else {
+                ActionCTM(pLocal, CTM_ATTACK, g_BotTarget, tX, tY, tZ);
+                Log("[COMBAT] Attacking... Dist: %.1f", dist);
                 static DWORD lastAtk = 0;
                 if (GetTickCount() - lastAtk > 1500) {
                     ExecuteLua("InteractUnit('mouseover'); StartAttack();");
@@ -306,7 +377,19 @@ void BotPulse() {
         else {
             if (targetDynFlags & 1) { 
                 if (dist > 4.5f && !isLooting) {
-                    ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
+                    if (g_PathTargetGuid != g_BotTarget || g_CurrentPath.empty()) {
+                        g_CurrentPath = RequestPathFromServer({myX, myY, myZ}, {tX, tY, tZ});
+                        g_PathIndex = 0;
+                        g_PathTargetGuid = g_BotTarget;
+                    }
+                    
+                    if (!g_CurrentPath.empty() && g_PathIndex < g_CurrentPath.size()) {
+                        Vector3 nextPt = g_CurrentPath[g_PathIndex];
+                        if (GetDistance3D(myX, myY, myZ, nextPt.x, nextPt.y, nextPt.z) < 1.5f) g_PathIndex++;
+                        else ActionCTM(pLocal, CTM_MOVE, 0, nextPt.x, nextPt.y, nextPt.z);
+                    } else {
+                        ActionCTM(pLocal, CTM_MOVE, g_BotTarget, tX, tY, tZ);
+                    }
                 } else {
                     if (!isLooting) {
                         uint64_t ctmGuid = g_BotTarget;
@@ -344,6 +427,9 @@ void BotPulse() {
         return; 
     } 
     
+    // ==========================================
+    // РАДАР (САМООБОРОНА + ГРИНД)
+    // ==========================================
     uint64_t bestGuid = 0;
     float bestDist = 25.0f; 
 
@@ -383,10 +469,14 @@ void BotPulse() {
 
     if (bestGuid) {
         g_BotTarget = bestGuid; 
+        g_CurrentPath.clear(); 
         ProgrammaticTarget(g_BotTarget);
         return;
     }
 
+    // ==========================================
+    // РЕЖИМ ЗАДАЧ (КВЕСТЫ И НАВИГАЦИЯ)
+    // ==========================================
     if (g_Profile.empty() || g_CurrentTaskIndex >= g_Profile.size()) {
         Log("[IDLE] Profile finished or not loaded. Waiting...");
         return;
@@ -412,12 +502,24 @@ void BotPulse() {
             stuckTimer = GetTickCount();
         }
 
+        if (g_CurrentPath.empty()) {
+            g_CurrentPath = RequestPathFromServer({myX, myY, myZ}, {task.x, task.y, task.z});
+            g_PathIndex = 0;
+        }
+
         if (distToWaypoint < 2.0f) {
             Log("[TASK] Reached waypoint %d!", g_CurrentTaskIndex);
             g_CurrentTaskIndex++; 
+            g_CurrentPath.clear();
         } else {
-            ActionCTM(pLocal, CTM_MOVE, 0, task.x, task.y, task.z);
-            Log("[TASK] Moving to Waypoint %d... Dist: %.1f", g_CurrentTaskIndex, distToWaypoint);
+            if (!g_CurrentPath.empty() && g_PathIndex < g_CurrentPath.size()) {
+                Vector3 nextPt = g_CurrentPath[g_PathIndex];
+                if (GetDistance3D(myX, myY, myZ, nextPt.x, nextPt.y, nextPt.z) < 1.5f) g_PathIndex++;
+                else ActionCTM(pLocal, CTM_MOVE, 0, nextPt.x, nextPt.y, nextPt.z);
+                Log("[TASK] Navigating to Waypoint %d... Dist: %.1f", g_CurrentTaskIndex, distToWaypoint);
+            } else {
+                ActionCTM(pLocal, CTM_MOVE, 0, task.x, task.y, task.z); 
+            }
         }
     }
     else if (task.type == TASK_ACCEPT_QUEST || task.type == TASK_TURN_IN_QUEST) {
@@ -433,7 +535,19 @@ void BotPulse() {
         float distToNpc = GetDistance3D(myX, myY, myZ, npcX, npcY, npcZ);
         
         if (distToNpc > 4.5f) {
-            ActionCTM(pLocal, CTM_MOVE, npcGuid, npcX, npcY, npcZ);
+            if (g_PathTargetGuid != npcGuid || g_CurrentPath.empty()) {
+                g_CurrentPath = RequestPathFromServer({myX, myY, myZ}, {npcX, npcY, npcZ});
+                g_PathIndex = 0;
+                g_PathTargetGuid = npcGuid;
+            }
+            
+            if (!g_CurrentPath.empty() && g_PathIndex < g_CurrentPath.size()) {
+                Vector3 nextPt = g_CurrentPath[g_PathIndex];
+                if (GetDistance3D(myX, myY, myZ, nextPt.x, nextPt.y, nextPt.z) < 1.5f) g_PathIndex++;
+                else ActionCTM(pLocal, CTM_MOVE, 0, nextPt.x, nextPt.y, nextPt.z);
+            } else {
+                ActionCTM(pLocal, CTM_MOVE, npcGuid, npcX, npcY, npcZ);
+            }
             Log("[TASK] Approaching NPC %d... Dist: %.1f", task.npcId, distToNpc);
             taskTimer = 0;
         } else {
@@ -453,6 +567,7 @@ void BotPulse() {
                     Log("[TASK] Quest Turned In!");
                 }
                 g_CurrentTaskIndex++;
+                g_CurrentPath.clear();
                 taskTimer = 0;
             }
         }
@@ -534,12 +649,12 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
                 
                 if (g_Active) {
                     std::string profileToLoad = GetProfilePathFromGUI();
-                    // [!] ФИКС: Загружаем профиль только если он изменился или пуст!
                     if (!profileToLoad.empty() && (g_CurrentProfileName != profileToLoad || g_Profile.empty())) {
                         LoadProfile(profileToLoad);
                     }
                 } else { 
                     g_BotTarget = 0; 
+                    g_CurrentPath.clear();
                     ExecuteLua("ClearTarget(); CloseLoot();");
                     g_Blacklist.clear(); 
                 }
@@ -561,7 +676,6 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
 }
 
 DWORD WINAPI Setup(LPVOID) {
-    // Очищаем лог при новом инжекте
     CreateDirectoryA("C:\\WoWBot", NULL);
     std::ofstream logFile("C:\\WoWBot\\bot_log.txt", std::ios_base::trunc);
     logFile.close();
