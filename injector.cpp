@@ -102,7 +102,6 @@ bool ManualMapInject(DWORD pid, const char* dllPath, std::string& guiLog) {
     HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!hProc) return false;
 
-    // Очистка перед инжектом
     std::remove(CHEAT_FOLDER "status.txt");
     std::remove(CHEAT_FOLDER "cmd.txt");
 
@@ -207,6 +206,25 @@ std::string ReadBotLog() {
     return std::string((std::istreambuf_iterator<char>(logFile)), std::istreambuf_iterator<char>());
 }
 
+void SaveLogToFile(HWND hwndOwner, const std::string& logData) {
+    OPENFILENAMEA ofn;
+    char szFile[260] = { 0 };
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwndOwner;
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile);
+    ofn.lpstrFilter = "Text Files (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrDefExt = "txt";
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+
+    if (GetSaveFileNameA(&ofn) == TRUE) {
+        std::ofstream out(ofn.lpstrFile);
+        if (out.is_open()) out << logData;
+    }
+}
+
 void SendCommand(int cmd) {
     std::ofstream f(CHEAT_FOLDER "cmd.txt");
     if (f.is_open()) { f << cmd; f.close(); }
@@ -246,7 +264,6 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
         if (done) break;
 
-        // Надежная проверка мьютекса
         int botStatus = -1; 
         HANDLE hMutex = OpenMutexA(MUTEX_ALL_ACCESS, FALSE, "WoWBot_Active_Mutex");
         if (hMutex) {
@@ -314,10 +331,17 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
 
         ImGui::Spacing(); ImGui::Separator();
-        std::string liveLog = ReadBotLog();
 
+        // [!] ВОЗВРАЩЕНЫ КНОПКИ ЛОГОВ + ИСПРАВЛЕН CLEAR PROGRESS
+        std::string liveLog = ReadBotLog();
+        if (ImGui::Button("Copy to Clipboard")) ImGui::SetClipboardText(liveLog.c_str());
+        ImGui::SameLine();
+        if (ImGui::Button("Save to File...")) SaveLogToFile(hwnd, liveLog);
+        ImGui::SameLine();
         if (ImGui::Button("Clear Progress")) {
             std::remove(CHEAT_FOLDER "progress.txt");
+            if (botStatus != -1) SendCommand(3); // Сигнал боту сбросить ОЗУ
+            guiLog += "[!] Progress file cleared.\n";
         }
 
         ImGui::Spacing();
