@@ -29,21 +29,21 @@ dtQueryFilter g_Filter;
 
 std::vector<std::string> g_LoadedTiles;
 
-// Идеально точный размер тайла в WoW
-const float TILE_SIZE = 1600.0f / 3.0f; 
-const float CENTER_POINT = 32.0f * TILE_SIZE;
+// Истинные константы из исходников AzerothCore / TrinityCore
+const float GRID_SIZE = 533.33333f;
+const float CENTER_POINT = 32.0f * GRID_SIZE;
 
-// [!] ИСПРАВЛЕНО: Истинная конвертация координат TrinityCore 3.3.5
+// Точная конвертация осей AzerothCore
 void WoWToRecast(const Vector3& wow, float* recast) {
-    recast[0] = CENTER_POINT - wow.x;
+    recast[0] = wow.y;
     recast[1] = wow.z;
-    recast[2] = CENTER_POINT - wow.y;
+    recast[2] = wow.x;
 }
 
 void RecastToWoW(const float* recast, Vector3& wow) {
-    wow.x = CENTER_POINT - recast[0];
+    wow.x = recast[2];
+    wow.y = recast[0];
     wow.z = recast[1];
-    wow.y = CENTER_POINT - recast[2];
 }
 
 void InitNavMesh() {
@@ -53,13 +53,13 @@ void InitNavMesh() {
     dtNavMeshParams params;
     memset(&params, 0, sizeof(params));
     
-    // В TrinityCore центр координат для Detour всегда 0,0,0
-    params.orig[0] = 0.0f;
+    // Точный центр координат AzerothCore
+    params.orig[0] = -CENTER_POINT;
     params.orig[1] = 0.0f;
-    params.orig[2] = 0.0f;
+    params.orig[2] = -CENTER_POINT;
     
-    params.tileWidth = TILE_SIZE;
-    params.tileHeight = TILE_SIZE;
+    params.tileWidth = GRID_SIZE;
+    params.tileHeight = GRID_SIZE;
     params.maxTiles = 16384;     
     params.maxPolys = 1 << 22;   
     
@@ -68,18 +68,15 @@ void InitNavMesh() {
     
     g_Filter.setIncludeFlags(0xFFFF);
     g_Filter.setExcludeFlags(0);
-    std::cout << "[+] Detour NavMesh Engine Initialized (TrinityCore Coordinates)!\n";
+    std::cout << "[+] Detour NavMesh Engine Initialized (AzerothCore Coordinates)!\n";
 }
 
 void GetGridCoordinates(float x, float y, int& gridX, int& gridY) {
-    gridX = (int)(32.0f - (x / TILE_SIZE));
-    gridY = (int)(32.0f - (y / TILE_SIZE));
+    gridX = (int)(32.0f - (x / GRID_SIZE));
+    gridY = (int)(32.0f - (y / GRID_SIZE));
 }
 
 bool LoadTile(int mapId, int gridX, int gridY) {
-    // Теперь координаты тайлов Detour идеально совпадают с сеткой WoW
-    if (g_NavMesh->getTileAt(gridX, gridY, 0)) return true; 
-
     char filename[512];
     sprintf_s(filename, "E:\\Cheats\\WoW Inject\\mmaps\\%03d%02d%02d.mmtile", mapId, gridX, gridY);
 
@@ -135,8 +132,8 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
     WoWToRecast(start, startPos);
     WoWToRecast(end, endPos);
     
-    // Радиус поиска: 10 ярдов по горизонтали, 20 ярдов по вертикали (высоте)
-    float extents[3] = { 10.0f, 20.0f, 10.0f };
+    // Огромный радиус поиска (50 ярдов по X/Z, 100 ярдов по высоте Y)
+    float extents[3] = { 50.0f, 100.0f, 50.0f };
 
     dtPolyRef startRef = 0, endRef = 0;
     g_NavQuery->findNearestPoly(startPos, extents, &g_Filter, &startRef, 0);
@@ -177,7 +174,7 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
 }
 
 int main() {
-    std::cout << "--- WoW NavMesh Server (TrinityCore Edition) ---\n";
+    std::cout << "--- WoW NavMesh Server (AzerothCore Edition) ---\n";
     InitNavMesh();
 
     SECURITY_DESCRIPTOR sd;
