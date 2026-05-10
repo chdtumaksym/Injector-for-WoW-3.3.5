@@ -1,4 +1,5 @@
-#define NOMINMAX // [!] ФИКС ОШИБКИ КОМПИЛЯЦИИ C2589
+--- START OF FILE PathServer.cpp ---
+#define NOMINMAX 
 #include <windows.h>
 #include <iostream>
 #include <vector>
@@ -6,7 +7,6 @@
 #include <fstream>
 #include <algorithm>
 
-// Подключаем правильный Detour
 #include "DetourNavMesh.h"
 #include "DetourNavMeshQuery.h"
 
@@ -30,7 +30,6 @@ dtQueryFilter g_Filter;
 
 std::vector<std::string> g_LoadedTiles;
 
-// --- ИСТИННАЯ ТРАНСФОРМАЦИЯ КООРДИНАТ TRINITYCORE ---
 void WoWToRecast(const Vector3& wow, float* recast) {
     recast[0] = wow.y;
     recast[1] = wow.z;
@@ -71,11 +70,10 @@ void GetGridCoordinates(float x, float y, int& gridX, int& gridY) {
 }
 
 bool LoadTile(int mapId, int gridX, int gridY) {
-    // В Detour координаты тайлов высчитываются по формуле TrinityCore
     int navX = 32 - gridY;
     int navY = 32 - gridX;
     
-    if (g_NavMesh->getTileAt(navX, navY, 0)) return true; // Уже загружен
+    if (g_NavMesh->getTileAt(navX, navY, 0)) return true; 
 
     char filename[512];
     sprintf_s(filename, "E:\\Cheats\\WoW Inject\\mmaps\\%03d%02d%02d.mmtile", mapId, gridX, gridY);
@@ -113,7 +111,6 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
     GetGridCoordinates(start.x, start.y, startGridX, startGridY);
     GetGridCoordinates(end.x, end.y, endGridX, endGridY);
     
-    //[!] УМНАЯ ЗАГРУЗКА КАРТ [!]
     int minX = std::min(startGridX, endGridX) - 1;
     int maxX = std::max(startGridX, endGridX) + 1;
     int minY = std::min(startGridY, endGridY) - 1;
@@ -171,28 +168,44 @@ int main() {
     std::cout << "--- WoW NavMesh Server (True Coordinates) ---\n";
     InitNavMesh();
 
+    // [!] ИСПРАВЛЕНО: Создаем Null DACL, чтобы любой процесс (даже без прав Админа) мог подключиться к пайпу
+    SECURITY_DESCRIPTOR sd;
+    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = &sd;
+    sa.bInheritHandle = FALSE;
+
     while (true) {
+        // [!] ИСПРАВЛЕНО: Используем PIPE_TYPE_BYTE для совместимости с CreateFileA в боте
         HANDLE hPipe = CreateNamedPipeA(
             "\\\\.\\pipe\\WoWNavMeshPipe", PIPE_ACCESS_DUPLEX,
-            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-            PIPE_UNLIMITED_INSTANCES, 1024 * 16, 1024 * 16, 0, NULL);
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_UNLIMITED_INSTANCES, 1024 * 16, 1024 * 16, 0, &sa);
 
         if (hPipe != INVALID_HANDLE_VALUE) {
             if (ConnectNamedPipe(hPipe, NULL) || GetLastError() == ERROR_PIPE_CONNECTED) {
                 PathRequest req;
                 DWORD bytesRead;
                 if (ReadFile(hPipe, &req, sizeof(PathRequest), &bytesRead, NULL)) {
+                    std::cout << "[+] Request: " << req.start.x << "," << req.start.y << " -> " << req.end.x << "," << req.end.y << "\n";
                     std::vector<Vector3> path = CalculatePath(req.start, req.end);
                     DWORD bytesWritten;
                     int count = path.size();
                     WriteFile(hPipe, &count, sizeof(int), &bytesWritten, NULL);
                     WriteFile(hPipe, path.data(), count * sizeof(Vector3), &bytesWritten, NULL);
+                } else {
+                    std::cout << "[-] ReadFile failed. Error: " << GetLastError() << "\n";
                 }
             }
             FlushFileBuffers(hPipe);
             DisconnectNamedPipe(hPipe);
+        } else {
+            std::cout << "[-] Failed to create pipe. Error: " << GetLastError() << "\n";
+            Sleep(1000);
         }
-        CloseHandle(hPipe);
     }
     return 0;
 }
+--- END OF FILE PathServer.cpp ---
