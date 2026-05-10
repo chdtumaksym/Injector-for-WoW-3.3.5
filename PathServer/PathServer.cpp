@@ -33,10 +33,13 @@ int main() {
             "\\\\.\\pipe\\WoWNavMeshPipe",
             PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-            1, 1024 * 16, 1024 * 16, 0, NULL);
+            PIPE_UNLIMITED_INSTANCES, 1024 * 16, 1024 * 16, 0, NULL);
 
         if (hPipe != INVALID_HANDLE_VALUE) {
-            if (ConnectNamedPipe(hPipe, NULL) != FALSE) {
+            // [!] ФИКС: Обработка моментального подключения (Race Condition)
+            bool connected = ConnectNamedPipe(hPipe, NULL) ? true : (GetLastError() == ERROR_PIPE_CONNECTED);
+            
+            if (connected) {
                 PathRequest req;
                 DWORD bytesRead;
                 
@@ -51,6 +54,7 @@ int main() {
                     WriteFile(hPipe, path.data(), count * sizeof(Vector3), &bytesWritten, NULL);
                 }
             }
+            FlushFileBuffers(hPipe);
             DisconnectNamedPipe(hPipe);
         }
         CloseHandle(hPipe);
