@@ -1,6 +1,12 @@
 #include <windows.h>
 #include <iostream>
 #include <vector>
+#include <string>
+#include <fstream>
+
+// [!] ПОДКЛЮЧАЕМ БИБЛИОТЕКУ DETOUR [!]
+#include "DetourNavMesh.h"
+#include "DetourNavMeshQuery.h"
 
 struct Vector3 { float x, y, z; };
 
@@ -9,11 +15,25 @@ struct PathRequest {
     Vector3 end;
 };
 
-// Заглушка. Позже здесь будет реальный DetourNavMeshQuery
+// Глобальные объекты навигации
+dtNavMesh* g_NavMesh = nullptr;
+dtNavMeshQuery* g_NavQuery = nullptr;
+
+// Инициализация движка Detour
+void InitNavMesh() {
+    g_NavMesh = dtAllocNavMesh();
+    g_NavQuery = dtAllocNavMeshQuery();
+    
+    std::cout << "[+] Detour NavMesh Engine Initialized!\n";
+    std::cout << "[!] Note: Map loading logic will be added in Phase 2.\n";
+}
+
+// Функция расчета пути (Пока что возвращает прямую линию, так как карты еще не загружены)
 std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
     std::vector<Vector3> path;
     
-    // Разбиваем прямую линию на 3 точки, чтобы проверить связь с DLL
+    // В следующем этапе здесь будет вызов g_NavQuery->findPath(...)
+    // А пока просто отдаем прямую линию, чтобы не сломать бота
     Vector3 mid1 = { start.x + (end.x - start.x) * 0.33f, start.y + (end.y - start.y) * 0.33f, start.z + (end.z - start.z) * 0.33f };
     Vector3 mid2 = { start.x + (end.x - start.x) * 0.66f, start.y + (end.y - start.y) * 0.66f, start.z + (end.z - start.z) * 0.66f };
     
@@ -25,7 +45,10 @@ std::vector<Vector3> CalculatePath(Vector3 start, Vector3 end) {
 }
 
 int main() {
-    std::cout << "--- WoW NavMesh Server (Phase 1: Bridge) ---\n";
+    std::cout << "--- WoW NavMesh Server (Phase 2: Detour Integration) ---\n";
+    
+    InitNavMesh(); // Запускаем движок навигации
+
     std::cout << "[+] Waiting for Bot DLL to connect...\n";
 
     while (true) {
@@ -36,7 +59,6 @@ int main() {
             PIPE_UNLIMITED_INSTANCES, 1024 * 16, 1024 * 16, 0, NULL);
 
         if (hPipe != INVALID_HANDLE_VALUE) {
-            // [!] ФИКС: Обработка моментального подключения (Race Condition)
             bool connected = ConnectNamedPipe(hPipe, NULL) ? true : (GetLastError() == ERROR_PIPE_CONNECTED);
             
             if (connected) {
