@@ -15,11 +15,10 @@
 #define ADDR_MOUSEOVER_GUID     0x00BD07A0 
 #define ADDR_LUA_EXECUTE        0x00819210 
 
-// ТИПЫ CLICK-TO-MOVE
 #define CTM_MOVE                4 
-#define CTM_INTERACT            5  // Взаимодействие с NPC (Квесты/Вендоры)
-#define CTM_LOOT                6  // Лут
-#define CTM_ATTACK              11 // Атака
+#define CTM_INTERACT            5  // Подходит для NPC и Квестов
+#define CTM_LOOT                6
+#define CTM_ATTACK              11 
 
 #pragma runtime_checks("", off)
 #pragma check_stack(off)
@@ -91,9 +90,7 @@ void LoadProfile(const std::string& filename) {
         } 
         else if (command == "GRIND") {
             task.type = TASK_GRIND;
-            task.npcId = 0; // По умолчанию 0, если ID не указан
-            iss >> task.count;
-            if (iss >> task.npcId) {} // Пытаемся прочитать ID моба
+            iss >> task.count >> task.npcId; 
             g_Profile.push_back(task);
         }
         else if (command == "ACCEPT_QUEST") {
@@ -147,31 +144,47 @@ void ActionCTM(uintptr_t pLocal, int type, uint64_t guid, float x, float y, floa
     }
 }
 
-// Функция для поиска координат и GUID нужного NPC по его ID
-bool FindNpcById(int npcId, uint64_t& outGuid, float& outX, float& outY, float& outZ) {
+uint64_t FindNpcGuidById(int npcId, float& outX, float& outY, float& outZ) {
     uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
     uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
-    if (!mgr) return false;
+    if (!mgr) return 0;
 
     uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
     while (cur && (cur & 1) == 0) {
         int type = *(int*)(cur + 0x14);
-        if (type == 3) { // Если это NPC
+        if (type == 3) { 
             uintptr_t desc = *(uintptr_t*)(cur + 0x8);
             if (desc) {
                 int entryId = *(int*)(desc + 0xC); 
                 if (entryId == npcId) {
-                    outGuid = *(uint64_t*)(cur + 0x30);
                     outX = *(float*)(cur + 0x798);
                     outY = *(float*)(cur + 0x79C);
                     outZ = *(float*)(cur + 0x7A0);
-                    return true;
+                    return *(uint64_t*)(cur + 0x30); 
                 }
             }
         }
         cur = *(uintptr_t*)(cur + 0x3C);
     }
-    return false;
+    return 0;
+}
+
+// [!] УНИВЕРСАЛЬНАЯ ФУНКЦИЯ ЗАВЕРШЕНИЯ УБИЙСТВА [!]
+void CompleteKill() {
+    g_Blacklist.push_back(g_BotTarget);
+    g_BotTarget = 0; 
+    ExecuteLua("ClearTarget(); CloseLoot();"); 
+
+    if (!g_Profile.empty() && g_CurrentTaskIndex < g_Profile.size()) {
+        if (g_Profile[g_CurrentTaskIndex].type == TASK_GRIND) {
+            g_Profile[g_CurrentTaskIndex].killsDone++;
+            printf("\n[GRIND] Kill %d / %d\n", g_Profile[g_CurrentTaskIndex].killsDone, g_Profile[g_CurrentTaskIndex].count);
+            if (g_Profile[g_CurrentTaskIndex].killsDone >= g_Profile[g_CurrentTaskIndex].count) {
+                g_CurrentTaskIndex++;
+                printf("[TASK] Grind complete! Moving to next task.\n");
+            }
+        }
+    }
 }
 
 void BotPulse() {
@@ -203,7 +216,9 @@ void BotPulse() {
     int myMaxHp = *(int*)(pLocalDesc + 0x80); 
     if (myMaxHp <= 0) myMaxHp = 1; 
     float myHpPercent = ((float)myHp / (float)myMaxHp) * 100.0f;
-    int myFaction = *(int*)(pLocalDesc + 0xDC);
+    
+    uint32_t myFlags = *(uint32_t*)(pLocalDesc + 0xEC); 
+    bool inCombat = (myFlags & 0x80000) != 0; 
 
     if (myHpPercent < 40.0f) {
         ExecuteLua("MoveForwardStop(); MoveBackwardStop();"); 
@@ -243,6 +258,9 @@ void BotPulse() {
     static DWORD lootTimer = 0;
     static DWORD deathTime = 0;
 
+    // ==========================================
+    // РЕЖИМ БОЯ И ЛУТА (ПРИОРИТЕТ)
+    // ==========================================
     if (hasTarget) {
         ProgrammaticTarget(g_BotTarget);
         float dist = GetDistance3D(myX, myY, myZ, tX, tY, tZ);
@@ -282,37 +300,19 @@ void BotPulse() {
                     }
 
                     if (GetTickCount() - lootTimer > 3000) {
-                        g_Blacklist.push_back(g_BotTarget);
-                        
-                        if (!g_Profile.empty() && g_CurrentTaskIndex < g_Profile.size()) {
-                            if (g_Profile[g_CurrentTaskIndex].type == TASK_GRIND) {
-                                g_Profile[g_CurrentTaskIndex].killsDone++;
-                                printf("\n[GRIND] Kill %d / %d\n", g_Profile[g_CurrentTaskIndex].killsDone, g_Profile[g_CurrentTaskIndex].count);
-                                if (g_Profile[g_CurrentTaskIndex].killsDone >= g_Profile[g_CurrentTaskIndex].count) {
-                                    g_CurrentTaskIndex++;
-                                    printf("[TASK] Grind complete! Moving to next task.\n");
-                                }
-                            }
-                        }
-
-                        g_BotTarget = 0; 
+                        CompleteKill(); // [!] Успешный лут -> Засчитываем килл
                         isLooting = false;
-                        ExecuteLua("ClearTarget(); CloseLoot();"); 
                     }
                 }
             } else {
                 if (isLooting) {
-                    g_Blacklist.push_back(g_BotTarget);
-                    g_BotTarget = 0; 
+                    CompleteKill(); // [!] Лут пропал -> Засчитываем килл
                     isLooting = false;
-                    ExecuteLua("ClearTarget(); CloseLoot();"); 
                 } else {
                     if (deathTime == 0) deathTime = GetTickCount();
                     if (GetTickCount() - deathTime > 1500) {
-                        g_Blacklist.push_back(g_BotTarget);
-                        g_BotTarget = 0; 
+                        CompleteKill(); // [!] Труп пустой -> Засчитываем килл
                         deathTime = 0;
-                        ExecuteLua("ClearTarget();"); 
                     }
                 }
             }
@@ -320,8 +320,11 @@ void BotPulse() {
         return; 
     } 
     
+    // ==========================================
+    // РАДАР (САМООБОРОНА + ГРИНД)
+    // ==========================================
     uint64_t bestGuid = 0;
-    float bestDist = 40.0f; // УВЕЛИЧЕН РАДИУС ПОИСКА МОБОВ ДО 40 МЕТРОВ
+    float bestDist = 25.0f; 
 
     bool isGrindTask = (!g_Profile.empty() && g_CurrentTaskIndex < g_Profile.size() && g_Profile[g_CurrentTaskIndex].type == TASK_GRIND);
     int targetNpcId = isGrindTask ? g_Profile[g_CurrentTaskIndex].npcId : 0;
@@ -335,27 +338,21 @@ void BotPulse() {
                 uintptr_t desc = *(uintptr_t*)(cur + 0x8);
                 if (desc) {
                     int hp = *(int*)(desc + 0x60); 
-                    int mobFaction = *(int*)(desc + 0xDC);
-                    uint32_t mobFlags = *(uint32_t*)(desc + 0xEC);
                     uint32_t mobDynFlags = *(uint32_t*)(desc + 0x13C);
                     int entryId = *(int*)(desc + 0xC); 
 
                     bool isTapped = (mobDynFlags & 0x4) != 0;       
-                    bool isUnattackable = (mobFlags & 0x102) != 0; 
 
-                    bool isEnemy = false;
-                    if (targetNpcId > 0) {
-                        isEnemy = (entryId == targetNpcId); // Ищем конкретного моба
-                    } else {
-                        isEnemy = (myFaction != mobFaction); // Если ID не указан, бьем чужую фракцию
-                    }
+                    float mX = *(float*)(cur + 0x798);
+                    float mY = *(float*)(cur + 0x79C);
+                    float mZ = *(float*)(cur + 0x7A0);
+                    float dist = GetDistance3D(myX, myY, myZ, mX, mY, mZ);
 
-                    if (isGrindTask && isEnemy && hp > 0 && !isTapped && !isUnattackable) {
-                        float mX = *(float*)(cur + 0x798);
-                        float mY = *(float*)(cur + 0x79C);
-                        float mZ = *(float*)(cur + 0x7A0);
-                        float dist = GetDistance3D(myX, myY, myZ, mX, mY, mZ);
-                        
+                    // [!] ЛОГИКА РАДАРА: Бьем нужного моба по квесту ИЛИ защищаемся от тех, кто напал на нас
+                    bool isValidGrindTarget = (isGrindTask && entryId == targetNpcId && !isTapped);
+                    bool isAttackingUs = (inCombat && dist < 10.0f); // Если мы в бою и моб близко - это самооборона!
+
+                    if (hp > 0 && (isValidGrindTarget || isAttackingUs)) {
                         if (dist < bestDist && dist > 0.1f) {
                             bestDist = dist;
                             bestGuid = guid;
@@ -373,12 +370,16 @@ void BotPulse() {
         return;
     }
 
+    // ==========================================
+    // РЕЖИМ ЗАДАЧ (КВЕСТЫ И НАВИГАЦИЯ)
+    // ==========================================
     if (g_Profile.empty() || g_CurrentTaskIndex >= g_Profile.size()) {
         printf("[IDLE] Profile finished or not loaded. Waiting...      \r");
         return;
     }
 
     BotTask& task = g_Profile[g_CurrentTaskIndex];
+    static DWORD taskTimer = 0; 
 
     if (task.type == TASK_GOTO) {
         float distToWaypoint = GetDistance3D(myX, myY, myZ, task.x, task.y, task.z);
@@ -390,66 +391,46 @@ void BotPulse() {
             printf("[TASK] Moving to Waypoint %d... Dist: %.1f      \r", g_CurrentTaskIndex, distToWaypoint);
         }
     }
-    // ==========================================
-    // НОВАЯ ЛОГИКА КВЕСТОВ (STATE MACHINE + CTM)
-    // ==========================================
     else if (task.type == TASK_ACCEPT_QUEST || task.type == TASK_TURN_IN_QUEST) {
-        static int qState = 0;
-        static DWORD qTimer = 0;
+        float npcX = 0, npcY = 0, npcZ = 0;
+        uint64_t npcGuid = FindNpcGuidById(task.npcId, npcX, npcY, npcZ);
         
-        if (qState == 0) {
-            printf("\n[TASK] %s Quest %d with NPC %d...\n", 
-                task.type == TASK_ACCEPT_QUEST ? "Accepting" : "Turning in", 
-                task.questId, task.npcId);
-            qState = 1;
+        if (!npcGuid) {
+            printf("[TASK] Looking for NPC %d...      \r", task.npcId);
+            return;
         }
-        else if (qState == 1) {
-            uint64_t npcGuid = 0; float nX, nY, nZ;
-            if (FindNpcById(task.npcId, npcGuid, nX, nY, nZ)) {
-                float dist = GetDistance3D(myX, myY, myZ, nX, nY, nZ);
-                if (dist > 4.5f) {
-                    // Бежим к NPC через CTM_INTERACT
-                    ActionCTM(pLocal, CTM_INTERACT, npcGuid, nX, nY, nZ);
-                } else {
-                    // Подошли вплотную. Останавливаемся и открываем окно
-                    ExecuteLua("MoveForwardStop(); MoveBackwardStop();");
-                    ActionCTM(pLocal, CTM_INTERACT, npcGuid, nX, nY, nZ);
-                    ProgrammaticTarget(npcGuid); // Берем в таргет для надежности
-                    qTimer = GetTickCount();
-                    qState = 2;
-                }
-            } else {
-                printf("[-] NPC %d not found nearby! Skipping...\n", task.npcId);
-                g_CurrentTaskIndex++;
-                qState = 0;
+
+        float distToNpc = GetDistance3D(myX, myY, myZ, npcX, npcY, npcZ);
+        
+        // [!] ИДЕАЛЬНОЕ ВЗАИМОДЕЙСТВИЕ С NPC [!]
+        if (distToNpc > 4.5f) {
+            ActionCTM(pLocal, CTM_INTERACT, npcGuid, npcX, npcY, npcZ);
+            printf("[TASK] Approaching NPC %d... Dist: %.1f      \r", task.npcId, distToNpc);
+            taskTimer = 0;
+        } else {
+            if (taskTimer == 0) {
+                ExecuteLua("MoveForwardStop();");
+                *(uint64_t*)ADDR_MOUSEOVER_GUID = npcGuid;
+                ExecuteLua("InteractUnit('mouseover')"); // Открываем диалог
+                taskTimer = GetTickCount();
+                printf("\n[TASK] Opening Dialog with NPC...\n");
             }
-        }
-        else if (qState == 2) {
-            // Ждем 1.5 секунды, пока откроется окно диалога
-            if (GetTickCount() - qTimer > 1500) { 
+            // Ждем 1 секунду, чтобы окно диалога успело открыться
+            else if (GetTickCount() - taskTimer > 1000) {
                 if (task.type == TASK_ACCEPT_QUEST) {
                     ExecuteLua("SelectGossipAvailableQuest(1); SelectAvailableQuest(1); AcceptQuest();");
+                    printf("[TASK] Quest Accepted!\n");
                 } else {
                     ExecuteLua("SelectGossipActiveQuest(1); SelectActiveQuest(1); CompleteQuest(); GetQuestReward(1);");
+                    printf("[TASK] Quest Turned In!\n");
                 }
-                qTimer = GetTickCount();
-                qState = 3;
-            }
-        }
-        else if (qState == 3) {
-            // Ждем 1 секунду после нажатия кнопки "Принять", чтобы сервер засчитал квест
-            if (GetTickCount() - qTimer > 1000) { 
                 g_CurrentTaskIndex++;
-                qState = 0;
+                taskTimer = 0;
             }
         }
     }
     else if (task.type == TASK_GRIND) {
-        if (task.npcId > 0) {
-            printf("[TASK] Grinding mode active. Looking for mob ID %d... (%d/%d)      \r", task.npcId, task.killsDone, task.count);
-        } else {
-            printf("[TASK] Grinding mode active. Looking for ANY enemy... (%d/%d)      \r", task.killsDone, task.count);
-        }
+        printf("[TASK] Grinding mode active. Looking for mob ID %d... (%d/%d)      \r", task.npcId, task.killsDone, task.count);
     }
     else if (task.type == TASK_LOAD_PROFILE) {
         printf("\n[SYSTEM] Loading next profile: %s\n", task.nextProfile);
@@ -481,38 +462,6 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
             g_Active = false;
             CreateThread(0, 0, EjectThread, 0, 0, 0);
             return CallWindowProcA(oWndProc, hWnd, uMsg, wParam, lParam);
-        }
-
-        static bool f9Pressed = false;
-        if (GetAsyncKeyState(VK_F9) & 0x8000) {
-            if (!f9Pressed) {
-                f9Pressed = true;
-                uintptr_t conn = *(uintptr_t*)ADDR_S_CUR_MGR;
-                uintptr_t mgr = conn ? *(uintptr_t*)(conn + OFFSET_OBJECT_MANAGER) : 0;
-                if (mgr) {
-                    uint64_t localGuid = *(uint64_t*)(mgr + 0xC0);
-                    uintptr_t cur = *(uintptr_t*)(mgr + 0xAC);
-                    while (cur && (cur & 1) == 0) {
-                        if (*(uint64_t*)(cur + 0x30) == localGuid) {
-                            float x = *(float*)(cur + 0x798);
-                            float y = *(float*)(cur + 0x79C);
-                            float z = *(float*)(cur + 0x7A0);
-                            
-                            CreateDirectoryA("C:\\WoWBot", NULL);
-                            std::ofstream outfile("C:\\WoWBot\\RecordedProfile.txt", std::ios_base::app);
-                            outfile << "GOTO " << x << " " << y << " " << z << "\n";
-                            outfile.close();
-                            
-                            Beep(1000, 100);
-                            printf("\n[+] Waypoint Saved: %.2f %.2f %.2f\n", x, y, z);
-                            break;
-                        }
-                        cur = *(uintptr_t*)(cur + 0x3C);
-                    }
-                }
-            }
-        } else {
-            f9Pressed = false;
         }
 
         static bool isPressed = false;
